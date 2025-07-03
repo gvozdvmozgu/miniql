@@ -31,6 +31,8 @@ jobs:
           key: ${{ env.RUST_CHANNEL }}
       - name: cargo build
         run: cargo build --quiet
+      - name: cargo build --package miniql
+        run: cargo build --package miniql --quiet
       - name: cargo clippy
         run: cargo clippy --quiet
       - name: cargo test

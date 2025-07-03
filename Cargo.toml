@@ -41,4 +41,7 @@ name = "miniql"
 version.workspace = true
 edition.workspace = true
 
+[features]
+std = []
+
 [dependencies]

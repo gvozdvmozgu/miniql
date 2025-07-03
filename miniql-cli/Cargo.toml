@@ -11,3 +11,4 @@ name = "miniql"
 path = "src/main.rs"
 
 [dependencies]
+miniql = { path = "..", features = ["std"] }
