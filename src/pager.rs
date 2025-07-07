@@ -123,8 +123,8 @@ pub struct PageId(NonZero<u32>);
 impl PageId {
     pub const ROOT: PageId = unsafe { PageId::new_unchecked(1) };
 
-    pub fn new(id: u32) -> Option<Self> {
-        id.checked_add(1).map(|id| unsafe { Self::new_unchecked(id) })
+    pub fn new(id: u32) -> Self {
+        Self(NonZero::new(id).unwrap())
     }
 
     /// # Safety
