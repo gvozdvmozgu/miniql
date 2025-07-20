@@ -5,5 +5,6 @@
 
 extern crate alloc;
 
+pub mod decoder;
 pub mod fs;
 pub mod pager;

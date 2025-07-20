@@ -4,6 +4,7 @@ use core::alloc::{AllocError, Allocator};
 use core::cell::OnceCell;
 use core::num::NonZero;
 
+use crate::decoder::Decoder;
 use crate::fs::File;
 
 pub const PAGE_SIZE: usize = 4096;
@@ -33,7 +34,7 @@ impl<F: File, A: Allocator + Copy> Pager<F, A> {
     }
 
     pub fn count(&self) -> u32 {
-        unsafe { self.root().read_u32_unchecked(28) }
+        self.root().decoder().split_at(28).read_u32()
     }
 
     pub fn read_page(&mut self, page_id: PageId) -> Result<(), F> {
@@ -54,7 +55,7 @@ impl<F: File, A: Allocator + Copy> Pager<F, A> {
 
         if self.db_size > page_id0 as u32 {
             let offset = page_id0.checked_mul(PAGE_SIZE).ok_or(Error::TooManyPages)?;
-            self.file.read(page.bytes.as_mut_slice(), offset).map_err(Error::Io)?;
+            self.file.read(&mut page.bytes, offset).map_err(Error::Io)?;
         }
 
         Ok(())
@@ -85,35 +86,34 @@ impl<F: File, A: Allocator + Copy> Pager<F, A> {
     }
 }
 
+enum PageKind {
+    Root,
+    Normal,
+}
+
 pub struct Page<A: Allocator> {
-    bytes: Box<[u8; PAGE_SIZE], A>,
-    #[expect(dead_code)]
-    offset: usize,
+    bytes: Box<[u8], A>,
+    kind: PageKind,
 }
 
 impl<A: Allocator> Page<A> {
     fn new(page_id: usize, bytes: Box<[u8; PAGE_SIZE], A>) -> Self {
-        Self { bytes, offset: if page_id == 1 { 100 } else { 0 } }
+        Self { bytes, kind: if page_id == 1 { PageKind::Root } else { PageKind::Normal } }
     }
 
     pub fn offset(&self) -> usize {
-        self.bytes.as_ptr() as usize
+        match self.kind {
+            PageKind::Root => 100,
+            PageKind::Normal => 0,
+        }
     }
 
-    pub fn read_u32(&self, pos: usize) -> Option<u32> {
-        self.bytes
-            .get(pos..=pos + 3)
-            .and_then(|bytes| bytes.try_into().ok().map(u32::from_be_bytes))
+    pub fn decoder(&self) -> Decoder<'_> {
+        Decoder::new(&self.bytes)
     }
 
-    /// # Safety
-    ///
-    /// The `pos` must be a valid position within the page's byte slice,
-    /// and it must be aligned to a 4-byte boundary.
-    /// The caller must ensure that the position does not exceed the bounds of
-    /// the page.
-    pub unsafe fn read_u32_unchecked(&self, pos: usize) -> u32 {
-        unsafe { self.read_u32(pos).unwrap_unchecked() }
+    pub fn decoder_after_header(&self) -> Decoder<'_> {
+        self.decoder().split_at(self.offset())
     }
 }
 
