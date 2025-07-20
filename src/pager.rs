@@ -29,6 +29,7 @@ impl<F: File, A: Allocator + Copy> Pager<F, A> {
         Ok(pager)
     }
 
+    #[inline]
     pub fn root(&self) -> &Page<A> {
         unsafe { self.pages.get_unchecked(0).get().unwrap_unchecked() }
     }
