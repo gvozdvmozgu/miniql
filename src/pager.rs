@@ -55,7 +55,8 @@ impl<F: File, A: Allocator + Copy> Pager<F, A> {
             .map_err(|AllocError| Error::OutOfMemory)?;
 
         if self.db_size > page_id0 as u32 {
-            let offset = page_id0.checked_mul(PAGE_SIZE).ok_or(Error::TooManyPages)?;
+            let offset =
+                page_id0.checked_mul(PAGE_SIZE).ok_or(Error::TooManyPages)?.try_into().unwrap();
             self.file.read(&mut page.bytes, offset).map_err(Error::Io)?;
         }
 
