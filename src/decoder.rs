@@ -1,5 +1,5 @@
-use core::marker::PhantomData;
-use core::ops::Range;
+use std::marker::PhantomData;
+use std::ops::Range;
 
 pub struct Decoder<'bytes> {
     start: *const u8,
@@ -32,7 +32,7 @@ impl<'bytes> Decoder<'bytes> {
         }
 
         unsafe {
-            let slice = core::slice::from_raw_parts(self.current, bytes);
+            let slice = std::slice::from_raw_parts(self.current, bytes);
             self.current = self.current.add(bytes);
             slice
         }

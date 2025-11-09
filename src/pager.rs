@@ -1,36 +1,35 @@
-use alloc::boxed::Box;
-use alloc::vec::Vec;
-use core::alloc::{AllocError, Allocator};
-use core::cell::OnceCell;
-use core::num::NonZero;
+use std::boxed::Box;
+use std::cell::OnceCell;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::num::NonZero;
+use std::vec::Vec;
 
 use crate::decoder::Decoder;
-use crate::fs::File;
 
 pub const PAGE_SIZE: usize = 4096;
 
-type Result<T, F> = core::result::Result<T, Error<<F as File>::Error>>;
+type Result<T> = std::result::Result<T, Error>;
 
-pub struct Pager<F: File, A: Allocator + Copy> {
-    file: F,
-    pages: Vec<OnceCell<Page<A>>, A>,
+pub struct Pager {
+    file: File,
+    pages: Vec<OnceCell<Page>>,
     db_size: u32,
-    allocator: A,
 }
 
-impl<F: File, A: Allocator + Copy> Pager<F, A> {
-    pub fn new(file: F, allocator: A) -> Result<Self, F> {
-        let file_size = file.size().map_err(Error::Io)? as usize;
+impl Pager {
+    pub fn new(file: File) -> Result<Self> {
+        let file_size = file.metadata().map_err(Error::Io)?.len() as usize;
         let db_size = file_size.div_ceil(PAGE_SIZE) as u32;
 
-        let mut pager = Pager { file, pages: Vec::new_in(allocator), db_size, allocator };
+        let mut pager = Pager { file, pages: Vec::new(), db_size };
         pager.read_page(PageId::ROOT)?;
 
         Ok(pager)
     }
 
     #[inline]
-    pub fn root(&self) -> &Page<A> {
+    pub fn root(&self) -> &Page {
         unsafe { self.pages.get_unchecked(0).get().unwrap_unchecked() }
     }
 
@@ -38,7 +37,7 @@ impl<F: File, A: Allocator + Copy> Pager<F, A> {
         self.root().decoder().split_at(28).read_u32()
     }
 
-    pub fn read_page(&mut self, page_id: PageId) -> Result<(), F> {
+    pub fn read_page(&mut self, page_id: PageId) -> Result<()> {
         let page_id1 = page_id.into_inner() as usize;
         let page_id0 = page_id1 - 1;
 
@@ -47,40 +46,30 @@ impl<F: File, A: Allocator + Copy> Pager<F, A> {
         self.resize_with(page_id1)?;
 
         // SAFETY: `resize_with(page_id1)` has ensured `self.pages.len() ≥ page_id1`.
-        let page = unsafe { self.pages.get_unchecked_mut(page_id0) }
-            .get_mut_or_try_init(|| {
-                Box::try_new_in([0; PAGE_SIZE], self.allocator)
-                    .map(|page| Page::new(page_id1, page))
-            })
-            .map_err(|AllocError| Error::OutOfMemory)?;
-
-        if self.db_size > page_id0 as u32 {
-            let offset = page_id0.checked_mul(PAGE_SIZE).ok_or(Error::TooManyPages)?;
-            self.file.read(&mut page.bytes, offset).map_err(Error::Io)?;
+        let page = unsafe { self.pages.get_unchecked_mut(page_id0) };
+        
+        if page.get().is_none() {
+            let mut bytes = Box::new([0u8; PAGE_SIZE]);
+            
+            if self.db_size > page_id0 as u32 {
+                let offset = page_id0.checked_mul(PAGE_SIZE).ok_or(Error::TooManyPages)?;
+                self.file.seek(SeekFrom::Start(offset as u64)).map_err(Error::Io)?;
+                self.file.read_exact(&mut bytes[..]).map_err(Error::Io)?;
+            }
+            
+            let _ = page.set(Page::new(page_id1, bytes));
         }
 
         Ok(())
     }
 
-    fn resize_with(&mut self, new_size: usize) -> Result<(), F> {
-        self.pages.try_reserve(new_size).map_err(|error| match error.kind() {
-            alloc::collections::TryReserveErrorKind::CapacityOverflow => Error::CapacityOverflow,
-            alloc::collections::TryReserveErrorKind::AllocError { .. } => Error::OutOfMemory,
-        })?;
+    fn resize_with(&mut self, new_size: usize) -> Result<()> {
+        self.pages.try_reserve(new_size.saturating_sub(self.pages.len()))
+            .map_err(|_| Error::OutOfMemory)?;
 
         let len = self.pages.len();
         if new_size > len {
-            let additional = new_size - len;
-
-            unsafe {
-                let ptr = self.pages.as_mut_ptr().add(len);
-
-                for i in 0..additional {
-                    ptr.add(i).write(OnceCell::new());
-                }
-
-                self.pages.set_len(new_size);
-            }
+            self.pages.resize_with(new_size, OnceCell::new);
         }
 
         Ok(())
@@ -92,13 +81,13 @@ enum PageKind {
     Normal,
 }
 
-pub struct Page<A: Allocator> {
-    bytes: Box<[u8], A>,
+pub struct Page {
+    bytes: Box<[u8]>,
     kind: PageKind,
 }
 
-impl<A: Allocator> Page<A> {
-    fn new(page_id: usize, bytes: Box<[u8; PAGE_SIZE], A>) -> Self {
+impl Page {
+    fn new(page_id: usize, bytes: Box<[u8; PAGE_SIZE]>) -> Self {
         Self { bytes, kind: if page_id == 1 { PageKind::Root } else { PageKind::Normal } }
     }
 
@@ -141,9 +130,8 @@ impl PageId {
 }
 
 #[derive(Debug)]
-pub enum Error<Io> {
-    Io(Io),
+pub enum Error {
+    Io(std::io::Error),
     OutOfMemory,
     TooManyPages,
-    CapacityOverflow,
 }
