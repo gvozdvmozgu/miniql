@@ -47,16 +47,16 @@ impl Pager {
 
         // SAFETY: `resize_with(page_id1)` has ensured `self.pages.len() ≥ page_id1`.
         let page = unsafe { self.pages.get_unchecked_mut(page_id0) };
-        
+
         if page.get().is_none() {
             let mut bytes = Box::new([0u8; PAGE_SIZE]);
-            
+
             if self.db_size > page_id0 as u32 {
                 let offset = page_id0.checked_mul(PAGE_SIZE).ok_or(Error::TooManyPages)?;
                 self.file.seek(SeekFrom::Start(offset as u64)).map_err(Error::Io)?;
                 self.file.read_exact(&mut bytes[..]).map_err(Error::Io)?;
             }
-            
+
             let _ = page.set(Page::new(page_id1, bytes));
         }
 
@@ -64,7 +64,8 @@ impl Pager {
     }
 
     fn resize_with(&mut self, new_size: usize) -> Result<()> {
-        self.pages.try_reserve(new_size.saturating_sub(self.pages.len()))
+        self.pages
+            .try_reserve(new_size.saturating_sub(self.pages.len()))
             .map_err(|_| Error::OutOfMemory)?;
 
         let len = self.pages.len();
