@@ -1,0 +1,304 @@
+use std::{fmt, str};
+
+use crate::decoder::Decoder;
+use crate::pager::{Page, PageId, Pager};
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug)]
+pub enum Error {
+    Pager(crate::pager::Error),
+    UnsupportedPageType(u8),
+    UnsupportedSerialType(u64),
+    Corrupted(&'static str),
+    Utf8(str::Utf8Error),
+    TableNotFound(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pager(err) => write!(f, "{err}"),
+            Self::UnsupportedPageType(kind) => write!(f, "Unsupported page type: 0x{kind:02X}"),
+            Self::UnsupportedSerialType(serial) => {
+                write!(f, "Unsupported record serial type: {serial}")
+            }
+            Self::Corrupted(msg) => write!(f, "Corrupted table page: {msg}"),
+            Self::Utf8(err) => write!(f, "{err}"),
+            Self::TableNotFound(name) => {
+                write!(f, "Table '{name}' not found in sqlite_schema")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pager(err) => Some(err),
+            Self::Utf8(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::pager::Error> for Error {
+    fn from(err: crate::pager::Error) -> Self {
+        Self::Pager(err)
+    }
+}
+
+impl From<str::Utf8Error> for Error {
+    fn from(err: str::Utf8Error) -> Self {
+        Self::Utf8(err)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Value {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl Value {
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_integer(&self) -> Option<i64> {
+        match self {
+            Self::Integer(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn display_blob(bytes: &[u8], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("x'")?;
+        for byte in bytes {
+            write!(f, "{byte:02x}")?;
+        }
+        f.write_str("'")
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => f.write_str("NULL"),
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::Real(value) => write!(f, "{value}"),
+            Self::Text(value) => f.write_str(value),
+            Self::Blob(bytes) => Self::display_blob(bytes, f),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TableRow {
+    pub rowid: i64,
+    pub values: Vec<Value>,
+}
+
+pub fn read_table(pager: &mut Pager, page_id: PageId) -> Result<Vec<TableRow>> {
+    let mut rows = Vec::new();
+    read_table_page(pager, page_id, &mut rows)?;
+    Ok(rows)
+}
+
+fn read_table_page(pager: &mut Pager, page_id: PageId, rows: &mut Vec<TableRow>) -> Result<()> {
+    pager.read_page(page_id)?;
+    let page = pager.page(page_id).ok_or(Error::Corrupted("missing page after read"))?;
+    let header = parse_header(page)?;
+
+    match header.kind {
+        BTreeKind::TableLeaf => {
+            for offset in header.cell_offsets {
+                rows.push(read_table_cell(page, offset)?);
+            }
+        }
+        BTreeKind::TableInterior => {
+            let page_len = page.bytes().len();
+            let mut children = Vec::with_capacity(header.cell_offsets.len() + 1);
+
+            for offset in header.cell_offsets {
+                if offset as usize >= page_len {
+                    return Err(Error::Corrupted("cell offset out of bounds"));
+                }
+
+                let mut decoder = page.decoder().split_at(offset as usize);
+                let child = decoder.read_u32();
+                let child =
+                    PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
+
+                // Skip the key separating subtrees; it is not needed for scanning.
+                let _ = decoder.read_varint();
+                children.push(child);
+            }
+
+            if let Some(right_most) = header.right_most_child {
+                let right_most =
+                    PageId::try_new(right_most).ok_or(Error::Corrupted("child page id is zero"))?;
+                children.push(right_most);
+            }
+
+            for child in children {
+                read_table_page(pager, child, rows)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn read_table_cell(page: &Page, offset: u16) -> Result<TableRow> {
+    if offset as usize >= page.bytes().len() {
+        return Err(Error::Corrupted("cell offset out of bounds"));
+    }
+
+    let mut decoder = page.decoder().split_at(offset as usize);
+
+    let before = decoder.remaining();
+    let payload_length = decoder.read_varint();
+    let payload_length_len = before - decoder.remaining();
+    let payload_length =
+        usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
+
+    let before = decoder.remaining();
+    let rowid = decoder.read_varint() as i64;
+    let rowid_len = before - decoder.remaining();
+
+    let start = offset as usize + payload_length_len + rowid_len;
+    let end =
+        start.checked_add(payload_length).ok_or(Error::Corrupted("payload length overflow"))?;
+
+    let bytes = page.bytes();
+    if end > bytes.len() {
+        return Err(Error::Corrupted("payload extends past page boundary"));
+    }
+
+    let values = decode_record(&bytes[start..end])?;
+    Ok(TableRow { rowid, values })
+}
+
+fn decode_record(payload: &[u8]) -> Result<Vec<Value>> {
+    let mut header_decoder = Decoder::new(payload);
+    let before = header_decoder.remaining();
+    let header_len = header_decoder.read_varint() as usize;
+    let header_len_len = before - header_decoder.remaining();
+
+    if header_len < header_len_len || header_len > payload.len() {
+        return Err(Error::Corrupted("invalid record header length"));
+    }
+
+    let mut serial_decoder = Decoder::new(&payload[header_len_len..header_len]);
+    let mut serials = Vec::new();
+    while serial_decoder.remaining() > 0 {
+        serials.push(serial_decoder.read_varint());
+    }
+
+    let mut value_decoder = Decoder::new(&payload[header_len..]);
+    let mut values = Vec::with_capacity(serials.len());
+    for serial in serials {
+        values.push(decode_value(serial, &mut value_decoder)?);
+    }
+
+    Ok(values)
+}
+
+fn decode_value(serial_type: u64, decoder: &mut Decoder<'_>) -> Result<Value> {
+    let value = match serial_type {
+        0 => Value::Null,
+        1 => Value::Integer(read_signed_be(decoder, 1)?),
+        2 => Value::Integer(read_signed_be(decoder, 2)?),
+        3 => Value::Integer(read_signed_be(decoder, 3)?),
+        4 => Value::Integer(read_signed_be(decoder, 4)?),
+        5 => Value::Integer(read_signed_be(decoder, 6)?),
+        6 => Value::Integer(read_signed_be(decoder, 8)?),
+        7 => Value::Real(f64::from_bits(read_u64_be(decoder)?)),
+        8 => Value::Integer(0),
+        9 => Value::Integer(1),
+        serial if serial >= 12 && serial % 2 == 0 => {
+            let len = ((serial - 12) / 2) as usize;
+            Value::Blob(read_exact_bytes(decoder, len)?.to_vec())
+        }
+        serial if serial >= 13 => {
+            let len = ((serial - 13) / 2) as usize;
+            let text = str::from_utf8(read_exact_bytes(decoder, len)?)?.to_owned();
+            Value::Text(text)
+        }
+        other => return Err(Error::UnsupportedSerialType(other)),
+    };
+
+    Ok(value)
+}
+
+fn read_signed_be(decoder: &mut Decoder<'_>, bytes: usize) -> Result<i64> {
+    debug_assert!(bytes <= 8);
+
+    let mut buf = [0u8; 8];
+    let offset = 8 - bytes;
+    buf[offset..].copy_from_slice(read_exact_bytes(decoder, bytes)?);
+
+    let value = u64::from_be_bytes(buf);
+    let shift = (8 - bytes) * 8;
+    Ok(((value << shift) as i64) >> shift)
+}
+
+fn read_u64_be(decoder: &mut Decoder<'_>) -> Result<u64> {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(read_exact_bytes(decoder, 8)?);
+    Ok(u64::from_be_bytes(buf))
+}
+
+fn read_exact_bytes<'bytes>(decoder: &mut Decoder<'bytes>, len: usize) -> Result<&'bytes [u8]> {
+    if decoder.remaining() < len {
+        return Err(Error::Corrupted("record payload shorter than declared"));
+    }
+
+    Ok(decoder.read_bytes(len))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BTreeKind {
+    TableLeaf,
+    TableInterior,
+}
+
+struct BTreeHeader {
+    kind: BTreeKind,
+    cell_offsets: Vec<u16>,
+    right_most_child: Option<u32>,
+}
+
+fn parse_header(page: &Page) -> Result<BTreeHeader> {
+    let mut decoder = page.decoder_after_header();
+    let page_type = decoder.read_u8();
+    let _first_freeblock = decoder.read_u16();
+    let cell_count = decoder.read_u16();
+    let _start_of_cell_content = decoder.read_u16();
+    let _fragmented_free_bytes = decoder.read_u8();
+
+    let right_most_child = match page_type {
+        0x05 | 0x02 => Some(decoder.read_u32()),
+        _ => None,
+    };
+
+    let mut cell_offsets = Vec::with_capacity(cell_count as usize);
+    for _ in 0..cell_count {
+        cell_offsets.push(decoder.read_u16());
+    }
+
+    let kind = match page_type {
+        0x0D => BTreeKind::TableLeaf,
+        0x05 => BTreeKind::TableInterior,
+        _ => return Err(Error::UnsupportedPageType(page_type)),
+    };
+
+    Ok(BTreeHeader { kind, cell_offsets, right_most_child })
+}

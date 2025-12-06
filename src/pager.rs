@@ -1,5 +1,6 @@
 use std::boxed::Box;
 use std::cell::OnceCell;
+use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::num::NonZero;
@@ -75,6 +76,11 @@ impl Pager {
 
         Ok(())
     }
+
+    pub fn page(&self, page_id: PageId) -> Option<&Page> {
+        let index = (page_id.into_inner() - 1) as usize;
+        self.pages.get(index).and_then(OnceCell::get)
+    }
 }
 
 enum PageKind {
@@ -106,6 +112,10 @@ impl Page {
     pub fn decoder_after_header(&self) -> Decoder<'_> {
         self.decoder().split_at(self.offset())
     }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +126,10 @@ impl PageId {
 
     pub fn new(id: u32) -> Self {
         Self(NonZero::new(id).unwrap())
+    }
+
+    pub fn try_new(id: u32) -> Option<Self> {
+        NonZero::new(id).map(Self)
     }
 
     /// # Safety
@@ -135,4 +149,23 @@ pub enum Error {
     Io(std::io::Error),
     OutOfMemory,
     TooManyPages,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "{err}"),
+            Self::OutOfMemory => f.write_str("Not enough memory to load page"),
+            Self::TooManyPages => f.write_str("Database contains more pages than supported"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
 }

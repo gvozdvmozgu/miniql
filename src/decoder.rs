@@ -16,8 +16,35 @@ impl<'bytes> Decoder<'bytes> {
     }
 
     #[inline]
+    pub fn read_u8(&mut self) -> u8 {
+        self.read_array::<1>()[0]
+    }
+
+    #[inline]
+    pub fn read_u16(&mut self) -> u16 {
+        u16::from_be_bytes(self.read_array())
+    }
+
+    #[inline]
     pub fn read_u32(&mut self) -> u32 {
         u32::from_be_bytes(self.read_array())
+    }
+
+    #[inline]
+    pub fn read_varint(&mut self) -> u64 {
+        let mut result = 0u64;
+
+        for _ in 0..8 {
+            let byte = self.read_u8();
+            result = (result << 7) | u64::from(byte & 0x7F);
+
+            if byte & 0x80 == 0 {
+                return result;
+            }
+        }
+
+        let byte = self.read_u8();
+        (result << 8) | u64::from(byte)
     }
 
     #[inline]
@@ -26,7 +53,7 @@ impl<'bytes> Decoder<'bytes> {
     }
 
     #[inline]
-    fn read_bytes(&mut self, bytes: usize) -> &'bytes [u8] {
+    pub fn read_bytes(&mut self, bytes: usize) -> &'bytes [u8] {
         if bytes > self.remaining() {
             decoder_exhausted();
         }
