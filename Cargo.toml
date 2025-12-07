@@ -40,4 +40,11 @@ name = "miniql"
 version.workspace = true
 edition.workspace = true
 
+[dev-dependencies]
+codspeed-criterion-compat = "4"
+
 [dependencies]
+
+[[bench]]
+name = "read_table"
+harness = false
