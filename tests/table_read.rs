@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use miniql::pager::{PageId, Pager};
-use miniql::table::{self, TableRow, Value};
+use miniql::table::{self, TableRow, TableRowRef, Value, ValueRef};
 
 fn open_pager() -> Pager {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/users.db");
@@ -49,6 +49,27 @@ fn reads_users_table_rows() {
     assert_eq!(second.rowid, 2);
     assert_eq!(second.values.len(), 3);
     assert!(matches!(second.values[0], Value::Null));
+    assert_eq!(second.values[1].as_text(), Some("bob"));
+    assert_eq!(second.values[2].as_integer(), Some(25));
+}
+
+#[test]
+fn reads_users_table_rows_by_ref() {
+    let pager = open_pager();
+    let rows: Vec<TableRowRef<'_>> =
+        table::read_table_ref(&pager, PageId::new(2)).expect("read users table");
+
+    assert_eq!(rows.len(), 2);
+
+    let first = &rows[0];
+    assert_eq!(first.rowid, 1);
+    assert!(matches!(first.values[0], ValueRef::Null));
+    assert_eq!(first.values[1].as_text(), Some("alice"));
+    assert_eq!(first.values[2].as_integer(), Some(30));
+
+    let second = &rows[1];
+    assert_eq!(second.rowid, 2);
+    assert!(matches!(second.values[0], ValueRef::Null));
     assert_eq!(second.values[1].as_text(), Some("bob"));
     assert_eq!(second.values[2].as_integer(), Some(25));
 }

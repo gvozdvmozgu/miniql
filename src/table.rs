@@ -99,19 +99,80 @@ impl fmt::Display for Value {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ValueRef<'a> {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+impl<'a> ValueRef<'a> {
+    pub fn as_text(&self) -> Option<&'a str> {
+        match self {
+            Self::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn as_integer(&self) -> Option<i64> {
+        match self {
+            Self::Integer(value) => Some(*value),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> From<ValueRef<'a>> for Value {
+    fn from(value: ValueRef<'a>) -> Self {
+        match value {
+            ValueRef::Null => Value::Null,
+            ValueRef::Integer(value) => Value::Integer(value),
+            ValueRef::Real(value) => Value::Real(value),
+            ValueRef::Text(text) => Value::Text(text.to_owned()),
+            ValueRef::Blob(bytes) => Value::Blob(bytes.to_owned()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableRow {
     pub rowid: i64,
     pub values: Vec<Value>,
 }
 
-pub fn read_table(pager: &mut Pager, page_id: PageId) -> Result<Vec<TableRow>> {
-    let mut rows = Vec::new();
-    read_table_page(pager, page_id, &mut rows)?;
+#[derive(Debug, Clone)]
+pub struct TableRowRef<'a> {
+    pub rowid: i64,
+    pub values: Vec<ValueRef<'a>>,
+}
+
+pub fn read_table(pager: &Pager, page_id: PageId) -> Result<Vec<TableRow>> {
+    let borrowed = read_table_ref(pager, page_id)?;
+
+    let mut rows = Vec::with_capacity(borrowed.len());
+    for row in borrowed {
+        rows.push(TableRow {
+            rowid: row.rowid,
+            values: row.values.into_iter().map(Value::from).collect(),
+        });
+    }
+
     Ok(rows)
 }
 
-fn read_table_page(pager: &mut Pager, page_id: PageId, rows: &mut Vec<TableRow>) -> Result<()> {
+pub fn read_table_ref<'a>(pager: &'a Pager, page_id: PageId) -> Result<Vec<TableRowRef<'a>>> {
+    let mut rows = Vec::new();
+    read_table_page_ref(pager, page_id, &mut rows)?;
+    Ok(rows)
+}
+
+fn read_table_page_ref<'a>(
+    pager: &'a Pager,
+    page_id: PageId,
+    rows: &mut Vec<TableRowRef<'a>>,
+) -> Result<()> {
     pager.read_page(page_id)?;
     let page = pager.page(page_id).ok_or(Error::Corrupted("missing page after read"))?;
     let header = parse_header(page)?;
@@ -119,7 +180,7 @@ fn read_table_page(pager: &mut Pager, page_id: PageId, rows: &mut Vec<TableRow>)
     match header.kind {
         BTreeKind::TableLeaf => {
             for offset in header.cell_offsets {
-                rows.push(read_table_cell(page, offset)?);
+                rows.push(read_table_cell_ref(page, offset)?);
             }
         }
         BTreeKind::TableInterior => {
@@ -148,7 +209,7 @@ fn read_table_page(pager: &mut Pager, page_id: PageId, rows: &mut Vec<TableRow>)
             }
 
             for child in children {
-                read_table_page(pager, child, rows)?;
+                read_table_page_ref(pager, child, rows)?;
             }
         }
     }
@@ -156,7 +217,7 @@ fn read_table_page(pager: &mut Pager, page_id: PageId, rows: &mut Vec<TableRow>)
     Ok(())
 }
 
-fn read_table_cell(page: &Page, offset: u16) -> Result<TableRow> {
+fn read_table_cell_ref<'a>(page: &'a Page, offset: u16) -> Result<TableRowRef<'a>> {
     if offset as usize >= page.bytes().len() {
         return Err(Error::Corrupted("cell offset out of bounds"));
     }
@@ -182,11 +243,11 @@ fn read_table_cell(page: &Page, offset: u16) -> Result<TableRow> {
         return Err(Error::Corrupted("payload extends past page boundary"));
     }
 
-    let values = decode_record(&bytes[start..end])?;
-    Ok(TableRow { rowid, values })
+    let values = decode_record_ref(&bytes[start..end])?;
+    Ok(TableRowRef { rowid, values })
 }
 
-fn decode_record(payload: &[u8]) -> Result<Vec<Value>> {
+fn decode_record_ref<'a>(payload: &'a [u8]) -> Result<Vec<ValueRef<'a>>> {
     let mut header_decoder = Decoder::new(payload);
     let before = header_decoder.remaining();
     let header_len = header_decoder.read_varint() as usize;
@@ -205,32 +266,32 @@ fn decode_record(payload: &[u8]) -> Result<Vec<Value>> {
     let mut value_decoder = Decoder::new(&payload[header_len..]);
     let mut values = Vec::with_capacity(serials.len());
     for serial in serials {
-        values.push(decode_value(serial, &mut value_decoder)?);
+        values.push(decode_value_ref(serial, &mut value_decoder)?);
     }
 
     Ok(values)
 }
 
-fn decode_value(serial_type: u64, decoder: &mut Decoder<'_>) -> Result<Value> {
+fn decode_value_ref<'a>(serial_type: u64, decoder: &mut Decoder<'a>) -> Result<ValueRef<'a>> {
     let value = match serial_type {
-        0 => Value::Null,
-        1 => Value::Integer(read_signed_be(decoder, 1)?),
-        2 => Value::Integer(read_signed_be(decoder, 2)?),
-        3 => Value::Integer(read_signed_be(decoder, 3)?),
-        4 => Value::Integer(read_signed_be(decoder, 4)?),
-        5 => Value::Integer(read_signed_be(decoder, 6)?),
-        6 => Value::Integer(read_signed_be(decoder, 8)?),
-        7 => Value::Real(f64::from_bits(read_u64_be(decoder)?)),
-        8 => Value::Integer(0),
-        9 => Value::Integer(1),
+        0 => ValueRef::Null,
+        1 => ValueRef::Integer(read_signed_be(decoder, 1)?),
+        2 => ValueRef::Integer(read_signed_be(decoder, 2)?),
+        3 => ValueRef::Integer(read_signed_be(decoder, 3)?),
+        4 => ValueRef::Integer(read_signed_be(decoder, 4)?),
+        5 => ValueRef::Integer(read_signed_be(decoder, 6)?),
+        6 => ValueRef::Integer(read_signed_be(decoder, 8)?),
+        7 => ValueRef::Real(f64::from_bits(read_u64_be(decoder)?)),
+        8 => ValueRef::Integer(0),
+        9 => ValueRef::Integer(1),
         serial if serial >= 12 && serial % 2 == 0 => {
             let len = ((serial - 12) / 2) as usize;
-            Value::Blob(read_exact_bytes(decoder, len)?.to_vec())
+            ValueRef::Blob(read_exact_bytes(decoder, len)?)
         }
         serial if serial >= 13 => {
             let len = ((serial - 13) / 2) as usize;
-            let text = str::from_utf8(read_exact_bytes(decoder, len)?)?.to_owned();
-            Value::Text(text)
+            let text = str::from_utf8(read_exact_bytes(decoder, len)?)?;
+            ValueRef::Text(text)
         }
         other => return Err(Error::UnsupportedSerialType(other)),
     };
