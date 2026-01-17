@@ -17,7 +17,15 @@ impl<'bytes> Decoder<'bytes> {
 
     #[inline]
     pub fn read_u8(&mut self) -> u8 {
-        self.read_array::<1>()[0]
+        if self.current == self.end {
+            decoder_exhausted();
+        }
+
+        unsafe {
+            let byte = *self.current;
+            self.current = self.current.add(1);
+            byte
+        }
     }
 
     #[inline]
@@ -32,9 +40,13 @@ impl<'bytes> Decoder<'bytes> {
 
     #[inline]
     pub fn read_varint(&mut self) -> u64 {
-        let mut result = 0u64;
+        let first = self.read_u8();
+        if first & 0x80 == 0 {
+            return u64::from(first);
+        }
 
-        for _ in 0..8 {
+        let mut result = u64::from(first & 0x7F);
+        for _ in 0..7 {
             let byte = self.read_u8();
             result = (result << 7) | u64::from(byte & 0x7F);
 
@@ -67,7 +79,7 @@ impl<'bytes> Decoder<'bytes> {
 
     #[inline]
     pub fn split_at(&self, position: usize) -> Decoder<'bytes> {
-        assert!(position <= self.len());
+        debug_assert!(position <= self.len());
 
         let current = unsafe { self.start.add(position) };
         Decoder { start: self.start, current, end: self.end, phantom: PhantomData }

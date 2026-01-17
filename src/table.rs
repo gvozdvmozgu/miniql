@@ -124,6 +124,18 @@ impl<'a> ValueRef<'a> {
     }
 }
 
+impl fmt::Display for ValueRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => f.write_str("NULL"),
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::Real(value) => write!(f, "{value}"),
+            Self::Text(value) => f.write_str(value),
+            Self::Blob(bytes) => Value::display_blob(bytes, f),
+        }
+    }
+}
+
 impl<'a> From<ValueRef<'a>> for Value {
     fn from(value: ValueRef<'a>) -> Self {
         match value {
@@ -177,17 +189,29 @@ fn read_table_page_ref<'a>(
     let page = pager.page(page_id).ok_or(Error::Corrupted("missing page after read"))?;
     let header = parse_header(page)?;
 
+    let cell_ptrs_len = header.cell_count as usize * 2;
+    let cell_ptrs_end = header
+        .cell_ptrs_start
+        .checked_add(cell_ptrs_len)
+        .ok_or(Error::Corrupted("cell pointer array overflow"))?;
+    let bytes = page.bytes();
+    if cell_ptrs_end > bytes.len() {
+        return Err(Error::Corrupted("cell pointer array out of bounds"));
+    }
+    let cell_ptrs = &bytes[header.cell_ptrs_start..cell_ptrs_end];
+
     match header.kind {
         BTreeKind::TableLeaf => {
-            for offset in header.cell_offsets {
+            rows.reserve(header.cell_count as usize);
+            for idx in 0..header.cell_count as usize {
+                let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
                 rows.push(read_table_cell_ref(page, offset)?);
             }
         }
         BTreeKind::TableInterior => {
-            let page_len = page.bytes().len();
-            let mut children = Vec::with_capacity(header.cell_offsets.len() + 1);
-
-            for offset in header.cell_offsets {
+            let page_len = bytes.len();
+            for idx in 0..header.cell_count as usize {
+                let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
                 if offset as usize >= page_len {
                     return Err(Error::Corrupted("cell offset out of bounds"));
                 }
@@ -199,17 +223,13 @@ fn read_table_page_ref<'a>(
 
                 // Skip the key separating subtrees; it is not needed for scanning.
                 let _ = decoder.read_varint();
-                children.push(child);
+                read_table_page_ref(pager, child, rows)?;
             }
 
             if let Some(right_most) = header.right_most_child {
                 let right_most =
                     PageId::try_new(right_most).ok_or(Error::Corrupted("child page id is zero"))?;
-                children.push(right_most);
-            }
-
-            for child in children {
-                read_table_page_ref(pager, child, rows)?;
+                read_table_page_ref(pager, right_most, rows)?;
             }
         }
     }
@@ -258,14 +278,10 @@ fn decode_record_ref<'a>(payload: &'a [u8]) -> Result<Vec<ValueRef<'a>>> {
     }
 
     let mut serial_decoder = Decoder::new(&payload[header_len_len..header_len]);
-    let mut serials = Vec::new();
-    while serial_decoder.remaining() > 0 {
-        serials.push(serial_decoder.read_varint());
-    }
-
     let mut value_decoder = Decoder::new(&payload[header_len..]);
-    let mut values = Vec::with_capacity(serials.len());
-    for serial in serials {
+    let mut values = Vec::with_capacity(8);
+    while serial_decoder.remaining() > 0 {
+        let serial = serial_decoder.read_varint();
         values.push(decode_value_ref(serial, &mut value_decoder)?);
     }
 
@@ -333,7 +349,8 @@ enum BTreeKind {
 
 struct BTreeHeader {
     kind: BTreeKind,
-    cell_offsets: Vec<u16>,
+    cell_count: u16,
+    cell_ptrs_start: usize,
     right_most_child: Option<u32>,
 }
 
@@ -345,21 +362,25 @@ fn parse_header(page: &Page) -> Result<BTreeHeader> {
     let _start_of_cell_content = decoder.read_u16();
     let _fragmented_free_bytes = decoder.read_u8();
 
-    let right_most_child = match page_type {
-        0x05 | 0x02 => Some(decoder.read_u32()),
-        _ => None,
-    };
-
-    let mut cell_offsets = Vec::with_capacity(cell_count as usize);
-    for _ in 0..cell_count {
-        cell_offsets.push(decoder.read_u16());
-    }
-
     let kind = match page_type {
         0x0D => BTreeKind::TableLeaf,
         0x05 => BTreeKind::TableInterior,
         _ => return Err(Error::UnsupportedPageType(page_type)),
     };
 
-    Ok(BTreeHeader { kind, cell_offsets, right_most_child })
+    let right_most_child = match kind {
+        BTreeKind::TableInterior => Some(decoder.read_u32()),
+        BTreeKind::TableLeaf => None,
+    };
+
+    let header_size = match kind {
+        BTreeKind::TableLeaf => 8,
+        BTreeKind::TableInterior => 12,
+    };
+    let cell_ptrs_start = page
+        .offset()
+        .checked_add(header_size)
+        .ok_or(Error::Corrupted("cell pointer array overflow"))?;
+
+    Ok(BTreeHeader { kind, cell_count, cell_ptrs_start, right_most_child })
 }

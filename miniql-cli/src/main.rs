@@ -2,7 +2,7 @@ use std::fs::File;
 use std::process;
 
 use miniql::pager::{PageId, Pager};
-use miniql::table::{self, TableRow};
+use miniql::table::{self, TableRowRef};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -14,29 +14,29 @@ fn main() {
         process::exit(1);
     });
 
-    let mut pager = Pager::new(file).unwrap_or_else(|err| {
+    let pager = Pager::new(file).unwrap_or_else(|err| {
         eprintln!("Failed to create pager: {err}");
         process::exit(1);
     });
 
-    if let Err(err) = print_table(&mut pager, &table_name) {
+    if let Err(err) = print_table(&pager, &table_name) {
         eprintln!("Error: {err}");
         process::exit(1);
     }
 }
 
-fn print_table(pager: &mut Pager, table_name: &str) -> Result<(), table::Error> {
+fn print_table(pager: &Pager, table_name: &str) -> Result<(), table::Error> {
     let root_page = if table_name == "sqlite_schema" {
         PageId::ROOT
     } else {
-        let schema_rows = table::read_table(pager, PageId::ROOT)?;
+        let schema_rows = table::read_table_ref(pager, PageId::ROOT)?;
         let root_page = find_root_page(&schema_rows, table_name)
             .ok_or_else(|| table::Error::TableNotFound(table_name.to_owned()))?;
 
         PageId::try_new(root_page).ok_or(table::Error::Corrupted("table root page is zero"))?
     };
 
-    let rows = table::read_table(pager, root_page)?;
+    let rows = table::read_table_ref(pager, root_page)?;
     println!("table: {table_name} (root page {})", root_page.into_inner());
     for row in rows {
         print_row(&row);
@@ -45,7 +45,7 @@ fn print_table(pager: &mut Pager, table_name: &str) -> Result<(), table::Error> 
     Ok(())
 }
 
-fn find_root_page(rows: &[TableRow], table_name: &str) -> Option<u32> {
+fn find_root_page(rows: &[TableRowRef<'_>], table_name: &str) -> Option<u32> {
     rows.iter().find_map(|row| {
         if row.values.len() < 4 {
             return None;
@@ -59,7 +59,7 @@ fn find_root_page(rows: &[TableRow], table_name: &str) -> Option<u32> {
     })
 }
 
-fn print_row(row: &TableRow) {
+fn print_row(row: &TableRowRef<'_>) {
     print!("{:>6} |", row.rowid);
     for value in &row.values {
         print!(" {value} |");
