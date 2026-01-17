@@ -15,8 +15,13 @@ fn bench_read_sqlite_schema_ref_hot(c: &mut Criterion) {
     let pager = Pager::new(file).expect("create pager");
     c.bench_function("read_sqlite_schema_ref_hot", |b| {
         b.iter(|| {
-            let rows = table::read_table_ref(&pager, PageId::ROOT).expect("read sqlite_schema");
-            black_box(rows.len());
+            let mut rows = 0usize;
+            table::scan_table_ref(&pager, PageId::ROOT, |_, _| {
+                rows += 1;
+                Ok(())
+            })
+            .expect("read sqlite_schema");
+            black_box(rows);
         });
     });
 }
@@ -27,8 +32,13 @@ fn bench_read_users_table_ref_hot(c: &mut Criterion) {
     let pager = Pager::new(file).expect("create pager");
     c.bench_function("read_users_table_ref_hot", |b| {
         b.iter(|| {
-            let rows = table::read_table_ref(&pager, PageId::new(2)).expect("read users table");
-            black_box(rows.len());
+            let mut rows = 0usize;
+            table::scan_table_ref(&pager, PageId::new(2), |_, _| {
+                rows += 1;
+                Ok(())
+            })
+            .expect("read users table");
+            black_box(rows);
         });
     });
 }
@@ -42,8 +52,13 @@ fn bench_read_sqlite_schema_ref_cold(c: &mut Criterion) {
                 Pager::new(file).expect("create pager")
             },
             |pager| {
-                let rows = table::read_table_ref(&pager, PageId::ROOT).expect("read sqlite_schema");
-                black_box(rows.len());
+                let mut rows = 0usize;
+                table::scan_table_ref(&pager, PageId::ROOT, |_, _| {
+                    rows += 1;
+                    Ok(())
+                })
+                .expect("read sqlite_schema");
+                black_box(rows);
             },
             BatchSize::PerIteration,
         );
@@ -59,8 +74,13 @@ fn bench_read_users_table_ref_cold(c: &mut Criterion) {
                 Pager::new(file).expect("create pager")
             },
             |pager| {
-                let rows = table::read_table_ref(&pager, PageId::new(2)).expect("read users table");
-                black_box(rows.len());
+                let mut rows = 0usize;
+                table::scan_table_ref(&pager, PageId::new(2), |_, _| {
+                    rows += 1;
+                    Ok(())
+                })
+                .expect("read users table");
+                black_box(rows);
             },
             BatchSize::PerIteration,
         );

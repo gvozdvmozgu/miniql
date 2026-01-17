@@ -2,7 +2,7 @@ use std::fs::File;
 use std::process;
 
 use miniql::pager::{PageId, Pager};
-use miniql::table::{self, TableRowRef};
+use miniql::table::{self, ValueRef};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -29,39 +29,50 @@ fn print_table(pager: &Pager, table_name: &str) -> Result<(), table::Error> {
     let root_page = if table_name == "sqlite_schema" {
         PageId::ROOT
     } else {
-        let schema_rows = table::read_table_ref(pager, PageId::ROOT)?;
-        let root_page = find_root_page(&schema_rows, table_name)
-            .ok_or_else(|| table::Error::TableNotFound(table_name.to_owned()))?;
-
-        PageId::try_new(root_page).ok_or(table::Error::Corrupted("table root page is zero"))?
+        find_root_page(pager, table_name)?
     };
 
-    let rows = table::read_table_ref(pager, root_page)?;
     println!("table: {table_name} (root page {})", root_page.into_inner());
-    for row in rows {
-        print_row(&row);
-    }
+    table::scan_table_ref(pager, root_page, |rowid, values| {
+        print_row(rowid, values);
+        Ok(())
+    })?;
 
     Ok(())
 }
 
-fn find_root_page(rows: &[TableRowRef<'_>], table_name: &str) -> Option<u32> {
-    rows.iter().find_map(|row| {
-        if row.values.len() < 4 {
-            return None;
+fn find_root_page(pager: &Pager, table_name: &str) -> Result<PageId, table::Error> {
+    let mut found = None;
+    table::scan_table_ref(pager, PageId::ROOT, |_, values| {
+        if found.is_some() {
+            return Ok(());
+        }
+        if values.len() < 4 {
+            return Ok(());
         }
 
-        let row_type = row.values.first()?.as_text()?;
-        let name = row.values.get(1)?.as_text()?;
-        let root_page = row.values.get(3)?.as_integer()?;
+        let row_type = values[0].as_text();
+        let name = values[1].as_text();
+        let root_page = values[3].as_integer();
 
-        if row_type == "table" && name == table_name { u32::try_from(root_page).ok() } else { None }
-    })
+        if let (Some(row_type), Some(name), Some(root_page)) = (row_type, name, root_page)
+            && row_type == "table"
+            && name == table_name
+            && let Ok(root_page) = u32::try_from(root_page)
+        {
+            found = Some(root_page);
+        }
+
+        Ok(())
+    })?;
+
+    let root_page = found.ok_or_else(|| table::Error::TableNotFound(table_name.to_owned()))?;
+    PageId::try_new(root_page).ok_or(table::Error::Corrupted("table root page is zero"))
 }
 
-fn print_row(row: &TableRowRef<'_>) {
-    print!("{:>6} |", row.rowid);
-    for value in &row.values {
+fn print_row(rowid: i64, values: &[ValueRef<'_>]) {
+    print!("{:>6} |", rowid);
+    for value in values {
         print!(" {value} |");
     }
     println!();

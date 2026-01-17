@@ -25,16 +25,16 @@ fn users_root_page(rows: &[TableRow]) -> Option<u32> {
 
 #[test]
 fn reads_schema_and_finds_users_root() {
-    let mut pager = open_pager();
-    let rows = table::read_table(&mut pager, PageId::ROOT).expect("read sqlite_schema");
+    let pager = open_pager();
+    let rows = table::read_table(&pager, PageId::ROOT).expect("read sqlite_schema");
     let root = users_root_page(&rows).expect("users table entry in sqlite_schema");
     assert_eq!(root, 2);
 }
 
 #[test]
 fn reads_users_table_rows() {
-    let mut pager = open_pager();
-    let rows = table::read_table(&mut pager, PageId::new(2)).expect("read users table");
+    let pager = open_pager();
+    let rows = table::read_table(&pager, PageId::new(2)).expect("read users table");
 
     assert_eq!(rows.len(), 2);
 
@@ -72,4 +72,34 @@ fn reads_users_table_rows_by_ref() {
     assert!(matches!(second.values[0], ValueRef::Null));
     assert_eq!(second.values[1].as_text(), Some("bob"));
     assert_eq!(second.values[2].as_integer(), Some(25));
+}
+
+#[test]
+fn scans_users_table_rows() {
+    let pager = open_pager();
+    let mut seen = 0usize;
+    table::scan_table_ref(&pager, PageId::new(2), |rowid, values| {
+        match seen {
+            0 => {
+                assert_eq!(rowid, 1);
+                assert_eq!(values.len(), 3);
+                assert!(matches!(values[0], ValueRef::Null));
+                assert_eq!(values[1].as_text(), Some("alice"));
+                assert_eq!(values[2].as_integer(), Some(30));
+            }
+            1 => {
+                assert_eq!(rowid, 2);
+                assert_eq!(values.len(), 3);
+                assert!(matches!(values[0], ValueRef::Null));
+                assert_eq!(values[1].as_text(), Some("bob"));
+                assert_eq!(values[2].as_integer(), Some(25));
+            }
+            _ => panic!("unexpected extra row"),
+        }
+        seen += 1;
+        Ok(())
+    })
+    .expect("scan users table");
+
+    assert_eq!(seen, 2);
 }
