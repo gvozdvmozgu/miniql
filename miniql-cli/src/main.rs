@@ -42,32 +42,29 @@ fn print_table(pager: &Pager, table_name: &str) -> Result<(), table::Error> {
 }
 
 fn find_root_page(pager: &Pager, table_name: &str) -> Result<PageId, table::Error> {
-    let mut found = None;
-    table::scan_table_ref(pager, PageId::ROOT, |_, values| {
-        if found.is_some() {
-            return Ok(());
-        }
+    let found = table::scan_table_ref_until(pager, PageId::ROOT, |_, values| {
         if values.len() < 4 {
-            return Ok(());
+            return Ok(None);
         }
 
         let row_type = values[0].as_text();
         let name = values[1].as_text();
         let root_page = values[3].as_integer();
 
-        if let (Some(row_type), Some(name), Some(root_page)) = (row_type, name, root_page)
-            && row_type == "table"
+        if let (Some("table"), Some(name), Some(root_page)) = (row_type, name, root_page)
             && name == table_name
             && let Ok(root_page) = u32::try_from(root_page)
         {
-            found = Some(root_page);
+            return match PageId::try_new(root_page) {
+                Some(page_id) => Ok(Some(page_id)),
+                None => Err(table::Error::Corrupted("table root page is zero")),
+            };
         }
 
-        Ok(())
+        Ok(None)
     })?;
 
-    let root_page = found.ok_or_else(|| table::Error::TableNotFound(table_name.to_owned()))?;
-    PageId::try_new(root_page).ok_or(table::Error::Corrupted("table root page is zero"))
+    found.ok_or_else(|| table::Error::TableNotFound(table_name.to_owned()))
 }
 
 fn print_row(rowid: i64, values: &[ValueRef<'_>]) {

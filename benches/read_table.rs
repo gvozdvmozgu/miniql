@@ -13,10 +13,11 @@ fn bench_read_sqlite_schema_ref_hot(c: &mut Criterion) {
     let db_path = fixture_path();
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
+    let mut scratch = Vec::with_capacity(8);
     c.bench_function("read_sqlite_schema_ref_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            table::scan_table_ref(&pager, PageId::ROOT, |_, _| {
+            table::scan_table_ref_with_scratch(&pager, PageId::ROOT, &mut scratch, |_, _| {
                 rows += 1;
                 Ok(())
             })
@@ -30,10 +31,11 @@ fn bench_read_users_table_ref_hot(c: &mut Criterion) {
     let db_path = fixture_path();
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
+    let mut scratch = Vec::with_capacity(8);
     c.bench_function("read_users_table_ref_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            table::scan_table_ref(&pager, PageId::new(2), |_, _| {
+            table::scan_table_ref_with_scratch(&pager, PageId::new(2), &mut scratch, |_, _| {
                 rows += 1;
                 Ok(())
             })
@@ -53,7 +55,8 @@ fn bench_read_sqlite_schema_ref_cold(c: &mut Criterion) {
             },
             |pager| {
                 let mut rows = 0usize;
-                table::scan_table_ref(&pager, PageId::ROOT, |_, _| {
+                let mut scratch = Vec::with_capacity(8);
+                table::scan_table_ref_with_scratch(&pager, PageId::ROOT, &mut scratch, |_, _| {
                     rows += 1;
                     Ok(())
                 })
@@ -75,7 +78,8 @@ fn bench_read_users_table_ref_cold(c: &mut Criterion) {
             },
             |pager| {
                 let mut rows = 0usize;
-                table::scan_table_ref(&pager, PageId::new(2), |_, _| {
+                let mut scratch = Vec::with_capacity(8);
+                table::scan_table_ref_with_scratch(&pager, PageId::new(2), &mut scratch, |_, _| {
                     rows += 1;
                     Ok(())
                 })

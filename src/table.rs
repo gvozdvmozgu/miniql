@@ -180,12 +180,37 @@ pub fn read_table_ref<'a>(pager: &'a Pager, page_id: PageId) -> Result<Vec<Table
     Ok(rows)
 }
 
-pub fn scan_table_ref<'a, F>(pager: &'a Pager, page_id: PageId, mut f: F) -> Result<()>
+pub fn scan_table_ref_with_scratch<'a, F>(
+    pager: &'a Pager,
+    page_id: PageId,
+    scratch: &mut Vec<ValueRef<'a>>,
+    mut f: F,
+) -> Result<()>
+where
+    F: for<'row> FnMut(i64, &'row [ValueRef<'a>]) -> Result<()>,
+{
+    scratch.clear();
+    scan_table_page_ref(pager, page_id, scratch, &mut f)
+}
+
+pub fn scan_table_ref<'a, F>(pager: &'a Pager, page_id: PageId, f: F) -> Result<()>
 where
     F: for<'row> FnMut(i64, &'row [ValueRef<'a>]) -> Result<()>,
 {
     let mut scratch = Vec::with_capacity(8);
-    scan_table_page_ref(pager, page_id, &mut scratch, &mut f)
+    scan_table_ref_with_scratch(pager, page_id, &mut scratch, f)
+}
+
+pub fn scan_table_ref_until<'a, F, T>(
+    pager: &'a Pager,
+    page_id: PageId,
+    mut f: F,
+) -> Result<Option<T>>
+where
+    F: for<'row> FnMut(i64, &'row [ValueRef<'a>]) -> Result<Option<T>>,
+{
+    let mut scratch = Vec::with_capacity(8);
+    scan_table_page_ref_until(pager, page_id, &mut scratch, &mut f)
 }
 
 fn read_table_page_ref<'a>(
@@ -286,6 +311,64 @@ where
     }
 
     Ok(())
+}
+
+fn scan_table_page_ref_until<'a, F, T>(
+    pager: &'a Pager,
+    page_id: PageId,
+    scratch: &mut Vec<ValueRef<'a>>,
+    f: &mut F,
+) -> Result<Option<T>>
+where
+    F: for<'row> FnMut(i64, &'row [ValueRef<'a>]) -> Result<Option<T>>,
+{
+    pager.read_page(page_id)?;
+    let page = pager.page(page_id).ok_or(Error::Corrupted("missing page after read"))?;
+    let header = parse_header(page)?;
+
+    let cell_ptrs = cell_ptrs(page, &header)?;
+
+    match header.kind {
+        BTreeKind::TableLeaf => {
+            for idx in 0..header.cell_count as usize {
+                let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
+                let rowid = read_table_cell_into(page, offset, scratch)?;
+                if let Some(value) = f(rowid, scratch.as_slice())? {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        BTreeKind::TableInterior => {
+            let page_len = page.bytes().len();
+            for idx in 0..header.cell_count as usize {
+                let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
+                if offset as usize >= page_len {
+                    return Err(Error::Corrupted("cell offset out of bounds"));
+                }
+
+                let mut decoder = page.decoder().split_at(offset as usize);
+                let child = decoder.read_u32();
+                let child =
+                    PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
+
+                // Skip the key separating subtrees; it is not needed for scanning.
+                let _ = decoder.read_varint();
+                if let Some(value) = scan_table_page_ref_until(pager, child, scratch, f)? {
+                    return Ok(Some(value));
+                }
+            }
+
+            if let Some(right_most) = header.right_most_child {
+                let right_most =
+                    PageId::try_new(right_most).ok_or(Error::Corrupted("child page id is zero"))?;
+                if let Some(value) = scan_table_page_ref_until(pager, right_most, scratch, f)? {
+                    return Ok(Some(value));
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 fn read_table_cell_ref<'a>(page: &'a Page, offset: u16) -> Result<TableRowRef<'a>> {
