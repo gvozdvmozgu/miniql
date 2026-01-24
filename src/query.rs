@@ -1,5 +1,5 @@
 use crate::pager::{PageId, Pager};
-use crate::table::{self, ValueRef};
+use crate::table::{self, ValueRef, ValueRefRaw};
 
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -127,7 +127,7 @@ impl std::ops::Not for Expr {
 
 #[derive(Debug, Default)]
 pub struct ScanScratch {
-    decoded: Vec<ValueRef<'static>>,
+    decoded: Vec<ValueRefRaw>,
     overflow_buf: Vec<u8>,
     serial_types: Vec<u64>,
 }
@@ -145,13 +145,13 @@ impl ScanScratch {
         }
     }
 
-    fn split_mut(&mut self) -> (&mut Vec<ValueRef<'static>>, &mut Vec<u64>, &mut Vec<u8>) {
+    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u64>, &mut Vec<u8>) {
         (&mut self.decoded, &mut self.serial_types, &mut self.overflow_buf)
     }
 }
 
 pub struct Row<'row> {
-    values: &'row [ValueRef<'row>],
+    values: &'row [ValueRefRaw],
     proj_map: Option<&'row [usize]>,
 }
 
@@ -169,7 +169,7 @@ impl<'row> Row<'row> {
             Some(map) => *map.get(i)?,
             None => i,
         };
-        self.values.get(idx).copied()
+        self.values.get(idx).copied().map(raw_to_ref)
     }
 
     pub fn get_i64(&self, i: usize) -> table::Result<i64> {
@@ -287,9 +287,8 @@ impl<'db> Scan<'db> {
             serial_types.clear();
 
             let needed_cols = plan.needed_cols.as_deref();
-            let decoded_row = decoded_mut(decoded);
             let count =
-                table::decode_record_project_into(payload, needed_cols, decoded_row, serial_types)?;
+                table::decode_record_project_into(payload, needed_cols, decoded, serial_types)?;
 
             if col_count.is_none() {
                 if let Some(err) = validate_columns(&plan.referenced_cols, count) {
@@ -298,7 +297,7 @@ impl<'db> Scan<'db> {
                 col_count = Some(count);
             }
 
-            let values = decoded_slice(decoded);
+            let values = decoded.as_slice();
             let row_eval = RowEval { values, needed_cols, column_count: count };
 
             if let Some(expr) = filter_expr.as_ref()
@@ -383,14 +382,10 @@ fn validate_columns(referenced: &[u16], column_count: usize) -> Option<table::Er
     None
 }
 
-fn decoded_mut<'row>(decoded: &'row mut Vec<ValueRef<'static>>) -> &'row mut Vec<ValueRef<'row>> {
-    // SAFETY: values are cleared each row and only used within the row callback.
-    unsafe { std::mem::transmute::<&mut Vec<ValueRef<'static>>, &mut Vec<ValueRef<'row>>>(decoded) }
-}
-
-fn decoded_slice<'row>(decoded: &'row Vec<ValueRef<'static>>) -> &'row [ValueRef<'row>] {
-    // SAFETY: decoded values are only exposed while the row borrow is alive.
-    unsafe { std::mem::transmute::<&[ValueRef<'static>], &[ValueRef<'row>]>(decoded.as_slice()) }
+fn raw_to_ref<'row>(value: ValueRefRaw) -> ValueRef<'row> {
+    // SAFETY: raw values point into the current row payload/overflow buffer and
+    // are only materialized for the duration of the row callback.
+    unsafe { value.as_value_ref() }
 }
 
 fn value_kind(value: ValueRef<'_>) -> &'static str {
@@ -449,7 +444,7 @@ enum CmpOp {
 }
 
 struct RowEval<'row, 'map> {
-    values: &'row [ValueRef<'row>],
+    values: &'row [ValueRefRaw],
     needed_cols: Option<&'map [u16]>,
     column_count: usize,
 }
@@ -464,9 +459,12 @@ impl<'row> RowEval<'row, '_> {
     fn value(&self, col: u16) -> Option<ValueRef<'row>> {
         match self.needed_cols {
             Some(cols) => {
-                cols.binary_search(&col).ok().and_then(|idx| self.values.get(idx).copied())
+                cols.binary_search(&col)
+                    .ok()
+                    .and_then(|idx| self.values.get(idx).copied())
+                    .map(raw_to_ref)
             }
-            None => self.values.get(col as usize).copied(),
+            None => self.values.get(col as usize).copied().map(raw_to_ref),
         }
     }
 }

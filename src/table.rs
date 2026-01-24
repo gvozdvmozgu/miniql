@@ -124,6 +124,46 @@ pub enum ValueRef<'row> {
     Blob(&'row [u8]),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RawBytes {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl RawBytes {
+    #[inline]
+    fn from_slice(bytes: &[u8]) -> Self {
+        Self { ptr: bytes.as_ptr(), len: bytes.len() }
+    }
+
+    #[inline]
+    unsafe fn as_slice<'row>(self) -> &'row [u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ValueRefRaw {
+    Null,
+    Integer(i64),
+    Real(f64),
+    TextBytes(RawBytes),
+    Blob(RawBytes),
+}
+
+impl ValueRefRaw {
+    #[inline]
+    pub(crate) unsafe fn as_value_ref<'row>(self) -> ValueRef<'row> {
+        match self {
+            Self::Null => ValueRef::Null,
+            Self::Integer(value) => ValueRef::Integer(value),
+            Self::Real(value) => ValueRef::Real(value),
+            Self::TextBytes(bytes) => ValueRef::TextBytes(unsafe { bytes.as_slice() }),
+            Self::Blob(bytes) => ValueRef::Blob(unsafe { bytes.as_slice() }),
+        }
+    }
+}
+
 impl<'row> ValueRef<'row> {
     pub fn as_text(&self) -> Option<&'row str> {
         match self {
@@ -184,7 +224,7 @@ pub struct TableRow {
 
 #[derive(Debug, Default)]
 pub struct RowScratch {
-    values: Vec<ValueRef<'static>>,
+    values: Vec<ValueRefRaw>,
     overflow_buf: Vec<u8>,
 }
 
@@ -202,23 +242,23 @@ impl RowScratch {
         self.overflow_buf.clear();
     }
 
-    fn split_mut<'row>(&'row mut self) -> (&'row mut Vec<ValueRef<'row>>, &'row mut Vec<u8>) {
-        let values = &mut self.values;
-        let overflow = &mut self.overflow_buf;
-        // SAFETY: values are cleared at row start and only hold references
-        // valid for the duration of the current row callback.
-        let values = unsafe {
-            std::mem::transmute::<&mut Vec<ValueRef<'static>>, &mut Vec<ValueRef<'row>>>(values)
-        };
-        (values, overflow)
+    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>) {
+        (&mut self.values, &mut self.overflow_buf)
     }
 
-    fn values_slice<'row>(&'row self) -> &'row [ValueRef<'row>] {
-        // SAFETY: values are only accessed while the row-scoped borrow is alive.
-        unsafe {
-            std::mem::transmute::<&[ValueRef<'static>], &[ValueRef<'row>]>(self.values.as_slice())
-        }
+    fn values_slice(&self) -> &[ValueRefRaw] {
+        self.values.as_slice()
     }
+}
+
+fn materialize_values<'row>(raw: &'row [ValueRefRaw]) -> Vec<ValueRef<'row>> {
+    let mut values = Vec::with_capacity(raw.len());
+    for value in raw {
+        // SAFETY: raw values point into the current row payload/overflow buffer and
+        // are only materialized for the duration of this callback.
+        values.push(unsafe { value.as_value_ref() });
+    }
+    values
 }
 
 pub fn read_table(pager: &Pager, page_id: PageId) -> Result<Vec<TableRow>> {
@@ -310,7 +350,9 @@ where
             for idx in 0..header.cell_count as usize {
                 let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
                 let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
-                f(rowid, scratch.values_slice())?;
+                let raw_values = scratch.values_slice();
+                let values = materialize_values(raw_values);
+                f(rowid, values.as_slice())?;
             }
         }
         BTreeKind::TableInterior => {
@@ -411,7 +453,9 @@ where
             for idx in 0..header.cell_count as usize {
                 let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
                 let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
-                if let Some(value) = f(rowid, scratch.values_slice())? {
+                let raw_values = scratch.values_slice();
+                let values = materialize_values(raw_values);
+                if let Some(value) = f(rowid, values.as_slice())? {
                     return Ok(Some(value));
                 }
             }
@@ -641,7 +685,7 @@ fn assemble_overflow_payload(
 pub(crate) fn decode_record_project_into<'row>(
     payload: &'row [u8],
     needed_cols: Option<&[u16]>,
-    out: &mut Vec<ValueRef<'row>>,
+    out: &mut Vec<ValueRefRaw>,
     serial_types: &mut Vec<u64>,
 ) -> Result<usize> {
     out.clear();
@@ -684,7 +728,7 @@ pub(crate) fn decode_record_project_into<'row>(
     Ok(serial_types.len())
 }
 
-fn decode_record_into<'row>(payload: &'row [u8], out: &mut Vec<ValueRef<'row>>) -> Result<()> {
+fn decode_record_into<'row>(payload: &'row [u8], out: &mut Vec<ValueRefRaw>) -> Result<()> {
     out.clear();
 
     let mut header_decoder = Decoder::new(payload);
@@ -729,25 +773,25 @@ fn serial_type_len(serial_type: u64) -> Result<usize> {
     }
 }
 
-fn decode_value_ref<'row>(serial_type: u64, decoder: &mut Decoder<'row>) -> Result<ValueRef<'row>> {
+fn decode_value_ref<'row>(serial_type: u64, decoder: &mut Decoder<'row>) -> Result<ValueRefRaw> {
     let value = match serial_type {
-        0 => ValueRef::Null,
-        1 => ValueRef::Integer(read_signed_be(decoder, 1)?),
-        2 => ValueRef::Integer(read_signed_be(decoder, 2)?),
-        3 => ValueRef::Integer(read_signed_be(decoder, 3)?),
-        4 => ValueRef::Integer(read_signed_be(decoder, 4)?),
-        5 => ValueRef::Integer(read_signed_be(decoder, 6)?),
-        6 => ValueRef::Integer(read_signed_be(decoder, 8)?),
-        7 => ValueRef::Real(f64::from_bits(read_u64_be(decoder)?)),
-        8 => ValueRef::Integer(0),
-        9 => ValueRef::Integer(1),
+        0 => ValueRefRaw::Null,
+        1 => ValueRefRaw::Integer(read_signed_be(decoder, 1)?),
+        2 => ValueRefRaw::Integer(read_signed_be(decoder, 2)?),
+        3 => ValueRefRaw::Integer(read_signed_be(decoder, 3)?),
+        4 => ValueRefRaw::Integer(read_signed_be(decoder, 4)?),
+        5 => ValueRefRaw::Integer(read_signed_be(decoder, 6)?),
+        6 => ValueRefRaw::Integer(read_signed_be(decoder, 8)?),
+        7 => ValueRefRaw::Real(f64::from_bits(read_u64_be(decoder)?)),
+        8 => ValueRefRaw::Integer(0),
+        9 => ValueRefRaw::Integer(1),
         serial if serial >= 12 && serial % 2 == 0 => {
             let len = ((serial - 12) / 2) as usize;
-            ValueRef::Blob(read_exact_bytes(decoder, len)?)
+            ValueRefRaw::Blob(RawBytes::from_slice(read_exact_bytes(decoder, len)?))
         }
         serial if serial >= 13 => {
             let len = ((serial - 13) / 2) as usize;
-            ValueRef::TextBytes(read_exact_bytes(decoder, len)?)
+            ValueRefRaw::TextBytes(RawBytes::from_slice(read_exact_bytes(decoder, len)?))
         }
         other => return Err(Error::UnsupportedSerialType(other)),
     };
