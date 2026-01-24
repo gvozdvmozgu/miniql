@@ -255,6 +255,7 @@ pub struct TableRow {
 pub struct RowScratch {
     values: Vec<ValueRefRaw>,
     overflow_buf: Vec<u8>,
+    btree_stack: Vec<PageId>,
 }
 
 impl RowScratch {
@@ -263,7 +264,19 @@ impl RowScratch {
     }
 
     pub fn with_capacity(values: usize, overflow: usize) -> Self {
-        Self { values: Vec::with_capacity(values), overflow_buf: Vec::with_capacity(overflow) }
+        Self {
+            values: Vec::with_capacity(values),
+            overflow_buf: Vec::with_capacity(overflow),
+            btree_stack: Vec::new(),
+        }
+    }
+
+    fn take_stack(&mut self) -> Vec<PageId> {
+        std::mem::take(&mut self.btree_stack)
+    }
+
+    fn return_stack(&mut self, stack: Vec<PageId>) {
+        self.btree_stack = stack;
     }
 
     fn prepare_row(&mut self) {
@@ -338,16 +351,19 @@ where
     scan_table_page_cells(pager, page_id, overflow_buf, &mut f)
 }
 
-pub(crate) fn scan_table_cells_with_scratch_until<F, T>(
+pub(crate) fn scan_table_cells_with_scratch_and_stack_until<F, T>(
     pager: &Pager,
     page_id: PageId,
     overflow_buf: &mut Vec<u8>,
+    stack: &mut Vec<PageId>,
     mut f: F,
 ) -> Result<Option<T>>
 where
     F: for<'row> FnMut(i64, &'row [u8]) -> Result<Option<T>>,
 {
-    scan_table_page_cells_until(pager, page_id, overflow_buf, &mut f)
+    stack.clear();
+    stack.push(page_id);
+    scan_table_page_cells_until_with_stack(pager, stack, overflow_buf, &mut f)
 }
 
 fn scan_table_page_ref<'pager, F>(
@@ -359,57 +375,66 @@ fn scan_table_page_ref<'pager, F>(
 where
     F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
 {
-    let mut stack = vec![page_id];
+    let mut stack = scratch.take_stack();
+    stack.clear();
+    stack.push(page_id);
     let max_pages = pager.page_count().max(1);
     let mut seen_pages = 0u32;
 
-    while let Some(page_id) = stack.pop() {
-        seen_pages += 1;
-        if seen_pages > max_pages {
-            return Err(Error::Corrupted("btree page cycle detected"));
-        }
-
-        let page = pager.page(page_id)?;
-        let header = parse_header(&page)?;
-        let cell_ptrs = cell_ptrs(&page, &header)?;
-
-        match header.kind {
-            BTreeKind::TableLeaf => {
-                for idx in 0..header.cell_count as usize {
-                    let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                    let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
-                    let row = RowView { values: scratch.values_slice() };
-                    f(rowid, row)?;
-                }
+    let result = (|| {
+        while let Some(page_id) = stack.pop() {
+            seen_pages += 1;
+            if seen_pages > max_pages {
+                return Err(Error::Corrupted("btree page cycle detected"));
             }
-            BTreeKind::TableInterior => {
-                if let Some(right_most) = header.right_most_child {
-                    let right_most = PageId::try_new(right_most)
-                        .ok_or(Error::Corrupted("child page id is zero"))?;
-                    stack.push(right_most);
-                }
 
-                let page_len = page.usable_bytes().len();
-                for idx in (0..header.cell_count as usize).rev() {
-                    let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                    if offset as usize >= page_len {
-                        return Err(Error::Corrupted("cell offset out of bounds"));
+            let page = pager.page(page_id)?;
+            let header = parse_header(&page)?;
+            let cell_ptrs = cell_ptrs(&page, &header)?;
+
+            match header.kind {
+                BTreeKind::TableLeaf => {
+                    for idx in 0..header.cell_count as usize {
+                        let offset =
+                            u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
+                        let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
+                        let row = RowView { values: scratch.values_slice() };
+                        f(rowid, row)?;
+                    }
+                }
+                BTreeKind::TableInterior => {
+                    if let Some(right_most) = header.right_most_child {
+                        let right_most = PageId::try_new(right_most)
+                            .ok_or(Error::Corrupted("child page id is zero"))?;
+                        stack.push(right_most);
                     }
 
-                    let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
-                    let child = read_u32_checked(&mut decoder, "cell child pointer truncated")?;
-                    let child =
-                        PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
+                    let page_len = page.usable_bytes().len();
+                    for idx in (0..header.cell_count as usize).rev() {
+                        let offset =
+                            u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
+                        if offset as usize >= page_len {
+                            return Err(Error::Corrupted("cell offset out of bounds"));
+                        }
 
-                    // Skip the key separating subtrees; it is not needed for scanning.
-                    let _ = read_varint_checked(&mut decoder, "cell key truncated")?;
-                    stack.push(child);
+                        let mut decoder =
+                            Decoder::new(page.usable_bytes()).split_at(offset as usize);
+                        let child = read_u32_checked(&mut decoder, "cell child pointer truncated")?;
+                        let child = PageId::try_new(child)
+                            .ok_or(Error::Corrupted("child page id is zero"))?;
+
+                        // Skip the key separating subtrees; it is not needed for scanning.
+                        let _ = read_varint_checked(&mut decoder, "cell key truncated")?;
+                        stack.push(child);
+                    }
                 }
             }
         }
-    }
+        Ok(())
+    })();
 
-    Ok(())
+    scratch.return_stack(stack);
+    result
 }
 
 fn scan_table_page_cells<'pager, F>(
@@ -422,6 +447,18 @@ where
     F: for<'row> FnMut(i64, &'row [u8]) -> Result<()>,
 {
     let mut stack = vec![page_id];
+    scan_table_page_cells_with_stack(pager, &mut stack, overflow_buf, f)
+}
+
+fn scan_table_page_cells_with_stack<'pager, F>(
+    pager: &'pager Pager,
+    stack: &mut Vec<PageId>,
+    overflow_buf: &mut Vec<u8>,
+    f: &mut F,
+) -> Result<()>
+where
+    F: for<'row> FnMut(i64, &'row [u8]) -> Result<()>,
+{
     let max_pages = pager.page_count().max(1);
     let mut seen_pages = 0u32;
 
@@ -537,16 +574,15 @@ where
     Ok(None)
 }
 
-fn scan_table_page_cells_until<'pager, F, T>(
+fn scan_table_page_cells_until_with_stack<'pager, F, T>(
     pager: &'pager Pager,
-    page_id: PageId,
+    stack: &mut Vec<PageId>,
     overflow_buf: &mut Vec<u8>,
     f: &mut F,
 ) -> Result<Option<T>>
 where
     F: for<'row> FnMut(i64, &'row [u8]) -> Result<Option<T>>,
 {
-    let mut stack = vec![page_id];
     let max_pages = pager.page_count().max(1);
     let mut seen_pages = 0u32;
 

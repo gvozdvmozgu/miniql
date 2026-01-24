@@ -149,6 +149,7 @@ impl std::ops::Not for Expr {
 pub struct ScanScratch {
     decoded: Vec<ValueRefRaw>,
     overflow_buf: Vec<u8>,
+    btree_stack: Vec<PageId>,
 }
 
 impl ScanScratch {
@@ -157,11 +158,15 @@ impl ScanScratch {
     }
 
     pub fn with_capacity(values: usize, overflow: usize) -> Self {
-        Self { decoded: Vec::with_capacity(values), overflow_buf: Vec::with_capacity(overflow) }
+        Self {
+            decoded: Vec::with_capacity(values),
+            overflow_buf: Vec::with_capacity(overflow),
+            btree_stack: Vec::new(),
+        }
     }
 
-    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>) {
-        (&mut self.decoded, &mut self.overflow_buf)
+    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>, &mut Vec<PageId>) {
+        (&mut self.decoded, &mut self.overflow_buf, &mut self.btree_stack)
     }
 }
 
@@ -329,49 +334,55 @@ impl<'db> CompiledScan<'db> {
         let mut seen = 0usize;
         let mut col_count: Option<usize> = None;
 
-        let (decoded, overflow_buf) = scratch.split_mut();
+        let (decoded, overflow_buf, btree_stack) = scratch.split_mut();
 
-        table::scan_table_cells_with_scratch_until(pager, root, overflow_buf, |rowid, payload| {
-            decoded.clear();
+        table::scan_table_cells_with_scratch_and_stack_until(
+            pager,
+            root,
+            overflow_buf,
+            btree_stack,
+            |rowid, payload| {
+                decoded.clear();
 
-            let needed_cols = plan.needed_cols.as_deref();
-            let count = table::decode_record_project_into(payload, needed_cols, decoded)?;
+                let needed_cols = plan.needed_cols.as_deref();
+                let count = table::decode_record_project_into(payload, needed_cols, decoded)?;
 
-            if col_count.is_none() {
-                if let Some(err) = validate_columns(&plan.referenced_cols, count) {
-                    return Err(err);
+                if col_count.is_none() {
+                    if let Some(err) = validate_columns(&plan.referenced_cols, count) {
+                        return Err(err);
+                    }
+                    col_count = Some(count);
                 }
-                col_count = Some(count);
-            }
 
-            let values = decoded.as_slice();
-            let row_eval = RowEval { values, column_count: count };
+                let values = decoded.as_slice();
+                let row_eval = RowEval { values, column_count: count };
 
-            if let Some(expr) = compiled_expr.as_ref()
-                && eval_compiled_expr(expr, &row_eval)? != Truth::True
-            {
-                return Ok(None);
-            }
-
-            if let Some(filter_fn) = filter_fn.as_mut() {
-                let row_full = Row { values, proj_map: None };
-                if !filter_fn(&row_full)? {
+                if let Some(expr) = compiled_expr.as_ref()
+                    && eval_compiled_expr(expr, &row_eval)? != Truth::True
+                {
                     return Ok(None);
                 }
-            }
 
-            let row = Row { values, proj_map: plan.proj_map.as_deref() };
-            cb(rowid, row)?;
-            seen += 1;
+                if let Some(filter_fn) = filter_fn.as_mut() {
+                    let row_full = Row { values, proj_map: None };
+                    if !filter_fn(&row_full)? {
+                        return Ok(None);
+                    }
+                }
 
-            if let Some(limit) = limit
-                && seen >= limit
-            {
-                return Ok(Some(()));
-            }
+                let row = Row { values, proj_map: plan.proj_map.as_deref() };
+                cb(rowid, row)?;
+                seen += 1;
 
-            Ok(None)
-        })?;
+                if let Some(limit) = limit
+                    && seen >= limit
+                {
+                    return Ok(Some(()));
+                }
+
+                Ok(None)
+            },
+        )?;
 
         Ok(())
     }
