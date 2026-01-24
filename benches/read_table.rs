@@ -3,17 +3,17 @@ use std::path::{Path, PathBuf};
 
 use codspeed_criterion_compat::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use miniql::pager::{PageId, Pager};
-use miniql::table;
+use miniql::table::{self, RowScratch};
 
-fn fixture_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/users.db")
+fn fixture_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
 }
 
 fn bench_read_sqlite_schema_ref_hot(c: &mut Criterion) {
-    let db_path = fixture_path();
+    let db_path = fixture_path("users.db");
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
-    let mut scratch = Vec::with_capacity(8);
+    let mut scratch = RowScratch::with_capacity(8, 0);
     c.bench_function("read_sqlite_schema_ref_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
@@ -28,10 +28,10 @@ fn bench_read_sqlite_schema_ref_hot(c: &mut Criterion) {
 }
 
 fn bench_read_users_table_ref_hot(c: &mut Criterion) {
-    let db_path = fixture_path();
+    let db_path = fixture_path("users.db");
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
-    let mut scratch = Vec::with_capacity(8);
+    let mut scratch = RowScratch::with_capacity(8, 0);
     c.bench_function("read_users_table_ref_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
@@ -46,7 +46,7 @@ fn bench_read_users_table_ref_hot(c: &mut Criterion) {
 }
 
 fn bench_read_sqlite_schema_ref_cold(c: &mut Criterion) {
-    let db_path = fixture_path();
+    let db_path = fixture_path("users.db");
     c.bench_function("read_sqlite_schema_ref_cold", |b| {
         b.iter_batched(
             || {
@@ -55,7 +55,7 @@ fn bench_read_sqlite_schema_ref_cold(c: &mut Criterion) {
             },
             |pager| {
                 let mut rows = 0usize;
-                let mut scratch = Vec::with_capacity(8);
+                let mut scratch = RowScratch::with_capacity(8, 0);
                 table::scan_table_ref_with_scratch(&pager, PageId::ROOT, &mut scratch, |_, _| {
                     rows += 1;
                     Ok(())
@@ -69,7 +69,7 @@ fn bench_read_sqlite_schema_ref_cold(c: &mut Criterion) {
 }
 
 fn bench_read_users_table_ref_cold(c: &mut Criterion) {
-    let db_path = fixture_path();
+    let db_path = fixture_path("users.db");
     c.bench_function("read_users_table_ref_cold", |b| {
         b.iter_batched(
             || {
@@ -78,7 +78,7 @@ fn bench_read_users_table_ref_cold(c: &mut Criterion) {
             },
             |pager| {
                 let mut rows = 0usize;
-                let mut scratch = Vec::with_capacity(8);
+                let mut scratch = RowScratch::with_capacity(8, 0);
                 table::scan_table_ref_with_scratch(&pager, PageId::new(2), &mut scratch, |_, _| {
                     rows += 1;
                     Ok(())
@@ -91,11 +91,30 @@ fn bench_read_users_table_ref_cold(c: &mut Criterion) {
     });
 }
 
+fn bench_read_overflow_table_ref_hot(c: &mut Criterion) {
+    let db_path = fixture_path("overflow.db");
+    let file = File::open(&db_path).expect("open fixture");
+    let pager = Pager::new(file).expect("create pager");
+    let mut scratch = RowScratch::with_capacity(4, 8192);
+    c.bench_function("read_overflow_table_ref_hot", |b| {
+        b.iter(|| {
+            let mut rows = 0usize;
+            table::scan_table_ref_with_scratch(&pager, PageId::new(2), &mut scratch, |_, _| {
+                rows += 1;
+                Ok(())
+            })
+            .expect("read overflow table");
+            black_box(rows);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_read_sqlite_schema_ref_hot,
     bench_read_users_table_ref_hot,
     bench_read_sqlite_schema_ref_cold,
-    bench_read_users_table_ref_cold
+    bench_read_users_table_ref_cold,
+    bench_read_overflow_table_ref_hot
 );
 criterion_main!(benches);

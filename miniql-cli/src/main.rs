@@ -47,12 +47,13 @@ fn find_root_page(pager: &Pager, table_name: &str) -> Result<PageId, table::Erro
             return Ok(None);
         }
 
-        let row_type = values[0].as_text();
-        let name = values[1].as_text();
+        let row_type = values[0].text_bytes();
+        let name = values[1].text_bytes();
         let root_page = values[3].as_integer();
 
-        if let (Some("table"), Some(name), Some(root_page)) = (row_type, name, root_page)
-            && name == table_name
+        if let (Some(row_type), Some(name), Some(root_page)) = (row_type, name, root_page)
+            && row_type == b"table"
+            && name == table_name.as_bytes()
             && let Ok(root_page) = u32::try_from(root_page)
         {
             return match PageId::try_new(root_page) {

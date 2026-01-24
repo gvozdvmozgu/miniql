@@ -1,9 +1,11 @@
 use std::{fmt, str};
 
 use crate::decoder::Decoder;
-use crate::pager::{Page, PageId, Pager};
+use crate::pager::{PageId, PageRef, Pager};
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum Error {
@@ -13,6 +15,9 @@ pub enum Error {
     Corrupted(&'static str),
     Utf8(str::Utf8Error),
     TableNotFound(String),
+    PayloadTooLarge(usize),
+    OverflowChainTruncated,
+    OverflowLoopDetected,
 }
 
 impl fmt::Display for Error {
@@ -28,6 +33,9 @@ impl fmt::Display for Error {
             Self::TableNotFound(name) => {
                 write!(f, "Table '{name}' not found in sqlite_schema")
             }
+            Self::PayloadTooLarge(size) => write!(f, "Payload too large: {size} bytes"),
+            Self::OverflowChainTruncated => f.write_str("Overflow chain is truncated"),
+            Self::OverflowLoopDetected => f.write_str("Overflow chain contains a loop"),
         }
     }
 }
@@ -100,18 +108,25 @@ impl fmt::Display for Value {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ValueRef<'a> {
+pub enum ValueRef<'row> {
     Null,
     Integer(i64),
     Real(f64),
-    Text(&'a str),
-    Blob(&'a [u8]),
+    TextBytes(&'row [u8]),
+    Blob(&'row [u8]),
 }
 
-impl<'a> ValueRef<'a> {
-    pub fn as_text(&self) -> Option<&'a str> {
+impl<'row> ValueRef<'row> {
+    pub fn as_text(&self) -> Option<&'row str> {
         match self {
-            Self::Text(text) => Some(text),
+            Self::TextBytes(bytes) => str::from_utf8(bytes).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn text_bytes(&self) -> Option<&'row [u8]> {
+        match self {
+            Self::TextBytes(bytes) => Some(*bytes),
             _ => None,
         }
     }
@@ -130,20 +145,25 @@ impl fmt::Display for ValueRef<'_> {
             Self::Null => f.write_str("NULL"),
             Self::Integer(value) => write!(f, "{value}"),
             Self::Real(value) => write!(f, "{value}"),
-            Self::Text(value) => f.write_str(value),
+            Self::TextBytes(bytes) => match str::from_utf8(bytes) {
+                Ok(value) => f.write_str(value),
+                Err(_) => f.write_str("<invalid utf8>"),
+            },
             Self::Blob(bytes) => Value::display_blob(bytes, f),
         }
     }
 }
 
-impl<'a> From<ValueRef<'a>> for Value {
-    fn from(value: ValueRef<'a>) -> Self {
+impl TryFrom<ValueRef<'_>> for Value {
+    type Error = Error;
+
+    fn try_from(value: ValueRef<'_>) -> Result<Self> {
         match value {
-            ValueRef::Null => Value::Null,
-            ValueRef::Integer(value) => Value::Integer(value),
-            ValueRef::Real(value) => Value::Real(value),
-            ValueRef::Text(text) => Value::Text(text.to_owned()),
-            ValueRef::Blob(bytes) => Value::Blob(bytes.to_owned()),
+            ValueRef::Null => Ok(Value::Null),
+            ValueRef::Integer(value) => Ok(Value::Integer(value)),
+            ValueRef::Real(value) => Ok(Value::Real(value)),
+            ValueRef::TextBytes(bytes) => Ok(Value::Text(str::from_utf8(bytes)?.to_owned())),
+            ValueRef::Blob(bytes) => Ok(Value::Blob(bytes.to_owned())),
         }
     }
 }
@@ -154,145 +174,122 @@ pub struct TableRow {
     pub values: Vec<Value>,
 }
 
-#[derive(Debug, Clone)]
-pub struct TableRowRef<'a> {
-    pub rowid: i64,
-    pub values: Vec<ValueRef<'a>>,
+#[derive(Debug, Default)]
+pub struct RowScratch {
+    values: Vec<ValueRef<'static>>,
+    overflow_buf: Vec<u8>,
+}
+
+impl RowScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(values: usize, overflow: usize) -> Self {
+        Self { values: Vec::with_capacity(values), overflow_buf: Vec::with_capacity(overflow) }
+    }
+
+    fn prepare_row(&mut self) {
+        self.values.clear();
+        self.overflow_buf.clear();
+    }
+
+    fn split_mut<'row>(&'row mut self) -> (&'row mut Vec<ValueRef<'row>>, &'row mut Vec<u8>) {
+        let values = &mut self.values;
+        let overflow = &mut self.overflow_buf;
+        // SAFETY: values are cleared at row start and only hold references
+        // valid for the duration of the current row callback.
+        let values = unsafe {
+            std::mem::transmute::<&mut Vec<ValueRef<'static>>, &mut Vec<ValueRef<'row>>>(values)
+        };
+        (values, overflow)
+    }
+
+    fn values_slice<'row>(&'row self) -> &'row [ValueRef<'row>] {
+        // SAFETY: values are only accessed while the row-scoped borrow is alive.
+        unsafe {
+            std::mem::transmute::<&[ValueRef<'static>], &[ValueRef<'row>]>(self.values.as_slice())
+        }
+    }
 }
 
 pub fn read_table(pager: &Pager, page_id: PageId) -> Result<Vec<TableRow>> {
-    let borrowed = read_table_ref(pager, page_id)?;
-
-    let mut rows = Vec::with_capacity(borrowed.len());
-    for row in borrowed {
-        rows.push(TableRow {
-            rowid: row.rowid,
-            values: row.values.into_iter().map(Value::from).collect(),
-        });
-    }
-
-    Ok(rows)
-}
-
-pub fn read_table_ref<'a>(pager: &'a Pager, page_id: PageId) -> Result<Vec<TableRowRef<'a>>> {
     let mut rows = Vec::new();
-    read_table_page_ref(pager, page_id, &mut rows)?;
+    let mut scratch = RowScratch::with_capacity(8, 0);
+    scan_table_ref_with_scratch(pager, page_id, &mut scratch, |rowid, values| {
+        let mut owned = Vec::with_capacity(values.len());
+        for value in values {
+            owned.push(Value::try_from(*value)?);
+        }
+        rows.push(TableRow { rowid, values: owned });
+        Ok(())
+    })?;
     Ok(rows)
 }
 
-pub fn scan_table_ref_with_scratch<'a, F>(
-    pager: &'a Pager,
+pub fn read_table_ref(pager: &Pager, page_id: PageId) -> Result<Vec<TableRow>> {
+    read_table(pager, page_id)
+}
+
+pub fn scan_table_ref_with_scratch<F>(
+    pager: &Pager,
     page_id: PageId,
-    scratch: &mut Vec<ValueRef<'a>>,
+    scratch: &mut RowScratch,
     mut f: F,
 ) -> Result<()>
 where
-    F: for<'row> FnMut(i64, &'row [ValueRef<'a>]) -> Result<()>,
+    F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<()>,
 {
-    scratch.clear();
     scan_table_page_ref(pager, page_id, scratch, &mut f)
 }
 
-pub fn scan_table_ref<'a, F>(pager: &'a Pager, page_id: PageId, f: F) -> Result<()>
+pub fn scan_table_ref<F>(pager: &Pager, page_id: PageId, f: F) -> Result<()>
 where
-    F: for<'row> FnMut(i64, &'row [ValueRef<'a>]) -> Result<()>,
+    F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<()>,
 {
-    let mut scratch = Vec::with_capacity(8);
+    let mut scratch = RowScratch::with_capacity(8, 0);
     scan_table_ref_with_scratch(pager, page_id, &mut scratch, f)
 }
 
-pub fn scan_table_ref_until<'a, F, T>(
-    pager: &'a Pager,
-    page_id: PageId,
-    mut f: F,
-) -> Result<Option<T>>
+pub fn scan_table_ref_until<F, T>(pager: &Pager, page_id: PageId, mut f: F) -> Result<Option<T>>
 where
-    F: for<'row> FnMut(i64, &'row [ValueRef<'a>]) -> Result<Option<T>>,
+    F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<Option<T>>,
 {
-    let mut scratch = Vec::with_capacity(8);
+    let mut scratch = RowScratch::with_capacity(8, 0);
     scan_table_page_ref_until(pager, page_id, &mut scratch, &mut f)
 }
 
-fn read_table_page_ref<'a>(
-    pager: &'a Pager,
+fn scan_table_page_ref<'pager, F>(
+    pager: &'pager Pager,
     page_id: PageId,
-    rows: &mut Vec<TableRowRef<'a>>,
-) -> Result<()> {
-    pager.read_page(page_id)?;
-    let page = pager.page(page_id).ok_or(Error::Corrupted("missing page after read"))?;
-    let header = parse_header(page)?;
-
-    let cell_ptrs = cell_ptrs(page, &header)?;
-
-    match header.kind {
-        BTreeKind::TableLeaf => {
-            rows.reserve(header.cell_count as usize);
-            for idx in 0..header.cell_count as usize {
-                let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                rows.push(read_table_cell_ref(page, offset)?);
-            }
-        }
-        BTreeKind::TableInterior => {
-            let page_len = page.bytes().len();
-            for idx in 0..header.cell_count as usize {
-                let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                if offset as usize >= page_len {
-                    return Err(Error::Corrupted("cell offset out of bounds"));
-                }
-
-                let mut decoder = page.decoder().split_at(offset as usize);
-                let child = decoder.read_u32();
-                let child =
-                    PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
-
-                // Skip the key separating subtrees; it is not needed for scanning.
-                let _ = decoder.read_varint();
-                read_table_page_ref(pager, child, rows)?;
-            }
-
-            if let Some(right_most) = header.right_most_child {
-                let right_most =
-                    PageId::try_new(right_most).ok_or(Error::Corrupted("child page id is zero"))?;
-                read_table_page_ref(pager, right_most, rows)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn scan_table_page_ref<'a, F>(
-    pager: &'a Pager,
-    page_id: PageId,
-    scratch: &mut Vec<ValueRef<'a>>,
+    scratch: &mut RowScratch,
     f: &mut F,
 ) -> Result<()>
 where
-    F: for<'row> FnMut(i64, &'row [ValueRef<'a>]) -> Result<()>,
+    F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<()>,
 {
-    pager.read_page(page_id)?;
-    let page = pager.page(page_id).ok_or(Error::Corrupted("missing page after read"))?;
-    let header = parse_header(page)?;
+    let page = pager.page(page_id)?;
+    let header = parse_header(&page)?;
 
-    let cell_ptrs = cell_ptrs(page, &header)?;
+    let cell_ptrs = cell_ptrs(&page, &header)?;
 
     match header.kind {
         BTreeKind::TableLeaf => {
             for idx in 0..header.cell_count as usize {
                 let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                let rowid = read_table_cell_into(page, offset, scratch)?;
-                f(rowid, scratch.as_slice())?;
+                let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
+                f(rowid, scratch.values_slice())?;
             }
         }
         BTreeKind::TableInterior => {
-            let page_len = page.bytes().len();
+            let page_len = page.usable_bytes().len();
             for idx in 0..header.cell_count as usize {
                 let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
                 if offset as usize >= page_len {
                     return Err(Error::Corrupted("cell offset out of bounds"));
                 }
 
-                let mut decoder = page.decoder().split_at(offset as usize);
+                let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
                 let child = decoder.read_u32();
                 let child =
                     PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
@@ -313,40 +310,39 @@ where
     Ok(())
 }
 
-fn scan_table_page_ref_until<'a, F, T>(
-    pager: &'a Pager,
+fn scan_table_page_ref_until<'pager, F, T>(
+    pager: &'pager Pager,
     page_id: PageId,
-    scratch: &mut Vec<ValueRef<'a>>,
+    scratch: &mut RowScratch,
     f: &mut F,
 ) -> Result<Option<T>>
 where
-    F: for<'row> FnMut(i64, &'row [ValueRef<'a>]) -> Result<Option<T>>,
+    F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<Option<T>>,
 {
-    pager.read_page(page_id)?;
-    let page = pager.page(page_id).ok_or(Error::Corrupted("missing page after read"))?;
-    let header = parse_header(page)?;
+    let page = pager.page(page_id)?;
+    let header = parse_header(&page)?;
 
-    let cell_ptrs = cell_ptrs(page, &header)?;
+    let cell_ptrs = cell_ptrs(&page, &header)?;
 
     match header.kind {
         BTreeKind::TableLeaf => {
             for idx in 0..header.cell_count as usize {
                 let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                let rowid = read_table_cell_into(page, offset, scratch)?;
-                if let Some(value) = f(rowid, scratch.as_slice())? {
+                let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
+                if let Some(value) = f(rowid, scratch.values_slice())? {
                     return Ok(Some(value));
                 }
             }
         }
         BTreeKind::TableInterior => {
-            let page_len = page.bytes().len();
+            let page_len = page.usable_bytes().len();
             for idx in 0..header.cell_count as usize {
                 let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
                 if offset as usize >= page_len {
                     return Err(Error::Corrupted("cell offset out of bounds"));
                 }
 
-                let mut decoder = page.decoder().split_at(offset as usize);
+                let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
                 let child = decoder.read_u32();
                 let child =
                     PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
@@ -371,71 +367,127 @@ where
     Ok(None)
 }
 
-fn read_table_cell_ref<'a>(page: &'a Page, offset: u16) -> Result<TableRowRef<'a>> {
-    if offset as usize >= page.bytes().len() {
-        return Err(Error::Corrupted("cell offset out of bounds"));
-    }
-
-    let mut decoder = page.decoder().split_at(offset as usize);
-
-    let before = decoder.remaining();
-    let payload_length = decoder.read_varint();
-    let payload_length_len = before - decoder.remaining();
-    let payload_length =
-        usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
-
-    let before = decoder.remaining();
-    let rowid = decoder.read_varint() as i64;
-    let rowid_len = before - decoder.remaining();
-
-    let start = offset as usize + payload_length_len + rowid_len;
-    let end =
-        start.checked_add(payload_length).ok_or(Error::Corrupted("payload length overflow"))?;
-
-    let bytes = page.bytes();
-    if end > bytes.len() {
-        return Err(Error::Corrupted("payload extends past page boundary"));
-    }
-
-    let values = decode_record_ref(&bytes[start..end])?;
-    Ok(TableRowRef { rowid, values })
-}
-
-fn read_table_cell_into<'a>(
-    page: &'a Page,
+fn read_table_cell_into(
+    pager: &Pager,
+    page: &PageRef<'_>,
     offset: u16,
-    scratch: &mut Vec<ValueRef<'a>>,
+    scratch: &mut RowScratch,
 ) -> Result<i64> {
-    if offset as usize >= page.bytes().len() {
+    let usable = page.usable_bytes();
+    if offset as usize >= usable.len() {
         return Err(Error::Corrupted("cell offset out of bounds"));
     }
 
-    let mut decoder = page.decoder().split_at(offset as usize);
+    let mut decoder = Decoder::new(usable).split_at(offset as usize);
 
     let before = decoder.remaining();
     let payload_length = decoder.read_varint();
     let payload_length_len = before - decoder.remaining();
     let payload_length =
         usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
+    if payload_length > MAX_PAYLOAD_BYTES {
+        return Err(Error::PayloadTooLarge(payload_length));
+    }
 
     let before = decoder.remaining();
     let rowid = decoder.read_varint() as i64;
     let rowid_len = before - decoder.remaining();
 
     let start = offset as usize + payload_length_len + rowid_len;
-    let end =
-        start.checked_add(payload_length).ok_or(Error::Corrupted("payload length overflow"))?;
-
-    let bytes = page.bytes();
-    if end > bytes.len() {
+    let local_len = local_payload_len(page.usable_size(), payload_length)?;
+    let end_local =
+        start.checked_add(local_len).ok_or(Error::Corrupted("payload length overflow"))?;
+    if end_local > usable.len() {
         return Err(Error::Corrupted("payload extends past page boundary"));
     }
 
-    decode_record_into(&bytes[start..end], scratch)?;
+    scratch.prepare_row();
+    let (values, overflow_buf) = scratch.split_mut();
+
+    if payload_length <= local_len {
+        let payload = &usable[start..start + payload_length];
+        decode_record_into(payload, values)?;
+    } else {
+        let overflow_end =
+            end_local.checked_add(4).ok_or(Error::Corrupted("overflow pointer overflow"))?;
+        if overflow_end > usable.len() {
+            return Err(Error::Corrupted("overflow pointer out of bounds"));
+        }
+        let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
+        if overflow_page == 0 {
+            return Err(Error::OverflowChainTruncated);
+        }
+        assemble_overflow_payload(
+            pager,
+            payload_length,
+            local_len,
+            overflow_page,
+            &usable[start..end_local],
+            overflow_buf,
+        )?;
+        let payload = overflow_buf.as_slice();
+        decode_record_into(payload, values)?;
+    }
     Ok(rowid)
 }
 
-fn decode_record_into<'a>(payload: &'a [u8], out: &mut Vec<ValueRef<'a>>) -> Result<()> {
+fn assemble_overflow_payload(
+    pager: &Pager,
+    payload_len: usize,
+    local_len: usize,
+    mut overflow_page: u32,
+    local_bytes: &[u8],
+    overflow_buf: &mut Vec<u8>,
+) -> Result<()> {
+    overflow_buf.clear();
+    overflow_buf.reserve(payload_len);
+    overflow_buf.extend_from_slice(local_bytes);
+
+    let mut remaining =
+        payload_len.checked_sub(local_len).ok_or(Error::Corrupted("payload length underflow"))?;
+
+    let mut visited = 0u32;
+    let max_pages = pager.page_count().max(1);
+
+    while remaining > 0 {
+        if visited >= max_pages {
+            return Err(Error::OverflowLoopDetected);
+        }
+        visited += 1;
+
+        let page_id = PageId::try_new(overflow_page).ok_or(Error::OverflowChainTruncated)?;
+        let page_bytes = pager.page_bytes(page_id)?;
+        if page_bytes.len() < 4 {
+            return Err(Error::Corrupted("overflow page too small"));
+        }
+
+        let next_page = u32::from_be_bytes(page_bytes[0..4].try_into().unwrap());
+        let usable = pager.header().usable_size.min(page_bytes.len());
+        if usable < 4 {
+            return Err(Error::Corrupted("overflow page usable size too small"));
+        }
+        let content = &page_bytes[4..usable];
+        let take = remaining.min(content.len());
+        overflow_buf.extend_from_slice(&content[..take]);
+        remaining -= take;
+
+        if remaining == 0 {
+            break;
+        }
+        if next_page == 0 {
+            return Err(Error::OverflowChainTruncated);
+        }
+        overflow_page = next_page;
+    }
+
+    if overflow_buf.len() != payload_len {
+        return Err(Error::OverflowChainTruncated);
+    }
+
+    Ok(())
+}
+
+fn decode_record_into<'row>(payload: &'row [u8], out: &mut Vec<ValueRef<'row>>) -> Result<()> {
     out.clear();
 
     let mut header_decoder = Decoder::new(payload);
@@ -457,13 +509,7 @@ fn decode_record_into<'a>(payload: &'a [u8], out: &mut Vec<ValueRef<'a>>) -> Res
     Ok(())
 }
 
-fn decode_record_ref<'a>(payload: &'a [u8]) -> Result<Vec<ValueRef<'a>>> {
-    let mut values = Vec::with_capacity(8);
-    decode_record_into(payload, &mut values)?;
-    Ok(values)
-}
-
-fn decode_value_ref<'a>(serial_type: u64, decoder: &mut Decoder<'a>) -> Result<ValueRef<'a>> {
+fn decode_value_ref<'row>(serial_type: u64, decoder: &mut Decoder<'row>) -> Result<ValueRef<'row>> {
     let value = match serial_type {
         0 => ValueRef::Null,
         1 => ValueRef::Integer(read_signed_be(decoder, 1)?),
@@ -481,8 +527,7 @@ fn decode_value_ref<'a>(serial_type: u64, decoder: &mut Decoder<'a>) -> Result<V
         }
         serial if serial >= 13 => {
             let len = ((serial - 13) / 2) as usize;
-            let text = str::from_utf8(read_exact_bytes(decoder, len)?)?;
-            ValueRef::Text(text)
+            ValueRef::TextBytes(read_exact_bytes(decoder, len)?)
         }
         other => return Err(Error::UnsupportedSerialType(other)),
     };
@@ -508,7 +553,7 @@ fn read_u64_be(decoder: &mut Decoder<'_>) -> Result<u64> {
     Ok(u64::from_be_bytes(buf))
 }
 
-fn read_exact_bytes<'bytes>(decoder: &mut Decoder<'bytes>, len: usize) -> Result<&'bytes [u8]> {
+fn read_exact_bytes<'row>(decoder: &mut Decoder<'row>, len: usize) -> Result<&'row [u8]> {
     if decoder.remaining() < len {
         return Err(Error::Corrupted("record payload shorter than declared"));
     }
@@ -529,8 +574,11 @@ struct BTreeHeader {
     right_most_child: Option<u32>,
 }
 
-fn parse_header(page: &Page) -> Result<BTreeHeader> {
-    let mut decoder = page.decoder_after_header();
+fn parse_header(page: &PageRef<'_>) -> Result<BTreeHeader> {
+    if page.offset() >= page.usable_size() {
+        return Err(Error::Corrupted("page header offset out of bounds"));
+    }
+    let mut decoder = Decoder::new(page.usable_bytes()).split_at(page.offset());
     let page_type = decoder.read_u8();
     let _first_freeblock = decoder.read_u16();
     let cell_count = decoder.read_u16();
@@ -560,15 +608,36 @@ fn parse_header(page: &Page) -> Result<BTreeHeader> {
     Ok(BTreeHeader { kind, cell_count, cell_ptrs_start, right_most_child })
 }
 
-fn cell_ptrs<'a>(page: &'a Page, header: &BTreeHeader) -> Result<&'a [u8]> {
+fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &BTreeHeader) -> Result<&'a [u8]> {
     let cell_ptrs_len = header.cell_count as usize * 2;
     let cell_ptrs_end = header
         .cell_ptrs_start
         .checked_add(cell_ptrs_len)
         .ok_or(Error::Corrupted("cell pointer array overflow"))?;
-    let bytes = page.bytes();
+    let bytes = page.usable_bytes();
     if cell_ptrs_end > bytes.len() {
         return Err(Error::Corrupted("cell pointer array out of bounds"));
     }
     Ok(&bytes[header.cell_ptrs_start..cell_ptrs_end])
+}
+
+fn local_payload_len(usable_size: usize, payload_len: usize) -> Result<usize> {
+    if payload_len == 0 {
+        return Ok(0);
+    }
+
+    if usable_size < 512 {
+        return Err(Error::Corrupted("usable size too small"));
+    }
+
+    let u = usable_size;
+    let x = u.checked_sub(35).ok_or(Error::Corrupted("usable size underflow"))?;
+    let m = ((u - 12) * 32 / 255).saturating_sub(23);
+
+    if payload_len <= x {
+        return Ok(payload_len);
+    }
+
+    let k = m + ((payload_len - m) % (u - 4));
+    if k <= x { Ok(k) } else { Ok(m) }
 }

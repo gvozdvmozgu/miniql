@@ -1,107 +1,172 @@
-use std::boxed::Box;
-use std::cell::{OnceCell, RefCell};
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::num::NonZero;
+
+use memmap2::Mmap;
 
 use crate::decoder::Decoder;
 
-pub const PAGE_SIZE: usize = 4096;
-
 type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Debug, Clone)]
+pub struct DbHeader {
+    pub page_size: usize,
+    pub reserved: u8,
+    pub usable_size: usize,
+    pub encoding: u32,
+    pub page_count_hint: u32,
+    pub write_version: u8,
+    pub read_version: u8,
+}
+
+impl DbHeader {
+    pub fn parse(header: &[u8]) -> Result<Self> {
+        if header.len() < 100 {
+            return Err(Error::FileTooSmall);
+        }
+
+        if &header[..16] != b"SQLite format 3\0" {
+            return Err(Error::InvalidMagic);
+        }
+
+        let page_size_raw = u16::from_be_bytes([header[16], header[17]]);
+        let page_size = match page_size_raw {
+            1 => 65536usize,
+            size => size as usize,
+        };
+
+        if !is_valid_page_size(page_size) {
+            return Err(Error::UnsupportedPageSize(page_size_raw));
+        }
+
+        let reserved = header[20];
+        let usable_size = page_size
+            .checked_sub(reserved as usize)
+            .ok_or(Error::UnsupportedReservedSpace(reserved))?;
+
+        let payload_fraction = (header[21], header[22], header[23]);
+        if payload_fraction != (64, 32, 32) {
+            return Err(Error::UnsupportedPayloadFractions(payload_fraction));
+        }
+
+        let write_version = header[18];
+        let read_version = header[19];
+        if write_version == 2 || read_version == 2 {
+            return Err(Error::WalModeUnsupported { write_version, read_version });
+        }
+
+        let page_count_hint = u32::from_be_bytes([header[28], header[29], header[30], header[31]]);
+        let encoding = u32::from_be_bytes([header[56], header[57], header[58], header[59]]);
+        if encoding != 1 {
+            return Err(Error::UnsupportedEncoding(encoding));
+        }
+
+        Ok(DbHeader {
+            page_size,
+            reserved,
+            usable_size,
+            encoding,
+            page_count_hint,
+            write_version,
+            read_version,
+        })
+    }
+}
+
 pub struct Pager {
-    file: RefCell<File>,
-    pages: Box<[OnceCell<Page>]>,
-    db_size: u32,
+    header: DbHeader,
+    mmap: Mmap,
+    page_count: u32,
 }
 
 impl Pager {
     pub fn new(file: File) -> Result<Self> {
-        let file_size = file.metadata().map_err(Error::Io)?.len() as usize;
-        let db_size = file_size.div_ceil(PAGE_SIZE).max(1) as u32;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(Error::Io)?;
+        if mmap.len() < 100 {
+            return Err(Error::FileTooSmall);
+        }
 
-        let pages = std::iter::repeat_with(OnceCell::new)
-            .take(db_size as usize)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let header = DbHeader::parse(&mmap[..100])?;
 
-        let pager = Pager { file: RefCell::new(file), pages, db_size };
-        pager.read_page(PageId::ROOT)?;
+        let file_len = mmap.len();
+        if file_len < header.page_size {
+            return Err(Error::FileTooSmall);
+        }
 
-        Ok(pager)
+        if file_len % header.page_size != 0 {
+            return Err(Error::TruncatedFile);
+        }
+
+        let page_count =
+            (file_len / header.page_size).try_into().map_err(|_| Error::TooManyPages)?;
+
+        Ok(Pager { header, mmap, page_count })
     }
 
     #[inline]
-    pub fn root(&self) -> &Page {
-        unsafe { self.pages.get_unchecked(0).get().unwrap_unchecked() }
+    pub fn header(&self) -> &DbHeader {
+        &self.header
     }
 
     pub fn count(&self) -> u32 {
-        self.root().decoder().split_at(28).read_u32()
+        self.header.page_count_hint
     }
 
-    pub fn read_page(&self, page_id: PageId) -> Result<()> {
+    pub fn page_count(&self) -> u32 {
+        self.page_count
+    }
+
+    pub fn page_bytes(&self, page_id: PageId) -> Result<&[u8]> {
         let index = (page_id.into_inner() - 1) as usize;
-        let page_cell = self.pages.get(index).ok_or(Error::TooManyPages)?;
-
-        if page_cell.get().is_none() {
-            let mut bytes = Box::new([0u8; PAGE_SIZE]);
-
-            if index as u32 >= self.db_size {
-                return Err(Error::TooManyPages);
-            }
-
-            let offset = index.checked_mul(PAGE_SIZE).ok_or(Error::TooManyPages)?;
-            let mut file = self.file.borrow_mut();
-            file.seek(SeekFrom::Start(offset as u64)).map_err(Error::Io)?;
-            file.read_exact(&mut bytes[..]).map_err(Error::Io)?;
-
-            let _ = page_cell.set(Page::new(page_id.into_inner() as usize, bytes));
+        if index >= self.page_count as usize {
+            return Err(Error::PageOutOfRange);
         }
 
-        Ok(())
+        let start = index.checked_mul(self.header.page_size).ok_or(Error::PageOutOfRange)?;
+        let end = start.checked_add(self.header.page_size).ok_or(Error::PageOutOfRange)?;
+        if end > self.mmap.len() {
+            return Err(Error::PageOutOfRange);
+        }
+
+        Ok(&self.mmap[start..end])
     }
 
-    pub fn page(&self, page_id: PageId) -> Option<&Page> {
-        let index = (page_id.into_inner() - 1) as usize;
-        self.pages.get(index).and_then(OnceCell::get)
+    pub fn page(&self, page_id: PageId) -> Result<PageRef<'_>> {
+        let bytes = self.page_bytes(page_id)?;
+        Ok(PageRef { bytes, page_id, header: &self.header })
     }
 }
 
-enum PageKind {
-    Root,
-    Normal,
+pub struct PageRef<'a> {
+    bytes: &'a [u8],
+    page_id: PageId,
+    header: &'a DbHeader,
 }
 
-pub struct Page {
-    bytes: Box<[u8]>,
-    kind: PageKind,
-}
-
-impl Page {
-    fn new(page_id: usize, bytes: Box<[u8; PAGE_SIZE]>) -> Self {
-        Self { bytes, kind: if page_id == 1 { PageKind::Root } else { PageKind::Normal } }
-    }
-
+impl<'a> PageRef<'a> {
     pub fn offset(&self) -> usize {
-        match self.kind {
-            PageKind::Root => 100,
-            PageKind::Normal => 0,
-        }
+        if self.page_id.into_inner() == 1 { 100 } else { 0 }
     }
 
-    pub fn decoder(&self) -> Decoder<'_> {
-        Decoder::new(&self.bytes)
+    pub fn usable_size(&self) -> usize {
+        self.header.usable_size
     }
 
-    pub fn decoder_after_header(&self) -> Decoder<'_> {
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub fn usable_bytes(&self) -> &'a [u8] {
+        let end = self.header.usable_size.min(self.bytes.len());
+        &self.bytes[..end]
+    }
+
+    pub fn decoder(&self) -> Decoder<'a> {
+        Decoder::new(self.bytes)
+    }
+
+    pub fn decoder_after_header(&self) -> Decoder<'a> {
         self.decoder().split_at(self.offset())
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
     }
 }
 
@@ -134,14 +199,46 @@ impl PageId {
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
+    FileTooSmall,
+    InvalidMagic,
+    UnsupportedPageSize(u16),
+    UnsupportedReservedSpace(u8),
+    UnsupportedPayloadFractions((u8, u8, u8)),
+    UnsupportedEncoding(u32),
+    WalModeUnsupported { write_version: u8, read_version: u8 },
+    TruncatedFile,
     TooManyPages,
+    PageOutOfRange,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "{err}"),
+            Self::FileTooSmall => f.write_str("Database file is too small"),
+            Self::InvalidMagic => f.write_str("Invalid SQLite header magic"),
+            Self::UnsupportedPageSize(size) => {
+                write!(f, "Unsupported page size: {size}")
+            }
+            Self::UnsupportedReservedSpace(reserved) => {
+                write!(f, "Unsupported reserved space: {reserved}")
+            }
+            Self::UnsupportedPayloadFractions((a, b, c)) => {
+                write!(f, "Unsupported payload fractions: {a}/{b}/{c}")
+            }
+            Self::UnsupportedEncoding(encoding) => {
+                write!(f, "Unsupported encoding: {encoding}")
+            }
+            Self::WalModeUnsupported { write_version, read_version } => {
+                write!(
+                    f,
+                    "WAL mode unsupported (write_version={write_version}, \
+                     read_version={read_version})"
+                )
+            }
+            Self::TruncatedFile => f.write_str("Database file is truncated"),
             Self::TooManyPages => f.write_str("Database contains more pages than supported"),
+            Self::PageOutOfRange => f.write_str("Requested page is out of range"),
         }
     }
 }
@@ -152,5 +249,13 @@ impl std::error::Error for Error {
             Self::Io(err) => Some(err),
             _ => None,
         }
+    }
+}
+
+fn is_valid_page_size(page_size: usize) -> bool {
+    match page_size {
+        512..=32768 => page_size.is_power_of_two(),
+        65536 => true,
+        _ => false,
     }
 }
