@@ -341,17 +341,14 @@ where
     F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<()>,
 {
     let mut stack = vec![page_id];
-    let mut visited = vec![false; pager.page_count() as usize + 1];
+    let max_pages = pager.page_count().max(1);
+    let mut seen_pages = 0u32;
 
     while let Some(page_id) = stack.pop() {
-        let page_idx = page_id.into_inner() as usize;
-        if page_idx >= visited.len() {
-            return Err(Error::Corrupted("page id out of bounds"));
-        }
-        if visited[page_idx] {
+        seen_pages += 1;
+        if seen_pages > max_pages {
             return Err(Error::Corrupted("btree page cycle detected"));
         }
-        visited[page_idx] = true;
 
         let page = pager.page(page_id)?;
         let header = parse_header(&page)?;
@@ -407,17 +404,14 @@ where
     F: for<'row> FnMut(i64, &'row [u8]) -> Result<()>,
 {
     let mut stack = vec![page_id];
-    let mut visited = vec![false; pager.page_count() as usize + 1];
+    let max_pages = pager.page_count().max(1);
+    let mut seen_pages = 0u32;
 
     while let Some(page_id) = stack.pop() {
-        let page_idx = page_id.into_inner() as usize;
-        if page_idx >= visited.len() {
-            return Err(Error::Corrupted("page id out of bounds"));
-        }
-        if visited[page_idx] {
+        seen_pages += 1;
+        if seen_pages > max_pages {
             return Err(Error::Corrupted("btree page cycle detected"));
         }
-        visited[page_idx] = true;
 
         let page = pager.page(page_id)?;
         let header = parse_header(&page)?;
@@ -471,17 +465,14 @@ where
     F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<Option<T>>,
 {
     let mut stack = vec![page_id];
-    let mut visited = vec![false; pager.page_count() as usize + 1];
+    let max_pages = pager.page_count().max(1);
+    let mut seen_pages = 0u32;
 
     while let Some(page_id) = stack.pop() {
-        let page_idx = page_id.into_inner() as usize;
-        if page_idx >= visited.len() {
-            return Err(Error::Corrupted("page id out of bounds"));
-        }
-        if visited[page_idx] {
+        seen_pages += 1;
+        if seen_pages > max_pages {
             return Err(Error::Corrupted("btree page cycle detected"));
         }
-        visited[page_idx] = true;
 
         let page = pager.page(page_id)?;
         let header = parse_header(&page)?;
@@ -539,17 +530,14 @@ where
     F: for<'row> FnMut(i64, &'row [u8]) -> Result<Option<T>>,
 {
     let mut stack = vec![page_id];
-    let mut visited = vec![false; pager.page_count() as usize + 1];
+    let max_pages = pager.page_count().max(1);
+    let mut seen_pages = 0u32;
 
     while let Some(page_id) = stack.pop() {
-        let page_idx = page_id.into_inner() as usize;
-        if page_idx >= visited.len() {
-            return Err(Error::Corrupted("page id out of bounds"));
-        }
-        if visited[page_idx] {
+        seen_pages += 1;
+        if seen_pages > max_pages {
             return Err(Error::Corrupted("btree page cycle detected"));
         }
-        visited[page_idx] = true;
 
         let page = pager.page(page_id)?;
         let header = parse_header(&page)?;
@@ -726,8 +714,8 @@ fn assemble_overflow_payload(
     Ok(())
 }
 
-pub(crate) fn decode_record_project_into<'row>(
-    payload: &'row [u8],
+pub(crate) fn decode_record_project_into(
+    payload: &[u8],
     needed_cols: Option<&[u16]>,
     out: &mut Vec<ValueRefRaw>,
 ) -> Result<usize> {
@@ -760,7 +748,7 @@ pub(crate) fn decode_record_project_into<'row>(
             }
             column_count += 1;
         }
-        return Ok(column_count);
+        Ok(column_count)
     } else {
         let mut column_count = 0usize;
         while serial_decoder.remaining() > 0 {
@@ -768,11 +756,11 @@ pub(crate) fn decode_record_project_into<'row>(
             out.push(decode_value_ref(serial, &mut value_decoder)?);
             column_count += 1;
         }
-        return Ok(column_count);
+        Ok(column_count)
     }
 }
 
-fn decode_record_into<'row>(payload: &'row [u8], out: &mut Vec<ValueRefRaw>) -> Result<()> {
+fn decode_record_into(payload: &[u8], out: &mut Vec<ValueRefRaw>) -> Result<()> {
     out.clear();
 
     let mut header_decoder = Decoder::new(payload);
