@@ -13,6 +13,8 @@ pub enum Error {
     UnsupportedPageType(u8),
     UnsupportedSerialType(u64),
     Corrupted(&'static str),
+    InvalidColumnIndex { col: u16, column_count: usize },
+    TypeMismatch { col: usize, expected: &'static str, got: &'static str },
     Utf8(str::Utf8Error),
     TableNotFound(String),
     PayloadTooLarge(usize),
@@ -29,6 +31,12 @@ impl fmt::Display for Error {
                 write!(f, "Unsupported record serial type: {serial}")
             }
             Self::Corrupted(msg) => write!(f, "Corrupted table page: {msg}"),
+            Self::InvalidColumnIndex { col, column_count } => {
+                write!(f, "Invalid column index {col} (column count {column_count})")
+            }
+            Self::TypeMismatch { col, expected, got } => {
+                write!(f, "Type mismatch at column {col}: expected {expected}, got {got}")
+            }
             Self::Utf8(err) => write!(f, "{err}"),
             Self::TableNotFound(name) => {
                 write!(f, "Table '{name}' not found in sqlite_schema")
@@ -259,6 +267,30 @@ where
     scan_table_page_ref_until(pager, page_id, &mut scratch, &mut f)
 }
 
+pub fn scan_table_cells_with_scratch<F>(
+    pager: &Pager,
+    page_id: PageId,
+    overflow_buf: &mut Vec<u8>,
+    mut f: F,
+) -> Result<()>
+where
+    F: for<'row> FnMut(i64, &'row [u8]) -> Result<()>,
+{
+    scan_table_page_cells(pager, page_id, overflow_buf, &mut f)
+}
+
+pub(crate) fn scan_table_cells_with_scratch_until<F, T>(
+    pager: &Pager,
+    page_id: PageId,
+    overflow_buf: &mut Vec<u8>,
+    mut f: F,
+) -> Result<Option<T>>
+where
+    F: for<'row> FnMut(i64, &'row [u8]) -> Result<Option<T>>,
+{
+    scan_table_page_cells_until(pager, page_id, overflow_buf, &mut f)
+}
+
 fn scan_table_page_ref<'pager, F>(
     pager: &'pager Pager,
     page_id: PageId,
@@ -303,6 +335,56 @@ where
                 let right_most =
                     PageId::try_new(right_most).ok_or(Error::Corrupted("child page id is zero"))?;
                 scan_table_page_ref(pager, right_most, scratch, f)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn scan_table_page_cells<'pager, F>(
+    pager: &'pager Pager,
+    page_id: PageId,
+    overflow_buf: &mut Vec<u8>,
+    f: &mut F,
+) -> Result<()>
+where
+    F: for<'row> FnMut(i64, &'row [u8]) -> Result<()>,
+{
+    let page = pager.page(page_id)?;
+    let header = parse_header(&page)?;
+
+    let cell_ptrs = cell_ptrs(&page, &header)?;
+
+    match header.kind {
+        BTreeKind::TableLeaf => {
+            for idx in 0..header.cell_count as usize {
+                let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
+                let (rowid, payload) = read_table_cell_payload(pager, &page, offset, overflow_buf)?;
+                f(rowid, payload)?;
+            }
+        }
+        BTreeKind::TableInterior => {
+            let page_len = page.usable_bytes().len();
+            for idx in 0..header.cell_count as usize {
+                let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
+                if offset as usize >= page_len {
+                    return Err(Error::Corrupted("cell offset out of bounds"));
+                }
+
+                let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
+                let child = decoder.read_u32();
+                let child =
+                    PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
+
+                let _ = decoder.read_varint();
+                scan_table_page_cells(pager, child, overflow_buf, f)?;
+            }
+
+            if let Some(right_most) = header.right_most_child {
+                let right_most =
+                    PageId::try_new(right_most).ok_or(Error::Corrupted("child page id is zero"))?;
+                scan_table_page_cells(pager, right_most, overflow_buf, f)?;
             }
         }
     }
@@ -367,12 +449,83 @@ where
     Ok(None)
 }
 
+fn scan_table_page_cells_until<'pager, F, T>(
+    pager: &'pager Pager,
+    page_id: PageId,
+    overflow_buf: &mut Vec<u8>,
+    f: &mut F,
+) -> Result<Option<T>>
+where
+    F: for<'row> FnMut(i64, &'row [u8]) -> Result<Option<T>>,
+{
+    let page = pager.page(page_id)?;
+    let header = parse_header(&page)?;
+
+    let cell_ptrs = cell_ptrs(&page, &header)?;
+
+    match header.kind {
+        BTreeKind::TableLeaf => {
+            for idx in 0..header.cell_count as usize {
+                let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
+                let (rowid, payload) = read_table_cell_payload(pager, &page, offset, overflow_buf)?;
+                if let Some(value) = f(rowid, payload)? {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        BTreeKind::TableInterior => {
+            let page_len = page.usable_bytes().len();
+            for idx in 0..header.cell_count as usize {
+                let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
+                if offset as usize >= page_len {
+                    return Err(Error::Corrupted("cell offset out of bounds"));
+                }
+
+                let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
+                let child = decoder.read_u32();
+                let child =
+                    PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
+
+                let _ = decoder.read_varint();
+                if let Some(value) = scan_table_page_cells_until(pager, child, overflow_buf, f)? {
+                    return Ok(Some(value));
+                }
+            }
+
+            if let Some(right_most) = header.right_most_child {
+                let right_most =
+                    PageId::try_new(right_most).ok_or(Error::Corrupted("child page id is zero"))?;
+                if let Some(value) =
+                    scan_table_page_cells_until(pager, right_most, overflow_buf, f)?
+                {
+                    return Ok(Some(value));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 fn read_table_cell_into(
     pager: &Pager,
     page: &PageRef<'_>,
     offset: u16,
     scratch: &mut RowScratch,
 ) -> Result<i64> {
+    scratch.prepare_row();
+    let (values, overflow_buf) = scratch.split_mut();
+    let (rowid, payload) = read_table_cell_payload(pager, page, offset, overflow_buf)?;
+    decode_record_into(payload, values)?;
+    Ok(rowid)
+}
+
+fn read_table_cell_payload<'row>(
+    pager: &Pager,
+    page: &'row PageRef<'_>,
+    offset: u16,
+    overflow_buf: &'row mut Vec<u8>,
+) -> Result<(i64, &'row [u8])> {
     let usable = page.usable_bytes();
     if offset as usize >= usable.len() {
         return Err(Error::Corrupted("cell offset out of bounds"));
@@ -401,12 +554,11 @@ fn read_table_cell_into(
         return Err(Error::Corrupted("payload extends past page boundary"));
     }
 
-    scratch.prepare_row();
-    let (values, overflow_buf) = scratch.split_mut();
+    overflow_buf.clear();
 
     if payload_length <= local_len {
         let payload = &usable[start..start + payload_length];
-        decode_record_into(payload, values)?;
+        Ok((rowid, payload))
     } else {
         let overflow_end =
             end_local.checked_add(4).ok_or(Error::Corrupted("overflow pointer overflow"))?;
@@ -426,9 +578,8 @@ fn read_table_cell_into(
             overflow_buf,
         )?;
         let payload = overflow_buf.as_slice();
-        decode_record_into(payload, values)?;
+        Ok((rowid, payload))
     }
-    Ok(rowid)
 }
 
 fn assemble_overflow_payload(
@@ -487,6 +638,52 @@ fn assemble_overflow_payload(
     Ok(())
 }
 
+pub(crate) fn decode_record_project_into<'row>(
+    payload: &'row [u8],
+    needed_cols: Option<&[u16]>,
+    out: &mut Vec<ValueRef<'row>>,
+    serial_types: &mut Vec<u64>,
+) -> Result<usize> {
+    out.clear();
+    serial_types.clear();
+
+    let mut header_decoder = Decoder::new(payload);
+    let before = header_decoder.remaining();
+    let header_len = header_decoder.read_varint() as usize;
+    let header_len_len = before - header_decoder.remaining();
+
+    if header_len < header_len_len || header_len > payload.len() {
+        return Err(Error::Corrupted("invalid record header length"));
+    }
+
+    let mut serial_decoder = Decoder::new(&payload[header_len_len..header_len]);
+    while serial_decoder.remaining() > 0 {
+        serial_types.push(serial_decoder.read_varint());
+    }
+
+    let mut value_decoder = Decoder::new(&payload[header_len..]);
+
+    if let Some(needed_cols) = needed_cols {
+        let mut needed_iter = needed_cols.iter().copied();
+        let mut next_needed = needed_iter.next();
+        for (idx, &serial) in serial_types.iter().enumerate() {
+            let col_idx = idx as u16;
+            if Some(col_idx) == next_needed {
+                out.push(decode_value_ref(serial, &mut value_decoder)?);
+                next_needed = needed_iter.next();
+            } else {
+                skip_value(serial, &mut value_decoder)?;
+            }
+        }
+    } else {
+        for &serial in serial_types.iter() {
+            out.push(decode_value_ref(serial, &mut value_decoder)?);
+        }
+    }
+
+    Ok(serial_types.len())
+}
+
 fn decode_record_into<'row>(payload: &'row [u8], out: &mut Vec<ValueRef<'row>>) -> Result<()> {
     out.clear();
 
@@ -507,6 +704,29 @@ fn decode_record_into<'row>(payload: &'row [u8], out: &mut Vec<ValueRef<'row>>) 
     }
 
     Ok(())
+}
+
+fn skip_value<'row>(serial_type: u64, decoder: &mut Decoder<'row>) -> Result<()> {
+    let len = serial_type_len(serial_type)?;
+    if len > 0 {
+        let _ = read_exact_bytes(decoder, len)?;
+    }
+    Ok(())
+}
+
+fn serial_type_len(serial_type: u64) -> Result<usize> {
+    match serial_type {
+        0 | 8 | 9 => Ok(0),
+        1 => Ok(1),
+        2 => Ok(2),
+        3 => Ok(3),
+        4 => Ok(4),
+        5 => Ok(6),
+        6 | 7 => Ok(8),
+        serial if serial >= 12 && serial % 2 == 0 => Ok(((serial - 12) / 2) as usize),
+        serial if serial >= 13 => Ok(((serial - 13) / 2) as usize),
+        other => Err(Error::UnsupportedSerialType(other)),
+    }
 }
 
 fn decode_value_ref<'row>(serial_type: u64, decoder: &mut Decoder<'row>) -> Result<ValueRef<'row>> {
