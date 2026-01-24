@@ -115,16 +115,16 @@ fn bench_query_scan_full_projection_hot(c: &mut Criterion) {
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
     let mut scratch = ScanScratch::with_capacity(8, 0);
+    let mut scan =
+        Scan::table(&pager, PageId::new(2)).project([0, 1, 2]).compile().expect("compile scan");
     c.bench_function("query_scan_full_projection_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            Scan::table(&pager, PageId::new(2))
-                .project([0, 1, 2])
-                .for_each(&mut scratch, |_, _| {
-                    rows += 1;
-                    Ok(())
-                })
-                .expect("scan users table");
+            scan.for_each(&mut scratch, |_, _| {
+                rows += 1;
+                Ok(())
+            })
+            .expect("scan users table");
             black_box(rows);
         });
     });
@@ -135,17 +135,19 @@ fn bench_query_scan_filter_int_hot(c: &mut Criterion) {
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
     let mut scratch = ScanScratch::with_capacity(8, 0);
+    let mut scan = Scan::table(&pager, PageId::new(2))
+        .project([1, 2])
+        .filter(col(2).gt(lit_i64(25)))
+        .compile()
+        .expect("compile scan");
     c.bench_function("query_scan_filter_int_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            Scan::table(&pager, PageId::new(2))
-                .project([1, 2])
-                .filter(col(2).gt(lit_i64(25)))
-                .for_each(&mut scratch, |_, _| {
-                    rows += 1;
-                    Ok(())
-                })
-                .expect("scan users table");
+            scan.for_each(&mut scratch, |_, _| {
+                rows += 1;
+                Ok(())
+            })
+            .expect("scan users table");
             black_box(rows);
         });
     });
@@ -156,17 +158,19 @@ fn bench_query_scan_filter_text_hot(c: &mut Criterion) {
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
     let mut scratch = ScanScratch::with_capacity(8, 0);
+    let mut scan = Scan::table(&pager, PageId::new(2))
+        .project([1])
+        .filter(col(1).eq(lit_bytes(b"alice")))
+        .compile()
+        .expect("compile scan");
     c.bench_function("query_scan_filter_text_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            Scan::table(&pager, PageId::new(2))
-                .project([1])
-                .filter(col(1).eq(lit_bytes(b"alice")))
-                .for_each(&mut scratch, |_, _| {
-                    rows += 1;
-                    Ok(())
-                })
-                .expect("scan users table");
+            scan.for_each(&mut scratch, |_, _| {
+                rows += 1;
+                Ok(())
+            })
+            .expect("scan users table");
             black_box(rows);
         });
     });

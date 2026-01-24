@@ -22,6 +22,26 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone)]
+enum CompiledExpr {
+    Col { col: u16, idx: usize },
+    Lit(ValueLit),
+
+    Eq(Box<CompiledExpr>, Box<CompiledExpr>),
+    Ne(Box<CompiledExpr>, Box<CompiledExpr>),
+    Lt(Box<CompiledExpr>, Box<CompiledExpr>),
+    Le(Box<CompiledExpr>, Box<CompiledExpr>),
+    Gt(Box<CompiledExpr>, Box<CompiledExpr>),
+    Ge(Box<CompiledExpr>, Box<CompiledExpr>),
+
+    And(Box<CompiledExpr>, Box<CompiledExpr>),
+    Or(Box<CompiledExpr>, Box<CompiledExpr>),
+    Not(Box<CompiledExpr>),
+
+    IsNull(Box<CompiledExpr>),
+    IsNotNull(Box<CompiledExpr>),
+}
+
+#[derive(Debug, Clone)]
 pub enum ValueLit {
     Null,
     Integer(i64),
@@ -129,7 +149,6 @@ impl std::ops::Not for Expr {
 pub struct ScanScratch {
     decoded: Vec<ValueRefRaw>,
     overflow_buf: Vec<u8>,
-    serial_types: Vec<u64>,
 }
 
 impl ScanScratch {
@@ -138,15 +157,11 @@ impl ScanScratch {
     }
 
     pub fn with_capacity(values: usize, overflow: usize) -> Self {
-        Self {
-            decoded: Vec::with_capacity(values),
-            overflow_buf: Vec::with_capacity(overflow),
-            serial_types: Vec::with_capacity(values),
-        }
+        Self { decoded: Vec::with_capacity(values), overflow_buf: Vec::with_capacity(overflow) }
     }
 
-    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u64>, &mut Vec<u8>) {
-        (&mut self.decoded, &mut self.serial_types, &mut self.overflow_buf)
+    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>) {
+        (&mut self.decoded, &mut self.overflow_buf)
     }
 }
 
@@ -231,6 +246,15 @@ pub struct Scan<'db> {
     limit: Option<usize>,
 }
 
+pub struct CompiledScan<'db> {
+    pager: &'db Pager,
+    root: PageId,
+    plan: Plan,
+    compiled_expr: Option<CompiledExpr>,
+    filter_fn: Option<FilterFn<'db>>,
+    limit: Option<usize>,
+}
+
 impl<'db> Scan<'db> {
     pub fn table(pager: &'db Pager, root: PageId) -> Self {
         Self { pager, root, projection: None, filter_expr: None, filter_fn: None, limit: None }
@@ -261,15 +285,8 @@ impl<'db> Scan<'db> {
         self
     }
 
-    pub fn for_each<F>(self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
-    where
-        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
-    {
-        if self.limit == Some(0) {
-            return Ok(());
-        }
-
-        let Scan { pager, root, projection, filter_expr, mut filter_fn, limit } = self;
+    pub fn compile(self) -> table::Result<CompiledScan<'db>> {
+        let Scan { pager, root, projection, filter_expr, filter_fn, limit } = self;
 
         let mut pred_cols = Vec::new();
         if let Some(expr) = &filter_expr {
@@ -277,18 +294,48 @@ impl<'db> Scan<'db> {
         }
 
         let plan = build_plan(projection.as_ref(), &pred_cols, filter_fn.is_some());
+        let compiled_expr = filter_expr
+            .as_ref()
+            .map(|expr| compile_expr(expr, plan.needed_cols.as_deref()))
+            .transpose()?;
+
+        Ok(CompiledScan { pager, root, plan, compiled_expr, filter_fn, limit })
+    }
+
+    pub fn for_each<F>(self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
+    where
+        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+    {
+        let mut compiled = self.compile()?;
+        compiled.for_each(scratch, &mut cb)
+    }
+}
+
+impl<'db> CompiledScan<'db> {
+    pub fn for_each<F>(&mut self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
+    where
+        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+    {
+        if self.limit == Some(0) {
+            return Ok(());
+        }
+
+        let pager = self.pager;
+        let root = self.root;
+        let plan = &self.plan;
+        let compiled_expr = self.compiled_expr.as_ref();
+        let filter_fn = &mut self.filter_fn;
+        let limit = self.limit;
         let mut seen = 0usize;
         let mut col_count: Option<usize> = None;
 
-        let (decoded, serial_types, overflow_buf) = scratch.split_mut();
+        let (decoded, overflow_buf) = scratch.split_mut();
 
         table::scan_table_cells_with_scratch_until(pager, root, overflow_buf, |rowid, payload| {
             decoded.clear();
-            serial_types.clear();
 
             let needed_cols = plan.needed_cols.as_deref();
-            let count =
-                table::decode_record_project_into(payload, needed_cols, decoded, serial_types)?;
+            let count = table::decode_record_project_into(payload, needed_cols, decoded)?;
 
             if col_count.is_none() {
                 if let Some(err) = validate_columns(&plan.referenced_cols, count) {
@@ -298,10 +345,10 @@ impl<'db> Scan<'db> {
             }
 
             let values = decoded.as_slice();
-            let row_eval = RowEval { values, needed_cols, column_count: count };
+            let row_eval = RowEval { values, column_count: count };
 
-            if let Some(expr) = filter_expr.as_ref()
-                && eval_expr(expr, &row_eval)? != Truth::True
+            if let Some(expr) = compiled_expr.as_ref()
+                && eval_compiled_expr(expr, &row_eval)? != Truth::True
             {
                 return Ok(None);
             }
@@ -337,6 +384,7 @@ struct Plan {
 }
 
 fn build_plan(projection: Option<&Vec<u16>>, pred_cols: &[u16], decode_all: bool) -> Plan {
+    let decode_all = decode_all || projection.is_none();
     let mut referenced_cols = pred_cols.to_vec();
     if let Some(proj) = projection {
         referenced_cols.extend(proj.iter().copied());
@@ -371,6 +419,60 @@ fn build_plan(projection: Option<&Vec<u16>>, pred_cols: &[u16], decode_all: bool
     });
 
     Plan { needed_cols, proj_map, referenced_cols }
+}
+
+fn compile_expr(expr: &Expr, needed_cols: Option<&[u16]>) -> table::Result<CompiledExpr> {
+    let compile_col = |col: u16| -> table::Result<CompiledExpr> {
+        let idx = match needed_cols {
+            Some(cols) => cols
+                .binary_search(&col)
+                .map_err(|_| table::Error::Corrupted("predicate column not decoded"))?,
+            None => col as usize,
+        };
+        Ok(CompiledExpr::Col { col, idx })
+    };
+
+    Ok(match expr {
+        Expr::Col(idx) => compile_col(*idx)?,
+        Expr::Lit(lit) => CompiledExpr::Lit(lit.clone()),
+        Expr::Eq(lhs, rhs) => CompiledExpr::Eq(
+            Box::new(compile_expr(lhs, needed_cols)?),
+            Box::new(compile_expr(rhs, needed_cols)?),
+        ),
+        Expr::Ne(lhs, rhs) => CompiledExpr::Ne(
+            Box::new(compile_expr(lhs, needed_cols)?),
+            Box::new(compile_expr(rhs, needed_cols)?),
+        ),
+        Expr::Lt(lhs, rhs) => CompiledExpr::Lt(
+            Box::new(compile_expr(lhs, needed_cols)?),
+            Box::new(compile_expr(rhs, needed_cols)?),
+        ),
+        Expr::Le(lhs, rhs) => CompiledExpr::Le(
+            Box::new(compile_expr(lhs, needed_cols)?),
+            Box::new(compile_expr(rhs, needed_cols)?),
+        ),
+        Expr::Gt(lhs, rhs) => CompiledExpr::Gt(
+            Box::new(compile_expr(lhs, needed_cols)?),
+            Box::new(compile_expr(rhs, needed_cols)?),
+        ),
+        Expr::Ge(lhs, rhs) => CompiledExpr::Ge(
+            Box::new(compile_expr(lhs, needed_cols)?),
+            Box::new(compile_expr(rhs, needed_cols)?),
+        ),
+        Expr::And(lhs, rhs) => CompiledExpr::And(
+            Box::new(compile_expr(lhs, needed_cols)?),
+            Box::new(compile_expr(rhs, needed_cols)?),
+        ),
+        Expr::Or(lhs, rhs) => CompiledExpr::Or(
+            Box::new(compile_expr(lhs, needed_cols)?),
+            Box::new(compile_expr(rhs, needed_cols)?),
+        ),
+        Expr::Not(inner) => CompiledExpr::Not(Box::new(compile_expr(inner, needed_cols)?)),
+        Expr::IsNull(inner) => CompiledExpr::IsNull(Box::new(compile_expr(inner, needed_cols)?)),
+        Expr::IsNotNull(inner) => {
+            CompiledExpr::IsNotNull(Box::new(compile_expr(inner, needed_cols)?))
+        }
+    })
 }
 
 fn validate_columns(referenced: &[u16], column_count: usize) -> Option<table::Error> {
@@ -443,9 +545,8 @@ enum CmpOp {
     Ge,
 }
 
-struct RowEval<'row, 'map> {
+struct RowEval<'row> {
     values: &'row [ValueRefRaw],
-    needed_cols: Option<&'map [u16]>,
     column_count: usize,
 }
 
@@ -455,63 +556,56 @@ enum Operand<'row, 'expr> {
     Null,
 }
 
-impl<'row> RowEval<'row, '_> {
-    fn value(&self, col: u16) -> Option<ValueRef<'row>> {
-        match self.needed_cols {
-            Some(cols) => {
-                cols.binary_search(&col)
-                    .ok()
-                    .and_then(|idx| self.values.get(idx).copied())
-                    .map(raw_to_ref)
-            }
-            None => self.values.get(col as usize).copied().map(raw_to_ref),
-        }
+impl<'row> RowEval<'row> {
+    fn value_by_idx(&self, idx: usize, col: u16) -> table::Result<ValueRef<'row>> {
+        self.values
+            .get(idx)
+            .copied()
+            .map(raw_to_ref)
+            .ok_or(table::Error::InvalidColumnIndex { col, column_count: self.column_count })
     }
 }
 
-fn eval_expr(expr: &Expr, row: &RowEval<'_, '_>) -> table::Result<Truth> {
+fn eval_compiled_expr(expr: &CompiledExpr, row: &RowEval<'_>) -> table::Result<Truth> {
     match expr {
-        Expr::Col(_) | Expr::Lit(_) => Ok(Truth::Null),
-        Expr::Eq(lhs, rhs) => eval_cmp(CmpOp::Eq, lhs, rhs, row),
-        Expr::Ne(lhs, rhs) => eval_cmp(CmpOp::Ne, lhs, rhs, row),
-        Expr::Lt(lhs, rhs) => eval_cmp(CmpOp::Lt, lhs, rhs, row),
-        Expr::Le(lhs, rhs) => eval_cmp(CmpOp::Le, lhs, rhs, row),
-        Expr::Gt(lhs, rhs) => eval_cmp(CmpOp::Gt, lhs, rhs, row),
-        Expr::Ge(lhs, rhs) => eval_cmp(CmpOp::Ge, lhs, rhs, row),
-        Expr::And(lhs, rhs) => {
-            let left = eval_expr(lhs, row)?;
+        CompiledExpr::Col { .. } | CompiledExpr::Lit(_) => Ok(Truth::Null),
+        CompiledExpr::Eq(lhs, rhs) => eval_cmp(CmpOp::Eq, lhs, rhs, row),
+        CompiledExpr::Ne(lhs, rhs) => eval_cmp(CmpOp::Ne, lhs, rhs, row),
+        CompiledExpr::Lt(lhs, rhs) => eval_cmp(CmpOp::Lt, lhs, rhs, row),
+        CompiledExpr::Le(lhs, rhs) => eval_cmp(CmpOp::Le, lhs, rhs, row),
+        CompiledExpr::Gt(lhs, rhs) => eval_cmp(CmpOp::Gt, lhs, rhs, row),
+        CompiledExpr::Ge(lhs, rhs) => eval_cmp(CmpOp::Ge, lhs, rhs, row),
+        CompiledExpr::And(lhs, rhs) => {
+            let left = eval_compiled_expr(lhs, row)?;
             if left == Truth::False {
                 return Ok(Truth::False);
             }
-            let right = eval_expr(rhs, row)?;
+            let right = eval_compiled_expr(rhs, row)?;
             Ok(truth_and(left, right))
         }
-        Expr::Or(lhs, rhs) => {
-            let left = eval_expr(lhs, row)?;
+        CompiledExpr::Or(lhs, rhs) => {
+            let left = eval_compiled_expr(lhs, row)?;
             if left == Truth::True {
                 return Ok(Truth::True);
             }
-            let right = eval_expr(rhs, row)?;
+            let right = eval_compiled_expr(rhs, row)?;
             Ok(truth_or(left, right))
         }
-        Expr::Not(inner) => Ok(truth_not(eval_expr(inner, row)?)),
-        Expr::IsNull(inner) => eval_is_null(inner, row),
-        Expr::IsNotNull(inner) => eval_is_not_null(inner, row),
+        CompiledExpr::Not(inner) => Ok(truth_not(eval_compiled_expr(inner, row)?)),
+        CompiledExpr::IsNull(inner) => eval_is_null(inner, row),
+        CompiledExpr::IsNotNull(inner) => eval_is_not_null(inner, row),
     }
 }
 
-fn eval_is_null(inner: &Expr, row: &RowEval<'_, '_>) -> table::Result<Truth> {
+fn eval_is_null(inner: &CompiledExpr, row: &RowEval<'_>) -> table::Result<Truth> {
     match inner {
-        Expr::Col(idx) => match row
-            .value(*idx)
-            .ok_or(table::Error::InvalidColumnIndex { col: *idx, column_count: row.column_count })?
-        {
+        CompiledExpr::Col { col, idx } => match row.value_by_idx(*idx, *col)? {
             ValueRef::Null => Ok(Truth::True),
             _ => Ok(Truth::False),
         },
-        Expr::Lit(ValueLit::Null) => Ok(Truth::True),
-        Expr::Lit(_) => Ok(Truth::False),
-        _ => Ok(if matches!(eval_expr(inner, row)?, Truth::Null) {
+        CompiledExpr::Lit(ValueLit::Null) => Ok(Truth::True),
+        CompiledExpr::Lit(_) => Ok(Truth::False),
+        _ => Ok(if matches!(eval_compiled_expr(inner, row)?, Truth::Null) {
             Truth::True
         } else {
             Truth::False
@@ -519,7 +613,7 @@ fn eval_is_null(inner: &Expr, row: &RowEval<'_, '_>) -> table::Result<Truth> {
     }
 }
 
-fn eval_is_not_null(inner: &Expr, row: &RowEval<'_, '_>) -> table::Result<Truth> {
+fn eval_is_not_null(inner: &CompiledExpr, row: &RowEval<'_>) -> table::Result<Truth> {
     match eval_is_null(inner, row)? {
         Truth::True => Ok(Truth::False),
         Truth::False => Ok(Truth::True),
@@ -527,7 +621,12 @@ fn eval_is_not_null(inner: &Expr, row: &RowEval<'_, '_>) -> table::Result<Truth>
     }
 }
 
-fn eval_cmp(op: CmpOp, lhs: &Expr, rhs: &Expr, row: &RowEval<'_, '_>) -> table::Result<Truth> {
+fn eval_cmp(
+    op: CmpOp,
+    lhs: &CompiledExpr,
+    rhs: &CompiledExpr,
+    row: &RowEval<'_>,
+) -> table::Result<Truth> {
     let left = eval_operand(lhs, row)?;
     let right = eval_operand(rhs, row)?;
 
@@ -541,15 +640,12 @@ fn eval_cmp(op: CmpOp, lhs: &Expr, rhs: &Expr, row: &RowEval<'_, '_>) -> table::
 }
 
 fn eval_operand<'row, 'expr>(
-    expr: &'expr Expr,
-    row: &RowEval<'row, '_>,
+    expr: &'expr CompiledExpr,
+    row: &RowEval<'row>,
 ) -> table::Result<Operand<'row, 'expr>> {
     match expr {
-        Expr::Col(idx) => row
-            .value(*idx)
-            .map(Operand::Value)
-            .ok_or(table::Error::InvalidColumnIndex { col: *idx, column_count: row.column_count }),
-        Expr::Lit(lit) => Ok(Operand::Literal(lit.as_value_ref())),
+        CompiledExpr::Col { col, idx } => row.value_by_idx(*idx, *col).map(Operand::Value),
+        CompiledExpr::Lit(lit) => Ok(Operand::Literal(lit.as_value_ref())),
         _ => Ok(Operand::Null),
     }
 }
@@ -638,15 +734,9 @@ mod tests {
         let payload =
             build_record(&[ValueRef::Integer(1), ValueRef::Integer(2), ValueRef::Integer(3)]);
         let mut decoded = Vec::new();
-        let mut serial_types = Vec::new();
         let needed = vec![0u16, 2u16];
-        let _ = table::decode_record_project_into(
-            &payload,
-            Some(&needed),
-            &mut decoded,
-            &mut serial_types,
-        )
-        .expect("decode");
+        let _ = table::decode_record_project_into(&payload, Some(&needed), &mut decoded)
+            .expect("decode");
         assert_eq!(decoded.len(), 2);
     }
 

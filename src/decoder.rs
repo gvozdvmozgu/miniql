@@ -29,13 +29,37 @@ impl<'bytes> Decoder<'bytes> {
     }
 
     #[inline]
+    pub fn try_read_u8(&mut self) -> Option<u8> {
+        if self.current == self.end {
+            decoder_exhausted_cold();
+            return None;
+        }
+
+        unsafe {
+            let byte = *self.current;
+            self.current = self.current.add(1);
+            Some(byte)
+        }
+    }
+
+    #[inline]
     pub fn read_u16(&mut self) -> u16 {
         u16::from_be_bytes(self.read_array())
     }
 
     #[inline]
+    pub fn try_read_u16(&mut self) -> Option<u16> {
+        self.try_read_array().map(u16::from_be_bytes)
+    }
+
+    #[inline]
     pub fn read_u32(&mut self) -> u32 {
         u32::from_be_bytes(self.read_array())
+    }
+
+    #[inline]
+    pub fn try_read_u32(&mut self) -> Option<u32> {
+        self.try_read_array().map(u32::from_be_bytes)
     }
 
     #[inline]
@@ -60,8 +84,35 @@ impl<'bytes> Decoder<'bytes> {
     }
 
     #[inline]
+    pub fn try_read_varint(&mut self) -> Option<u64> {
+        let first = self.try_read_u8()?;
+        if first & 0x80 == 0 {
+            return Some(u64::from(first));
+        }
+
+        let mut result = u64::from(first & 0x7F);
+        for _ in 0..7 {
+            let byte = self.try_read_u8()?;
+            result = (result << 7) | u64::from(byte & 0x7F);
+
+            if byte & 0x80 == 0 {
+                return Some(result);
+            }
+        }
+
+        let byte = self.try_read_u8()?;
+        Some((result << 8) | u64::from(byte))
+    }
+
+    #[inline]
     pub fn read_array<const N: usize>(&mut self) -> [u8; N] {
         self.read_bytes(N).try_into().unwrap()
+    }
+
+    #[inline]
+    pub fn try_read_array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let bytes = self.try_read_bytes(N)?;
+        Some(bytes.try_into().unwrap())
     }
 
     #[inline]
@@ -74,6 +125,20 @@ impl<'bytes> Decoder<'bytes> {
             let slice = std::slice::from_raw_parts(self.current, bytes);
             self.current = self.current.add(bytes);
             slice
+        }
+    }
+
+    #[inline]
+    pub fn try_read_bytes(&mut self, bytes: usize) -> Option<&'bytes [u8]> {
+        if bytes > self.remaining() {
+            decoder_exhausted_cold();
+            return None;
+        }
+
+        unsafe {
+            let slice = std::slice::from_raw_parts(self.current, bytes);
+            self.current = self.current.add(bytes);
+            Some(slice)
         }
     }
 
@@ -102,3 +167,7 @@ impl<'bytes> Decoder<'bytes> {
 fn decoder_exhausted() -> ! {
     panic!("Decoder exhausted")
 }
+
+#[cold]
+#[inline(never)]
+fn decoder_exhausted_cold() {}

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use miniql::pager::{PageId, Pager};
 use miniql::query::{Scan, ScanScratch, col, lit_bytes, lit_i64};
+use miniql::table::ValueRef;
 
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
@@ -76,6 +77,26 @@ fn projection_remaps_columns() {
         .for_each(&mut scratch, |rowid, row| {
             let age = row.get_i64(0)?;
             let name = row.get_text(1)?;
+            first = Some((rowid, name.to_owned(), age));
+            Ok(())
+        })
+        .expect("scan users table");
+
+    assert_eq!(first, Some((1, "alice".to_string(), 30)));
+}
+
+#[test]
+fn scan_without_projection_decodes_all_columns() {
+    let pager = open_pager("users.db");
+    let mut scratch = ScanScratch::with_capacity(4, 0);
+    let mut first = None;
+
+    Scan::table(&pager, PageId::new(2))
+        .filter(col(2).gt(lit_i64(25)))
+        .for_each(&mut scratch, |rowid, row| {
+            assert!(matches!(row.get(0), Some(ValueRef::Null)));
+            let name = row.get_text(1)?;
+            let age = row.get_i64(2)?;
             first = Some((rowid, name.to_owned(), age));
             Ok(())
         })

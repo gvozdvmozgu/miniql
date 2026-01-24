@@ -54,12 +54,16 @@ impl DbHeader {
         if write_version == 2 || read_version == 2 {
             return Err(Error::WalModeUnsupported { write_version, read_version });
         }
+        if write_version != 1 || read_version != 1 {
+            return Err(Error::InvalidFileFormatVersion { write_version, read_version });
+        }
 
         let page_count_hint = u32::from_be_bytes([header[28], header[29], header[30], header[31]]);
-        let encoding = u32::from_be_bytes([header[56], header[57], header[58], header[59]]);
-        if encoding != 1 {
-            return Err(Error::UnsupportedEncoding(encoding));
-        }
+        let encoding_raw = u32::from_be_bytes([header[56], header[57], header[58], header[59]]);
+        let encoding = match encoding_raw {
+            0 | 1 => 1,
+            other => return Err(Error::UnsupportedEncoding(other)),
+        };
 
         Ok(DbHeader {
             page_size,
@@ -206,6 +210,7 @@ pub enum Error {
     UnsupportedPayloadFractions((u8, u8, u8)),
     UnsupportedEncoding(u32),
     WalModeUnsupported { write_version: u8, read_version: u8 },
+    InvalidFileFormatVersion { write_version: u8, read_version: u8 },
     TruncatedFile,
     TooManyPages,
     PageOutOfRange,
@@ -233,6 +238,13 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "WAL mode unsupported (write_version={write_version}, \
+                     read_version={read_version})"
+                )
+            }
+            Self::InvalidFileFormatVersion { write_version, read_version } => {
+                write!(
+                    f,
+                    "Invalid SQLite format version (write_version={write_version}, \
                      read_version={read_version})"
                 )
             }
