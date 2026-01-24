@@ -74,21 +74,21 @@ fn reads_users_table_rows_by_ref() {
 fn scans_users_table_rows() {
     let pager = open_pager("users.db");
     let mut seen = 0usize;
-    table::scan_table_ref(&pager, PageId::new(2), |rowid, values| {
+    table::scan_table_ref(&pager, PageId::new(2), |rowid, row| {
         match seen {
             0 => {
                 assert_eq!(rowid, 1);
-                assert_eq!(values.len(), 3);
-                assert!(matches!(values[0], ValueRef::Null));
-                assert_eq!(values[1].as_text(), Some("alice"));
-                assert_eq!(values[2].as_integer(), Some(30));
+                assert_eq!(row.len(), 3);
+                assert!(matches!(row.get(0), Some(ValueRef::Null)));
+                assert_eq!(row.get(1).and_then(|v| v.as_text()), Some("alice"));
+                assert_eq!(row.get(2).and_then(|v| v.as_integer()), Some(30));
             }
             1 => {
                 assert_eq!(rowid, 2);
-                assert_eq!(values.len(), 3);
-                assert!(matches!(values[0], ValueRef::Null));
-                assert_eq!(values[1].as_text(), Some("bob"));
-                assert_eq!(values[2].as_integer(), Some(25));
+                assert_eq!(row.len(), 3);
+                assert!(matches!(row.get(0), Some(ValueRef::Null)));
+                assert_eq!(row.get(1).and_then(|v| v.as_text()), Some("bob"));
+                assert_eq!(row.get(2).and_then(|v| v.as_integer()), Some(25));
             }
             _ => panic!("unexpected extra row"),
         }
@@ -112,11 +112,11 @@ fn opens_with_different_page_sizes() {
 fn reads_overflow_payloads() {
     let pager = open_pager("overflow.db");
     let mut rows = 0usize;
-    table::scan_table_ref(&pager, PageId::new(2), |rowid, values| {
+    table::scan_table_ref(&pager, PageId::new(2), |rowid, row| {
         assert_eq!(rowid, 1);
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[0].as_integer(), Some(1));
-        let text = values[1].as_text().expect("utf8 text");
+        assert_eq!(row.len(), 2);
+        assert_eq!(row.get(0).and_then(|v| v.as_integer()), Some(1));
+        let text = row.get(1).and_then(|v| v.as_text()).expect("utf8 text");
         assert!(text.len() > 5000);
         assert!(text.starts_with("payload-"));
         rows += 1;
@@ -130,8 +130,8 @@ fn reads_overflow_payloads() {
 fn scans_tables_with_interior_pages() {
     let pager = open_pager("interior.db");
     let mut rows = 0usize;
-    table::scan_table_ref(&pager, PageId::new(2), |_, values| {
-        assert_eq!(values.len(), 2);
+    table::scan_table_ref(&pager, PageId::new(2), |_, row| {
+        assert_eq!(row.len(), 2);
         rows += 1;
         Ok(())
     })

@@ -164,6 +164,12 @@ impl ValueRefRaw {
     }
 }
 
+fn raw_to_ref<'row>(value: ValueRefRaw) -> ValueRef<'row> {
+    // SAFETY: raw values point into the current row payload/overflow buffer and
+    // are only materialized for the duration of the row callback.
+    unsafe { value.as_value_ref() }
+}
+
 impl<'row> ValueRef<'row> {
     pub fn as_text(&self) -> Option<&'row str> {
         match self {
@@ -199,6 +205,29 @@ impl fmt::Display for ValueRef<'_> {
             },
             Self::Blob(bytes) => Value::display_blob(bytes, f),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RowView<'row> {
+    values: &'row [ValueRefRaw],
+}
+
+impl<'row> RowView<'row> {
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn get(&self, i: usize) -> Option<ValueRef<'row>> {
+        self.values.get(i).copied().map(raw_to_ref)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = ValueRef<'row>> + '_ {
+        self.values.iter().copied().map(raw_to_ref)
     }
 }
 
@@ -251,23 +280,13 @@ impl RowScratch {
     }
 }
 
-fn materialize_values<'row>(raw: &'row [ValueRefRaw]) -> Vec<ValueRef<'row>> {
-    let mut values = Vec::with_capacity(raw.len());
-    for value in raw {
-        // SAFETY: raw values point into the current row payload/overflow buffer and
-        // are only materialized for the duration of this callback.
-        values.push(unsafe { value.as_value_ref() });
-    }
-    values
-}
-
 pub fn read_table(pager: &Pager, page_id: PageId) -> Result<Vec<TableRow>> {
     let mut rows = Vec::new();
     let mut scratch = RowScratch::with_capacity(8, 0);
-    scan_table_ref_with_scratch(pager, page_id, &mut scratch, |rowid, values| {
-        let mut owned = Vec::with_capacity(values.len());
-        for value in values {
-            owned.push(Value::try_from(*value)?);
+    scan_table_ref_with_scratch(pager, page_id, &mut scratch, |rowid, row| {
+        let mut owned = Vec::with_capacity(row.len());
+        for value in row.iter() {
+            owned.push(Value::try_from(value)?);
         }
         rows.push(TableRow { rowid, values: owned });
         Ok(())
@@ -286,14 +305,14 @@ pub fn scan_table_ref_with_scratch<F>(
     mut f: F,
 ) -> Result<()>
 where
-    F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<()>,
+    F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
 {
     scan_table_page_ref(pager, page_id, scratch, &mut f)
 }
 
 pub fn scan_table_ref<F>(pager: &Pager, page_id: PageId, f: F) -> Result<()>
 where
-    F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<()>,
+    F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
 {
     let mut scratch = RowScratch::with_capacity(8, 0);
     scan_table_ref_with_scratch(pager, page_id, &mut scratch, f)
@@ -301,7 +320,7 @@ where
 
 pub fn scan_table_ref_until<F, T>(pager: &Pager, page_id: PageId, mut f: F) -> Result<Option<T>>
 where
-    F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<Option<T>>,
+    F: for<'row> FnMut(i64, RowView<'row>) -> Result<Option<T>>,
 {
     let mut scratch = RowScratch::with_capacity(8, 0);
     scan_table_page_ref_until(pager, page_id, &mut scratch, &mut f)
@@ -338,7 +357,7 @@ fn scan_table_page_ref<'pager, F>(
     f: &mut F,
 ) -> Result<()>
 where
-    F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<()>,
+    F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
 {
     let mut stack = vec![page_id];
     let max_pages = pager.page_count().max(1);
@@ -359,9 +378,8 @@ where
                 for idx in 0..header.cell_count as usize {
                     let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
                     let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
-                    let raw_values = scratch.values_slice();
-                    let values = materialize_values(raw_values);
-                    f(rowid, values.as_slice())?;
+                    let row = RowView { values: scratch.values_slice() };
+                    f(rowid, row)?;
                 }
             }
             BTreeKind::TableInterior => {
@@ -462,7 +480,7 @@ fn scan_table_page_ref_until<'pager, F, T>(
     f: &mut F,
 ) -> Result<Option<T>>
 where
-    F: for<'row> FnMut(i64, &'row [ValueRef<'row>]) -> Result<Option<T>>,
+    F: for<'row> FnMut(i64, RowView<'row>) -> Result<Option<T>>,
 {
     let mut stack = vec![page_id];
     let max_pages = pager.page_count().max(1);
@@ -483,9 +501,8 @@ where
                 for idx in 0..header.cell_count as usize {
                     let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
                     let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
-                    let raw_values = scratch.values_slice();
-                    let values = materialize_values(raw_values);
-                    if let Some(value) = f(rowid, values.as_slice())? {
+                    let row = RowView { values: scratch.values_slice() };
+                    if let Some(value) = f(rowid, row)? {
                         return Ok(Some(value));
                     }
                 }
