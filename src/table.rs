@@ -803,8 +803,18 @@ fn read_table_cell_ref_from_bytes<'row>(
     }
 
     let mut pos = offset as usize;
-    let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
-    let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+    let remaining = usable.len().saturating_sub(pos);
+    let (payload_length, rowid) = if remaining >= 18 {
+        // SAFETY: remaining >= 18 guarantees two varints (max 9 bytes each) are
+        // in-bounds.
+        let payload_length = unsafe { read_varint_unchecked_at(usable, &mut pos) };
+        let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) } as i64;
+        (payload_length, rowid)
+    } else {
+        let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
+        let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+        (payload_length, rowid)
+    };
     let payload_length =
         usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
     if payload_length > MAX_PAYLOAD_BYTES {
@@ -848,13 +858,26 @@ fn read_table_leaf_rowid(page: &PageRef<'_>, offset: u16) -> Result<i64> {
     }
 
     let mut pos = offset as usize;
-    let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
+    let remaining = usable.len().saturating_sub(pos);
+    let payload_length = if remaining >= 18 {
+        // SAFETY: remaining >= 18 guarantees two varints (max 9 bytes each) are
+        // in-bounds.
+        unsafe { read_varint_unchecked_at(usable, &mut pos) }
+    } else {
+        read_varint_at(usable, &mut pos, "cell payload length truncated")?
+    };
     let payload_length =
         usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
     if payload_length > MAX_PAYLOAD_BYTES {
         return Err(Error::PayloadTooLarge(payload_length));
     }
-    let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+    let rowid = if remaining >= 18 {
+        // SAFETY: remaining >= 18 guarantees two varints (max 9 bytes each) are
+        // in-bounds.
+        (unsafe { read_varint_unchecked_at(usable, &mut pos) }) as i64
+    } else {
+        read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64
+    };
     Ok(rowid)
 }
 
