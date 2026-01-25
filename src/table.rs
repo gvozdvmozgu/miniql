@@ -1325,7 +1325,6 @@ pub(crate) fn decode_record_project_into(
 ) -> Result<usize> {
     match payload {
         RecordPayload::Inline(bytes) => {
-            spill.clear();
             decode_record_project_into_bytes(bytes, needed_cols, out)
         }
         RecordPayload::Overflow(payload) => {
@@ -1452,7 +1451,87 @@ fn decode_record_into(
     out: &mut Vec<ValueRefRaw>,
     spill: &mut Vec<u8>,
 ) -> Result<()> {
-    let _ = decode_record_project_into(payload, None, out, spill)?;
+    match payload {
+        RecordPayload::Inline(bytes) => decode_record_into_bytes(bytes, out),
+        RecordPayload::Overflow(payload) => decode_record_into_overflow(&payload, out, spill),
+    }
+}
+
+fn decode_record_into_bytes(payload: &[u8], out: &mut Vec<ValueRefRaw>) -> Result<()> {
+    out.clear();
+
+    let mut header_pos = 0usize;
+    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let header_len = if first < 0x80 {
+        header_pos = 1;
+        first as usize
+    } else {
+        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+    };
+    if header_len < header_pos || header_len > payload.len() {
+        return Err(Error::Corrupted("invalid record header length"));
+    }
+
+    let serial_bytes = &payload[header_pos..header_len];
+    let mut serial_pos = 0usize;
+    let mut value_pos = header_len;
+    while serial_pos < serial_bytes.len() {
+        let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
+        let serial = if b < 0x80 {
+            serial_pos += 1;
+            b as u64
+        } else {
+            read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
+        };
+        out.push(decode_value_ref_at(serial, payload, &mut value_pos)?);
+    }
+
+    Ok(())
+}
+
+fn decode_record_into_overflow(
+    payload: &OverflowPayload<'_>,
+    out: &mut Vec<ValueRefRaw>,
+    spill: &mut Vec<u8>,
+) -> Result<()> {
+    out.clear();
+    spill.clear();
+
+    let mut serial_cursor = OverflowCursor::new(payload, 0)?;
+    let header_len = serial_cursor.read_varint("record header truncated")? as usize;
+    let header_pos = serial_cursor.position();
+    if header_len < header_pos || header_len > payload.total_len {
+        return Err(Error::Corrupted("invalid record header length"));
+    }
+
+    let mut value_cursor = OverflowCursor::new(payload, header_len)?;
+    let mut pending: Vec<PendingBytes> = Vec::new();
+
+    while serial_cursor.position() < header_len {
+        let serial = serial_cursor.read_varint("record header truncated")?;
+        if serial_cursor.position() > header_len {
+            return Err(Error::Corrupted("record header truncated"));
+        }
+        let decoded = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
+        match decoded {
+            DecodedValue::Ready(raw) => out.push(raw),
+            DecodedValue::Spill { start, len, kind } => {
+                let out_index = out.len();
+                out.push(ValueRefRaw::Null);
+                pending.push(PendingBytes { out_index, start, len, kind });
+            }
+        }
+    }
+
+    for pending in pending {
+        let slice = &spill[pending.start..pending.start + pending.len];
+        let raw = RawBytes::from_slice(slice);
+        out[pending.out_index] = match pending.kind {
+            PendingKind::Text => ValueRefRaw::TextBytes(raw),
+            PendingKind::Blob => ValueRefRaw::Blob(raw),
+        };
+    }
+
     Ok(())
 }
 
