@@ -13,6 +13,7 @@ pub struct IndexScratch {
     stack: Vec<StackEntry>,
     overflow_buf: Vec<u8>,
     decoded: Vec<ValueRefRaw>,
+    pending: Vec<table::PendingBytes>,
 }
 
 impl IndexScratch {
@@ -25,6 +26,7 @@ impl IndexScratch {
             stack: Vec::new(),
             overflow_buf: Vec::with_capacity(overflow),
             decoded: Vec::with_capacity(values),
+            pending: Vec::with_capacity(values),
         }
     }
 }
@@ -254,6 +256,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
             None,
             &mut self.scratch.decoded,
             &mut self.scratch.overflow_buf,
+            &mut self.scratch.pending,
         )?;
         self.cached_cell = Some((leaf.page_id, leaf.cell_index));
         Ok(())
@@ -352,6 +355,7 @@ pub(crate) fn index_key_len(
                     None,
                     &mut scratch.decoded,
                     &mut scratch.overflow_buf,
+                    &mut scratch.pending,
                 )?;
                 if count == 0 {
                     return Err(table::Error::Corrupted("index record has no columns"));

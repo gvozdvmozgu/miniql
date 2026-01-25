@@ -217,6 +217,7 @@ impl<'db> PreparedJoin<'db> {
             right_scan_scratch,
             right_decoded,
             right_overflow,
+            right_pending,
             index_scratch,
             right_nulls,
         ) = scratch.split_mut();
@@ -227,6 +228,7 @@ impl<'db> PreparedJoin<'db> {
                 &self.right_meta,
                 right_decoded,
                 right_overflow,
+                right_pending,
             )?)
         } else {
             None
@@ -243,6 +245,7 @@ impl<'db> PreparedJoin<'db> {
                 left_scan_scratch,
                 right_decoded,
                 right_overflow,
+                right_pending,
                 index_scratch,
                 right_nulls,
                 right_null_len,
@@ -258,6 +261,7 @@ impl<'db> PreparedJoin<'db> {
                 right_scan_scratch,
                 right_decoded,
                 right_overflow,
+                right_pending,
                 right_nulls,
                 right_null_len,
                 &mut cb,
@@ -281,6 +285,7 @@ impl<'db> PreparedJoin<'db> {
                 left_scan_scratch,
                 right_decoded,
                 right_overflow,
+                right_pending,
                 right_nulls,
                 right_null_len,
                 &mut cb,
@@ -302,9 +307,20 @@ pub struct JoinScratch {
     right_scan: ScanScratch,
     right_decoded: Vec<ValueRefRaw>,
     right_overflow: Vec<u8>,
+    right_pending: Vec<table::PendingBytes>,
     index: IndexScratch,
     right_nulls: Vec<ValueRefRaw>,
 }
+
+type JoinScratchParts<'a> = (
+    &'a mut ScanScratch,
+    &'a mut ScanScratch,
+    &'a mut Vec<ValueRefRaw>,
+    &'a mut Vec<u8>,
+    &'a mut Vec<table::PendingBytes>,
+    &'a mut IndexScratch,
+    &'a mut Vec<ValueRefRaw>,
+);
 
 impl JoinScratch {
     pub fn new() -> Self {
@@ -313,6 +329,7 @@ impl JoinScratch {
             right_scan: ScanScratch::new(),
             right_decoded: Vec::new(),
             right_overflow: Vec::new(),
+            right_pending: Vec::new(),
             index: IndexScratch::new(),
             right_nulls: Vec::new(),
         }
@@ -324,26 +341,19 @@ impl JoinScratch {
             right_scan: ScanScratch::with_capacity(right_values, overflow),
             right_decoded: Vec::with_capacity(right_values),
             right_overflow: Vec::with_capacity(overflow),
+            right_pending: Vec::with_capacity(right_values),
             index: IndexScratch::with_capacity(right_values, overflow),
             right_nulls: Vec::with_capacity(right_values),
         }
     }
 
-    fn split_mut(
-        &mut self,
-    ) -> (
-        &mut ScanScratch,
-        &mut ScanScratch,
-        &mut Vec<ValueRefRaw>,
-        &mut Vec<u8>,
-        &mut IndexScratch,
-        &mut Vec<ValueRefRaw>,
-    ) {
+    fn split_mut(&mut self) -> JoinScratchParts<'_> {
         (
             &mut self.left_scan,
             &mut self.right_scan,
             &mut self.right_decoded,
             &mut self.right_overflow,
+            &mut self.right_pending,
             &mut self.index,
             &mut self.right_nulls,
         )
@@ -452,6 +462,7 @@ fn index_nested_loop<F>(
     left_scratch: &mut ScanScratch,
     right_decoded: &mut Vec<ValueRefRaw>,
     right_overflow: &mut Vec<u8>,
+    right_pending: &mut Vec<table::PendingBytes>,
     index_scratch: &mut IndexScratch,
     right_nulls: &mut Vec<ValueRefRaw>,
     right_null_len: Option<usize>,
@@ -487,8 +498,12 @@ where
         while cursor.key_eq(left_key_value)? {
             let right_rowid = cursor.current_rowid()?;
             if let Some(payload) = table::lookup_rowid_payload(pager, right_root, right_rowid)?
-                && let Some(right_row) =
-                    right_scan.eval_payload(payload, right_decoded, right_overflow)?
+                && let Some(right_row) = right_scan.eval_payload(
+                    payload,
+                    right_decoded,
+                    right_overflow,
+                    right_pending,
+                )?
             {
                 let right_out = right_meta.output_row(right_row.values_raw());
                 cb(JoinedRow { left_rowid, right_rowid, left: left_out, right: right_out })?;
@@ -525,6 +540,7 @@ fn rowid_nested_loop<F>(
     left_scratch: &mut ScanScratch,
     right_decoded: &mut Vec<ValueRefRaw>,
     right_overflow: &mut Vec<u8>,
+    right_pending: &mut Vec<table::PendingBytes>,
     right_nulls: &mut Vec<ValueRefRaw>,
     right_null_len: Option<usize>,
     cb: &mut F,
@@ -546,7 +562,7 @@ where
         };
         if let Some(payload) = table::lookup_rowid_payload(pager, right_root, target_rowid)?
             && let Some(right_row) =
-                right_scan.eval_payload(payload, right_decoded, right_overflow)?
+                right_scan.eval_payload(payload, right_decoded, right_overflow, right_pending)?
         {
             let right_out = right_meta.output_row(right_row.values_raw());
             cb(JoinedRow {
@@ -614,6 +630,7 @@ fn hash_join<F>(
     right_scratch: &mut ScanScratch,
     right_decoded: &mut Vec<ValueRefRaw>,
     right_overflow: &mut Vec<u8>,
+    right_pending: &mut Vec<table::PendingBytes>,
     right_nulls: &mut Vec<ValueRefRaw>,
     right_null_len: Option<usize>,
     cb: &mut F,
@@ -690,6 +707,7 @@ where
                             payload,
                             right_decoded,
                             right_overflow,
+                            right_pending,
                             false,
                         )?
                     {
@@ -711,6 +729,7 @@ where
                                 payload,
                                 right_decoded,
                                 right_overflow,
+                                right_pending,
                                 false,
                             )?
                         {
@@ -1004,6 +1023,7 @@ fn resolve_right_null_len(
     right_meta: &SideMeta,
     right_decoded: &mut Vec<ValueRefRaw>,
     right_overflow: &mut Vec<u8>,
+    right_pending: &mut Vec<table::PendingBytes>,
 ) -> Result<usize> {
     if let Some(map) = right_meta.output_map.as_ref() {
         return Ok(map.len());
@@ -1023,8 +1043,13 @@ fn resolve_right_null_len(
         root,
         &mut stack,
         |_, payload| {
-            let count =
-                table::decode_record_project_into(payload, None, right_decoded, right_overflow)?;
+            let count = table::decode_record_project_into(
+                payload,
+                None,
+                right_decoded,
+                right_overflow,
+                right_pending,
+            )?;
             Ok(Some(count))
         },
     )?;

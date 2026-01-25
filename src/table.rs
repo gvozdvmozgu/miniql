@@ -7,6 +7,7 @@ use crate::pager::{PageId, PageRef, Pager};
 pub type Result<T> = std::result::Result<T, Error>;
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_SPILL_CAPACITY: usize = 8 * 1024;
 
 #[non_exhaustive]
 #[derive(Debug)]
@@ -16,6 +17,7 @@ pub enum Error {
     UnsupportedSerialType(u64),
     Corrupted(&'static str),
     InvalidColumnIndex { col: u16, column_count: usize },
+    ScratchTooSmall { kind: &'static str, needed: usize, capacity: usize },
     TypeMismatch { col: usize, expected: &'static str, got: &'static str },
     Utf8(str::Utf8Error),
     TableNotFound(String),
@@ -36,6 +38,9 @@ impl fmt::Display for Error {
             Self::Corrupted(msg) => write!(f, "Corrupted table page: {msg}"),
             Self::InvalidColumnIndex { col, column_count } => {
                 write!(f, "Invalid column index {col} (column count {column_count})")
+            }
+            Self::ScratchTooSmall { kind, needed, capacity } => {
+                write!(f, "Scratch buffer too small ({kind}): need {needed}, capacity {capacity}")
             }
             Self::TypeMismatch { col, expected, got } => {
                 write!(f, "Type mismatch at column {col}: expected {expected}, got {got}")
@@ -311,6 +316,7 @@ pub struct TableRow {
 pub struct RowScratch {
     values: Vec<ValueRefRaw>,
     overflow_buf: Vec<u8>,
+    pending: Vec<PendingBytes>,
     btree_stack: Vec<PageId>,
 }
 
@@ -323,6 +329,7 @@ impl RowScratch {
         Self {
             values: Vec::with_capacity(values),
             overflow_buf: Vec::with_capacity(overflow),
+            pending: Vec::with_capacity(values),
             btree_stack: Vec::new(),
         }
     }
@@ -338,10 +345,11 @@ impl RowScratch {
     fn prepare_row(&mut self) {
         self.values.clear();
         self.overflow_buf.clear();
+        self.pending.clear();
     }
 
-    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>) {
-        (&mut self.values, &mut self.overflow_buf)
+    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>, &mut Vec<PendingBytes>) {
+        (&mut self.values, &mut self.overflow_buf, &mut self.pending)
     }
 
     fn values_slice(&self) -> &[ValueRefRaw] {
@@ -351,7 +359,7 @@ impl RowScratch {
 
 pub fn read_table(pager: &Pager, page_id: PageId) -> Result<Vec<TableRow>> {
     let mut rows = Vec::new();
-    let mut scratch = RowScratch::with_capacity(8, 0);
+    let mut scratch = RowScratch::with_capacity(8, DEFAULT_SPILL_CAPACITY);
     scan_table_ref_with_scratch(pager, page_id, &mut scratch, |rowid, row| {
         let mut owned = Vec::with_capacity(row.len());
         for value in row.iter() {
@@ -383,7 +391,7 @@ pub fn scan_table_ref<F>(pager: &Pager, page_id: PageId, f: F) -> Result<()>
 where
     F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
 {
-    let mut scratch = RowScratch::with_capacity(8, 0);
+    let mut scratch = RowScratch::with_capacity(8, DEFAULT_SPILL_CAPACITY);
     scan_table_ref_with_scratch(pager, page_id, &mut scratch, f)
 }
 
@@ -391,7 +399,7 @@ pub fn scan_table_ref_until<F, T>(pager: &Pager, page_id: PageId, mut f: F) -> R
 where
     F: for<'row> FnMut(i64, RowView<'row>) -> Result<Option<T>>,
 {
-    let mut scratch = RowScratch::with_capacity(8, 0);
+    let mut scratch = RowScratch::with_capacity(8, DEFAULT_SPILL_CAPACITY);
     scan_table_page_ref_until(pager, page_id, &mut scratch, &mut f)
 }
 
@@ -826,7 +834,7 @@ fn read_table_cell_into(
     scratch: &mut RowScratch,
 ) -> Result<i64> {
     scratch.prepare_row();
-    let (values, spill) = scratch.split_mut();
+    let (values, spill, pending) = scratch.split_mut();
     let usable = page.usable_bytes();
     if offset as usize >= usable.len() {
         return Err(Error::Corrupted("cell offset out of bounds"));
@@ -880,7 +888,7 @@ fn read_table_cell_into(
 
     let payload =
         OverflowPayload::new(pager, payload_length, &usable[start..end_local], overflow_page);
-    decode_record_into_overflow(&payload, values, spill)?;
+    decode_record_into_overflow(&payload, values, spill, pending)?;
     Ok(rowid)
 }
 
@@ -1101,11 +1109,28 @@ enum PendingKind {
 }
 
 #[derive(Debug)]
-struct PendingBytes {
+pub(crate) struct PendingBytes {
     out_index: usize,
     start: usize,
     len: usize,
     kind: PendingKind,
+}
+
+fn push_checked<T>(out: &mut Vec<T>, value: T, kind: &'static str) -> Result<()> {
+    if out.len() == out.capacity() {
+        let needed = out.len().saturating_add(1);
+        return Err(Error::ScratchTooSmall { kind, needed, capacity: out.capacity() });
+    }
+    out.push(value);
+    Ok(())
+}
+
+fn ensure_spill_capacity(spill: &Vec<u8>, additional: usize) -> Result<()> {
+    let needed = spill.len().saturating_add(additional);
+    if needed > spill.capacity() {
+        return Err(Error::ScratchTooSmall { kind: "spill", needed, capacity: spill.capacity() });
+    }
+    Ok(())
 }
 
 struct OverflowCursor<'row> {
@@ -1259,6 +1284,7 @@ impl<'row> OverflowCursor<'row> {
             return Ok(ValueBytes::Inline(RawBytes::from_slice(slice)));
         }
 
+        ensure_spill_capacity(spill, len)?;
         let start = spill.len();
         let mut remaining = len;
         while remaining > 0 {
@@ -1297,9 +1323,11 @@ fn decode_record_project_into_overflow(
     needed_cols: Option<&[u16]>,
     out: &mut Vec<ValueRefRaw>,
     spill: &mut Vec<u8>,
+    pending: &mut Vec<PendingBytes>,
 ) -> Result<usize> {
     out.clear();
     spill.clear();
+    pending.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
     let header_len = serial_cursor.read_varint("record header truncated")? as usize;
@@ -1309,8 +1337,6 @@ fn decode_record_project_into_overflow(
     }
 
     let mut value_cursor = OverflowCursor::new(payload, header_len)?;
-    let mut pending: Vec<PendingBytes> = Vec::new();
-
     if let Some(needed_cols) = needed_cols {
         let mut needed_iter = needed_cols.iter().copied();
         let mut next_needed = needed_iter.next();
@@ -1324,11 +1350,15 @@ fn decode_record_project_into_overflow(
             if Some(col_idx) == next_needed {
                 let decoded = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
                 match decoded {
-                    DecodedValue::Ready(raw) => out.push(raw),
+                    DecodedValue::Ready(raw) => push_checked(out, raw, "values")?,
                     DecodedValue::Spill { start, len, kind } => {
                         let out_index = out.len();
-                        out.push(ValueRefRaw::Null);
-                        pending.push(PendingBytes { out_index, start, len, kind });
+                        push_checked(out, ValueRefRaw::Null, "values")?;
+                        push_checked(
+                            pending,
+                            PendingBytes { out_index, start, len, kind },
+                            "pending",
+                        )?;
                     }
                 }
                 next_needed = needed_iter.next();
@@ -1357,11 +1387,11 @@ fn decode_record_project_into_overflow(
             }
             let decoded = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
             match decoded {
-                DecodedValue::Ready(raw) => out.push(raw),
+                DecodedValue::Ready(raw) => push_checked(out, raw, "values")?,
                 DecodedValue::Spill { start, len, kind } => {
                     let out_index = out.len();
-                    out.push(ValueRefRaw::Null);
-                    pending.push(PendingBytes { out_index, start, len, kind });
+                    push_checked(out, ValueRefRaw::Null, "values")?;
+                    push_checked(pending, PendingBytes { out_index, start, len, kind }, "pending")?;
                 }
             }
             column_count += 1;
@@ -1385,11 +1415,13 @@ pub(crate) fn decode_record_project_into(
     needed_cols: Option<&[u16]>,
     out: &mut Vec<ValueRefRaw>,
     spill: &mut Vec<u8>,
+    pending: &mut Vec<PendingBytes>,
 ) -> Result<usize> {
+    pending.clear();
     match payload {
         RecordPayload::Inline(bytes) => decode_record_project_into_bytes(bytes, needed_cols, out),
         RecordPayload::Overflow(payload) => {
-            decode_record_project_into_overflow(&payload, needed_cols, out, spill)
+            decode_record_project_into_overflow(&payload, needed_cols, out, spill, pending)
         }
     }
 }
@@ -1431,7 +1463,8 @@ fn decode_record_project_into_bytes(
             };
             let col_idx = column_count as u16;
             if Some(col_idx) == next_needed {
-                out.push(decode_value_ref_at(serial, payload, &mut value_pos)?);
+                let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
+                push_checked(out, value, "values")?;
                 next_needed = needed_iter.next();
             } else {
                 skip_value_at(serial, payload, &mut value_pos)?;
@@ -1449,7 +1482,8 @@ fn decode_record_project_into_bytes(
             } else {
                 read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
             };
-            out.push(decode_value_ref_at(serial, payload, &mut value_pos)?);
+            let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
+            push_checked(out, value, "values")?;
             column_count += 1;
         }
         Ok(column_count)
@@ -1533,7 +1567,8 @@ fn decode_record_into_bytes(payload: &[u8], out: &mut Vec<ValueRefRaw>) -> Resul
         } else {
             read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
         };
-        out.push(decode_value_ref_at(serial, payload, &mut value_pos)?);
+        let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
+        push_checked(out, value, "values")?;
     }
 
     Ok(())
@@ -1543,9 +1578,11 @@ fn decode_record_into_overflow(
     payload: &OverflowPayload<'_>,
     out: &mut Vec<ValueRefRaw>,
     spill: &mut Vec<u8>,
+    pending: &mut Vec<PendingBytes>,
 ) -> Result<()> {
     out.clear();
     spill.clear();
+    pending.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
     let header_len = serial_cursor.read_varint("record header truncated")? as usize;
@@ -1555,8 +1592,6 @@ fn decode_record_into_overflow(
     }
 
     let mut value_cursor = OverflowCursor::new(payload, header_len)?;
-    let mut pending: Vec<PendingBytes> = Vec::new();
-
     while serial_cursor.position() < header_len {
         let serial = serial_cursor.read_varint("record header truncated")?;
         if serial_cursor.position() > header_len {
@@ -1564,11 +1599,11 @@ fn decode_record_into_overflow(
         }
         let decoded = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
         match decoded {
-            DecodedValue::Ready(raw) => out.push(raw),
+            DecodedValue::Ready(raw) => push_checked(out, raw, "values")?,
             DecodedValue::Spill { start, len, kind } => {
                 let out_index = out.len();
-                out.push(ValueRefRaw::Null);
-                pending.push(PendingBytes { out_index, start, len, kind });
+                push_checked(out, ValueRefRaw::Null, "values")?;
+                push_checked(pending, PendingBytes { out_index, start, len, kind }, "pending")?;
             }
         }
     }

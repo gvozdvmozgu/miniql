@@ -112,7 +112,8 @@ fn opens_with_different_page_sizes() {
 fn reads_overflow_payloads() {
     let pager = open_pager("overflow.db");
     let mut rows = 0usize;
-    table::scan_table_ref(&pager, PageId::new(2), |rowid, row| {
+    let mut scratch = table::RowScratch::with_capacity(2, 16 * 1024);
+    table::scan_table_ref_with_scratch(&pager, PageId::new(2), &mut scratch, |rowid, row| {
         assert_eq!(rowid, 1);
         assert_eq!(row.len(), 2);
         assert_eq!(row.get(0).and_then(|v| v.as_integer()), Some(1));
