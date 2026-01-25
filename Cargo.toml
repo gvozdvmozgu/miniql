@@ -45,6 +45,7 @@ codspeed-criterion-compat = "4"
 
 [dependencies]
 memmap2 = "0.9"
+rustc-hash = "2.1"
 
 [[bench]]
 name = "read_table"

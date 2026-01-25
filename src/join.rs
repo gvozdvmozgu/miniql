@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
+use rustc_hash::FxHashMap;
 
 use crate::index::{self, IndexCursor, IndexScratch};
 use crate::pager::{PageId, Pager};
@@ -551,6 +553,36 @@ where
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+enum RowIdList {
+    One(i64),
+    Many(Vec<i64>),
+}
+
+impl RowIdList {
+    #[inline(always)]
+    fn new(v: i64) -> Self {
+        RowIdList::One(v)
+    }
+
+    #[inline(always)]
+    fn push(&mut self, v: i64) -> (usize, usize) {
+        match self {
+            RowIdList::One(first) => {
+                let vec = vec![*first, v];
+                let new = vec.capacity();
+                *self = RowIdList::Many(vec);
+                (0, new)
+            }
+            RowIdList::Many(vec) => {
+                let old = vec.capacity();
+                vec.push(v);
+                (old, vec.capacity())
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hash_join<F>(
     left_scan: &mut CompiledScan<'_>,
@@ -570,52 +602,43 @@ where
     F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
 {
     let mut mem = MemTracker::new(mem_limit);
-    let mut numeric: HashMap<u64, Vec<i64>> = HashMap::new();
-    let mut text: HashMap<Box<[u8]>, Vec<i64>> = HashMap::new();
-    let mut blob: HashMap<Box<[u8]>, Vec<i64>> = HashMap::new();
+    let mut numeric: FxHashMap<u64, RowIdList> = FxHashMap::default();
+    let mut text: FxHashMap<Box<[u8]>, RowIdList> = FxHashMap::default();
+    let mut blob: FxHashMap<Box<[u8]>, RowIdList> = FxHashMap::default();
 
     right_scan.for_each(right_scratch, |rowid, row| {
         let Some(key_ref) = join_key_ref(right_meta, rowid, &row)? else {
             return Ok(());
         };
         match key_ref {
-            HashKeyRef::Number(bits) => match numeric.get_mut(&bits) {
-                Some(rowids) => {
-                    let old_cap = rowids.capacity();
-                    rowids.push(rowid);
-                    mem.charge_capacity_growth(old_cap, rowids.capacity())?;
+            HashKeyRef::Number(bits) => match numeric.entry(bits) {
+                Entry::Occupied(mut e) => {
+                    let (old, new) = e.get_mut().push(rowid);
+                    mem.charge_capacity_growth(old, new)?;
                 }
-                None => {
+                Entry::Vacant(e) => {
                     mem.charge(std::mem::size_of::<u64>())?;
-                    let rowids = vec![rowid];
-                    mem.charge_capacity_growth(0, rowids.capacity())?;
-                    numeric.insert(bits, rowids);
+                    e.insert(RowIdList::new(rowid));
                 }
             },
-            HashKeyRef::Text(bytes) => match text.get_mut(bytes) {
-                Some(rowids) => {
-                    let old_cap = rowids.capacity();
-                    rowids.push(rowid);
-                    mem.charge_capacity_growth(old_cap, rowids.capacity())?;
+            HashKeyRef::Text(bytes) => match text.entry(bytes.to_vec().into_boxed_slice()) {
+                Entry::Occupied(mut e) => {
+                    let (old, new) = e.get_mut().push(rowid);
+                    mem.charge_capacity_growth(old, new)?;
                 }
-                None => {
+                Entry::Vacant(e) => {
                     mem.charge(bytes.len())?;
-                    let rowids = vec![rowid];
-                    mem.charge_capacity_growth(0, rowids.capacity())?;
-                    text.insert(bytes.to_vec().into_boxed_slice(), rowids);
+                    e.insert(RowIdList::new(rowid));
                 }
             },
-            HashKeyRef::Blob(bytes) => match blob.get_mut(bytes) {
-                Some(rowids) => {
-                    let old_cap = rowids.capacity();
-                    rowids.push(rowid);
-                    mem.charge_capacity_growth(old_cap, rowids.capacity())?;
+            HashKeyRef::Blob(bytes) => match blob.entry(bytes.to_vec().into_boxed_slice()) {
+                Entry::Occupied(mut e) => {
+                    let (old, new) = e.get_mut().push(rowid);
+                    mem.charge_capacity_growth(old, new)?;
                 }
-                None => {
+                Entry::Vacant(e) => {
                     mem.charge(bytes.len())?;
-                    let rowids = vec![rowid];
-                    mem.charge_capacity_growth(0, rowids.capacity())?;
-                    blob.insert(bytes.to_vec().into_boxed_slice(), rowids);
+                    e.insert(RowIdList::new(rowid));
                 }
             },
         }
@@ -638,15 +661,44 @@ where
 
         if let Some(rowids) = rowids {
             let mut matched = false;
-            for &right_rowid in rowids {
-                if let Some(payload) =
-                    table::lookup_rowid_payload(pager, right_root, right_rowid, right_overflow)?
-                    && let Some(right_row) =
-                        right_scan.eval_payload_with_filters(payload, right_decoded, false)?
-                {
-                    let right_out = right_meta.output_row(right_row.values_raw());
-                    cb(JoinedRow { left_rowid, right_rowid, left: left_out, right: right_out })?;
-                    matched = true;
+            match rowids {
+                RowIdList::One(v) => {
+                    let right_rowid = *v;
+                    if let Some(payload) =
+                        table::lookup_rowid_payload(pager, right_root, right_rowid, right_overflow)?
+                        && let Some(right_row) =
+                            right_scan.eval_payload_with_filters(payload, right_decoded, false)?
+                    {
+                        let right_out = right_meta.output_row(right_row.values_raw());
+                        cb(JoinedRow {
+                            left_rowid,
+                            right_rowid,
+                            left: left_out,
+                            right: right_out,
+                        })?;
+                        matched = true;
+                    }
+                }
+                RowIdList::Many(vs) => {
+                    for &right_rowid in vs.iter() {
+                        if let Some(payload) = table::lookup_rowid_payload(
+                            pager,
+                            right_root,
+                            right_rowid,
+                            right_overflow,
+                        )? && let Some(right_row) =
+                            right_scan.eval_payload_with_filters(payload, right_decoded, false)?
+                        {
+                            let right_out = right_meta.output_row(right_row.values_raw());
+                            cb(JoinedRow {
+                                left_rowid,
+                                right_rowid,
+                                left: left_out,
+                                right: right_out,
+                            })?;
+                            matched = true;
+                        }
+                    }
                 }
             }
             if !matched && let Some(len) = right_null_len {

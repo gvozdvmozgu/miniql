@@ -25,6 +25,7 @@ pub enum Expr {
 enum CompiledExpr {
     Col { col: u16, idx: usize },
     Lit(ValueLit),
+    CmpColLit { idx: usize, op: CmpOp, lit: ValueLit },
 
     Eq(Box<CompiledExpr>, Box<CompiledExpr>),
     Ne(Box<CompiledExpr>, Box<CompiledExpr>),
@@ -485,43 +486,105 @@ fn build_plan(projection: Option<&Vec<u16>>, pred_cols: &[u16], decode_all: bool
 }
 
 fn compile_expr(expr: &Expr, needed_cols: Option<&[u16]>) -> table::Result<CompiledExpr> {
-    let compile_col = |col: u16| -> table::Result<CompiledExpr> {
-        let idx = match needed_cols {
+    let col_to_idx = |col: u16| -> table::Result<usize> {
+        Ok(match needed_cols {
             Some(cols) => cols
                 .binary_search(&col)
                 .map_err(|_| table::Error::Corrupted("predicate column not decoded"))?,
             None => col as usize,
-        };
+        })
+    };
+
+    let compile_col = |col: u16| -> table::Result<CompiledExpr> {
+        let idx = col_to_idx(col)?;
         Ok(CompiledExpr::Col { col, idx })
     };
 
     Ok(match expr {
         Expr::Col(idx) => compile_col(*idx)?,
         Expr::Lit(lit) => CompiledExpr::Lit(lit.clone()),
-        Expr::Eq(lhs, rhs) => CompiledExpr::Eq(
-            Box::new(compile_expr(lhs, needed_cols)?),
-            Box::new(compile_expr(rhs, needed_cols)?),
-        ),
-        Expr::Ne(lhs, rhs) => CompiledExpr::Ne(
-            Box::new(compile_expr(lhs, needed_cols)?),
-            Box::new(compile_expr(rhs, needed_cols)?),
-        ),
-        Expr::Lt(lhs, rhs) => CompiledExpr::Lt(
-            Box::new(compile_expr(lhs, needed_cols)?),
-            Box::new(compile_expr(rhs, needed_cols)?),
-        ),
-        Expr::Le(lhs, rhs) => CompiledExpr::Le(
-            Box::new(compile_expr(lhs, needed_cols)?),
-            Box::new(compile_expr(rhs, needed_cols)?),
-        ),
-        Expr::Gt(lhs, rhs) => CompiledExpr::Gt(
-            Box::new(compile_expr(lhs, needed_cols)?),
-            Box::new(compile_expr(rhs, needed_cols)?),
-        ),
-        Expr::Ge(lhs, rhs) => CompiledExpr::Ge(
-            Box::new(compile_expr(lhs, needed_cols)?),
-            Box::new(compile_expr(rhs, needed_cols)?),
-        ),
+        Expr::Eq(lhs, rhs) => match (&**lhs, &**rhs) {
+            (Expr::Col(c), Expr::Lit(lit)) => {
+                CompiledExpr::CmpColLit { idx: col_to_idx(*c)?, op: CmpOp::Eq, lit: lit.clone() }
+            }
+            (Expr::Lit(lit), Expr::Col(c)) => {
+                CompiledExpr::CmpColLit { idx: col_to_idx(*c)?, op: CmpOp::Eq, lit: lit.clone() }
+            }
+            _ => CompiledExpr::Eq(
+                Box::new(compile_expr(lhs, needed_cols)?),
+                Box::new(compile_expr(rhs, needed_cols)?),
+            ),
+        },
+        Expr::Ne(lhs, rhs) => match (&**lhs, &**rhs) {
+            (Expr::Col(c), Expr::Lit(lit)) => {
+                CompiledExpr::CmpColLit { idx: col_to_idx(*c)?, op: CmpOp::Ne, lit: lit.clone() }
+            }
+            (Expr::Lit(lit), Expr::Col(c)) => CompiledExpr::CmpColLit {
+                idx: col_to_idx(*c)?,
+                op: swap_cmp(CmpOp::Ne),
+                lit: lit.clone(),
+            },
+            _ => CompiledExpr::Ne(
+                Box::new(compile_expr(lhs, needed_cols)?),
+                Box::new(compile_expr(rhs, needed_cols)?),
+            ),
+        },
+        Expr::Lt(lhs, rhs) => match (&**lhs, &**rhs) {
+            (Expr::Col(c), Expr::Lit(lit)) => {
+                CompiledExpr::CmpColLit { idx: col_to_idx(*c)?, op: CmpOp::Lt, lit: lit.clone() }
+            }
+            (Expr::Lit(lit), Expr::Col(c)) => CompiledExpr::CmpColLit {
+                idx: col_to_idx(*c)?,
+                op: swap_cmp(CmpOp::Lt),
+                lit: lit.clone(),
+            },
+            _ => CompiledExpr::Lt(
+                Box::new(compile_expr(lhs, needed_cols)?),
+                Box::new(compile_expr(rhs, needed_cols)?),
+            ),
+        },
+        Expr::Le(lhs, rhs) => match (&**lhs, &**rhs) {
+            (Expr::Col(c), Expr::Lit(lit)) => {
+                CompiledExpr::CmpColLit { idx: col_to_idx(*c)?, op: CmpOp::Le, lit: lit.clone() }
+            }
+            (Expr::Lit(lit), Expr::Col(c)) => CompiledExpr::CmpColLit {
+                idx: col_to_idx(*c)?,
+                op: swap_cmp(CmpOp::Le),
+                lit: lit.clone(),
+            },
+            _ => CompiledExpr::Le(
+                Box::new(compile_expr(lhs, needed_cols)?),
+                Box::new(compile_expr(rhs, needed_cols)?),
+            ),
+        },
+        Expr::Gt(lhs, rhs) => match (&**lhs, &**rhs) {
+            (Expr::Col(c), Expr::Lit(lit)) => {
+                CompiledExpr::CmpColLit { idx: col_to_idx(*c)?, op: CmpOp::Gt, lit: lit.clone() }
+            }
+            (Expr::Lit(lit), Expr::Col(c)) => CompiledExpr::CmpColLit {
+                idx: col_to_idx(*c)?,
+                op: swap_cmp(CmpOp::Gt),
+                lit: lit.clone(),
+            },
+            _ => CompiledExpr::Gt(
+                Box::new(compile_expr(lhs, needed_cols)?),
+                Box::new(compile_expr(rhs, needed_cols)?),
+            ),
+        },
+        Expr::Ge(lhs, rhs) => match (&**lhs, &**rhs) {
+            (Expr::Col(c), Expr::Lit(lit)) => {
+                CompiledExpr::CmpColLit { idx: col_to_idx(*c)?, op: CmpOp::Ge, lit: lit.clone() }
+            }
+            (Expr::Lit(lit), Expr::Col(c)) => CompiledExpr::CmpColLit {
+                idx: col_to_idx(*c)?,
+                op: swap_cmp(CmpOp::Ge),
+                lit: lit.clone(),
+            },
+            _ => CompiledExpr::Ge(
+                Box::new(compile_expr(lhs, needed_cols)?),
+                Box::new(compile_expr(rhs, needed_cols)?),
+            ),
+        },
         Expr::And(lhs, rhs) => CompiledExpr::And(
             Box::new(compile_expr(lhs, needed_cols)?),
             Box::new(compile_expr(rhs, needed_cols)?),
@@ -536,6 +599,18 @@ fn compile_expr(expr: &Expr, needed_cols: Option<&[u16]>) -> table::Result<Compi
             CompiledExpr::IsNotNull(Box::new(compile_expr(inner, needed_cols)?))
         }
     })
+}
+
+#[inline(always)]
+fn swap_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Eq => CmpOp::Eq,
+        CmpOp::Ne => CmpOp::Ne,
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Ge => CmpOp::Le,
+    }
 }
 
 fn validate_columns(referenced: &[u16], column_count: usize) -> Option<table::Error> {
@@ -598,7 +673,7 @@ fn truth_not(value: Truth) -> Truth {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum CmpOp {
     Eq,
     Ne,
@@ -631,6 +706,12 @@ impl<'row> RowEval<'row> {
 
 fn eval_compiled_expr(expr: &CompiledExpr, row: &RowEval<'_>) -> table::Result<Truth> {
     match expr {
+        CompiledExpr::CmpColLit { idx, op, lit } => {
+            let raw = unsafe { *row.values.get_unchecked(*idx) };
+            let left = raw_to_ref(raw);
+            let right = lit.as_value_ref();
+            Ok(compare(*op, left, right))
+        }
         CompiledExpr::Col { .. } | CompiledExpr::Lit(_) => Ok(Truth::Null),
         CompiledExpr::Eq(lhs, rhs) => eval_cmp(CmpOp::Eq, lhs, rhs, row),
         CompiledExpr::Ne(lhs, rhs) => eval_cmp(CmpOp::Ne, lhs, rhs, row),

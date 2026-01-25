@@ -1,4 +1,4 @@
-use std::{fmt, str};
+use std::{fmt, ptr, str};
 
 use crate::decoder::Decoder;
 use crate::join::JoinError;
@@ -837,39 +837,42 @@ fn read_table_cell_payload<'row>(
     }
 
     let start = pos;
-    let local_len = local_payload_len(page.usable_size(), payload_length)?;
-    let end_local =
-        start.checked_add(local_len).ok_or(Error::Corrupted("payload length overflow"))?;
+    let usable_size = page.usable_size();
+    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted("usable size underflow"))?;
+    if payload_length <= x {
+        let end = start + payload_length;
+        if end > usable.len() {
+            return Err(Error::Corrupted("payload extends past page boundary"));
+        }
+        return Ok((rowid, &usable[start..end]));
+    }
+
+    let local_len = local_payload_len(usable_size, payload_length)?;
+    let end_local = start + local_len;
     if end_local > usable.len() {
         return Err(Error::Corrupted("payload extends past page boundary"));
     }
 
     overflow_buf.clear();
 
-    if payload_length <= local_len {
-        let payload = &usable[start..start + payload_length];
-        Ok((rowid, payload))
-    } else {
-        let overflow_end =
-            end_local.checked_add(4).ok_or(Error::Corrupted("overflow pointer overflow"))?;
-        if overflow_end > usable.len() {
-            return Err(Error::Corrupted("overflow pointer out of bounds"));
-        }
-        let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
-        if overflow_page == 0 {
-            return Err(Error::OverflowChainTruncated);
-        }
-        assemble_overflow_payload(
-            pager,
-            payload_length,
-            local_len,
-            overflow_page,
-            &usable[start..end_local],
-            overflow_buf,
-        )?;
-        let payload = overflow_buf.as_slice();
-        Ok((rowid, payload))
+    let overflow_end = end_local + 4;
+    if overflow_end > usable.len() {
+        return Err(Error::Corrupted("overflow pointer out of bounds"));
     }
+    let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
+    if overflow_page == 0 {
+        return Err(Error::OverflowChainTruncated);
+    }
+    assemble_overflow_payload(
+        pager,
+        payload_length,
+        local_len,
+        overflow_page,
+        &usable[start..end_local],
+        overflow_buf,
+    )?;
+    let payload = overflow_buf.as_slice();
+    Ok((rowid, payload))
 }
 
 fn read_table_cell_payload_from_bytes<'row>(
@@ -896,39 +899,42 @@ fn read_table_cell_payload_from_bytes<'row>(
     }
 
     let start = pos;
-    let local_len = local_payload_len(pager.header().usable_size, payload_length)?;
-    let end_local =
-        start.checked_add(local_len).ok_or(Error::Corrupted("payload length overflow"))?;
+    let usable_size = pager.header().usable_size;
+    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted("usable size underflow"))?;
+    if payload_length <= x {
+        let end = start + payload_length;
+        if end > usable.len() {
+            return Err(Error::Corrupted("payload extends past page boundary"));
+        }
+        return Ok((rowid, &usable[start..end]));
+    }
+
+    let local_len = local_payload_len(usable_size, payload_length)?;
+    let end_local = start + local_len;
     if end_local > usable.len() {
         return Err(Error::Corrupted("payload extends past page boundary"));
     }
 
     overflow_buf.clear();
 
-    if payload_length <= local_len {
-        let payload = &usable[start..start + payload_length];
-        Ok((rowid, payload))
-    } else {
-        let overflow_end =
-            end_local.checked_add(4).ok_or(Error::Corrupted("overflow pointer overflow"))?;
-        if overflow_end > usable.len() {
-            return Err(Error::Corrupted("overflow pointer out of bounds"));
-        }
-        let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
-        if overflow_page == 0 {
-            return Err(Error::OverflowChainTruncated);
-        }
-        assemble_overflow_payload(
-            pager,
-            payload_length,
-            local_len,
-            overflow_page,
-            &usable[start..end_local],
-            overflow_buf,
-        )?;
-        let payload = overflow_buf.as_slice();
-        Ok((rowid, payload))
+    let overflow_end = end_local + 4;
+    if overflow_end > usable.len() {
+        return Err(Error::Corrupted("overflow pointer out of bounds"));
     }
+    let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
+    if overflow_page == 0 {
+        return Err(Error::OverflowChainTruncated);
+    }
+    assemble_overflow_payload(
+        pager,
+        payload_length,
+        local_len,
+        overflow_page,
+        &usable[start..end_local],
+        overflow_buf,
+    )?;
+    let payload = overflow_buf.as_slice();
+    Ok((rowid, payload))
 }
 
 fn read_table_leaf_rowid(page: &PageRef<'_>, offset: u16) -> Result<i64> {
@@ -1031,7 +1037,13 @@ pub(crate) fn decode_record_project_into(
     out.clear();
 
     let mut header_pos = 0usize;
-    let header_len = read_varint_at(payload, &mut header_pos, "record header truncated")? as usize;
+    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let header_len = if first < 0x80 {
+        header_pos = 1;
+        first as usize
+    } else {
+        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+    };
     if header_len < header_pos || header_len > payload.len() {
         return Err(Error::Corrupted("invalid record header length"));
     }
@@ -1045,7 +1057,13 @@ pub(crate) fn decode_record_project_into(
         let mut next_needed = needed_iter.next();
         let mut column_count = 0usize;
         while serial_pos < serial_bytes.len() {
-            let serial = read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?;
+            let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
+            let serial = if b < 0x80 {
+                serial_pos += 1;
+                b as u64
+            } else {
+                read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
+            };
             let col_idx = column_count as u16;
             if Some(col_idx) == next_needed {
                 out.push(decode_value_ref_at(serial, payload, &mut value_pos)?);
@@ -1059,7 +1077,13 @@ pub(crate) fn decode_record_project_into(
     } else {
         let mut column_count = 0usize;
         while serial_pos < serial_bytes.len() {
-            let serial = read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?;
+            let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
+            let serial = if b < 0x80 {
+                serial_pos += 1;
+                b as u64
+            } else {
+                read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
+            };
             out.push(decode_value_ref_at(serial, payload, &mut value_pos)?);
             column_count += 1;
         }
@@ -1067,11 +1091,57 @@ pub(crate) fn decode_record_project_into(
     }
 }
 
+pub(crate) fn decode_record_column(payload: &[u8], col: u16) -> Result<Option<ValueRefRaw>> {
+    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let mut header_pos = 0usize;
+    let header_len = if first < 0x80 {
+        header_pos = 1;
+        first as usize
+    } else {
+        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+    };
+    if header_len < header_pos || header_len > payload.len() {
+        return Err(Error::Corrupted("invalid record header length"));
+    }
+
+    let serial_bytes = &payload[header_pos..header_len];
+    let mut serial_pos = 0usize;
+    let mut value_pos = header_len;
+
+    let target = col as usize;
+    let mut idx = 0usize;
+
+    while serial_pos < serial_bytes.len() {
+        let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
+        let serial = if b < 0x80 {
+            serial_pos += 1;
+            b as u64
+        } else {
+            read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
+        };
+
+        if idx == target {
+            let v = decode_value_ref_at(serial, payload, &mut value_pos)?;
+            return Ok(Some(v));
+        } else {
+            skip_value_at(serial, payload, &mut value_pos)?;
+        }
+        idx += 1;
+    }
+    Ok(None)
+}
+
 fn decode_record_into(payload: &[u8], out: &mut Vec<ValueRefRaw>) -> Result<()> {
     out.clear();
 
     let mut header_pos = 0usize;
-    let header_len = read_varint_at(payload, &mut header_pos, "record header truncated")? as usize;
+    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let header_len = if first < 0x80 {
+        header_pos = 1;
+        first as usize
+    } else {
+        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+    };
     if header_len < header_pos || header_len > payload.len() {
         return Err(Error::Corrupted("invalid record header length"));
     }
@@ -1080,7 +1150,13 @@ fn decode_record_into(payload: &[u8], out: &mut Vec<ValueRefRaw>) -> Result<()> 
     let mut serial_pos = 0usize;
     let mut value_pos = header_len;
     while serial_pos < serial_bytes.len() {
-        let serial = read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?;
+        let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
+        let serial = if b < 0x80 {
+            serial_pos += 1;
+            b as u64
+        } else {
+            read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
+        };
         out.push(decode_value_ref_at(serial, payload, &mut value_pos)?);
     }
 
@@ -1089,14 +1165,11 @@ fn decode_record_into(payload: &[u8], out: &mut Vec<ValueRefRaw>) -> Result<()> 
 
 fn skip_value_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Result<()> {
     let len = serial_type_len(serial_type)?;
-    if len > 0 {
-        let end =
-            pos.checked_add(len).ok_or(Error::Corrupted("record payload shorter than declared"))?;
-        if end > bytes.len() {
-            return Err(Error::Corrupted("record payload shorter than declared"));
-        }
-        *pos = end;
+    let end = *pos + len;
+    if end > bytes.len() {
+        return Err(Error::Corrupted("record payload shorter than declared"));
     }
+    *pos = end;
     Ok(())
 }
 
@@ -1142,21 +1215,63 @@ fn decode_value_ref_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Resul
 }
 
 fn read_signed_be_at(bytes: &[u8], pos: &mut usize, len: usize) -> Result<i64> {
-    debug_assert!(len <= 8);
+    let p = *pos;
+    let end = p + len;
+    if end > bytes.len() {
+        return Err(Error::Corrupted("record payload shorter than declared"));
+    }
+    *pos = end;
 
-    let mut buf = [0u8; 8];
-    let offset = 8 - len;
-    buf[offset..].copy_from_slice(read_exact_bytes_at(bytes, pos, len)?);
-
-    let value = u64::from_be_bytes(buf);
-    let shift = (8 - len) * 8;
-    Ok(((value << shift) as i64) >> shift)
+    unsafe {
+        Ok(match len {
+            1 => i8::from_be_bytes([*bytes.get_unchecked(p)]) as i64,
+            2 => {
+                let v = ptr::read_unaligned(bytes.as_ptr().add(p) as *const u16);
+                i16::from_be_bytes(v.to_be_bytes()) as i64
+            }
+            3 => {
+                let b0 = *bytes.get_unchecked(p) as u32;
+                let b1 = *bytes.get_unchecked(p + 1) as u32;
+                let b2 = *bytes.get_unchecked(p + 2) as u32;
+                let u = (b0 << 16) | (b1 << 8) | b2;
+                let i = ((u << 8) as i32) >> 8;
+                i as i64
+            }
+            4 => {
+                let v = ptr::read_unaligned(bytes.as_ptr().add(p) as *const u32);
+                i32::from_be_bytes(v.to_be_bytes()) as i64
+            }
+            6 => {
+                let b0 = *bytes.get_unchecked(p) as u64;
+                let b1 = *bytes.get_unchecked(p + 1) as u64;
+                let b2 = *bytes.get_unchecked(p + 2) as u64;
+                let b3 = *bytes.get_unchecked(p + 3) as u64;
+                let b4 = *bytes.get_unchecked(p + 4) as u64;
+                let b5 = *bytes.get_unchecked(p + 5) as u64;
+                let u = (b0 << 40) | (b1 << 32) | (b2 << 24) | (b3 << 16) | (b4 << 8) | b5;
+                let shift = 16;
+                ((u << shift) as i64) >> shift
+            }
+            8 => {
+                let v = ptr::read_unaligned(bytes.as_ptr().add(p) as *const u64);
+                u64::from_be(v) as i64
+            }
+            _ => std::hint::unreachable_unchecked(),
+        })
+    }
 }
 
 fn read_u64_be_at(bytes: &[u8], pos: &mut usize) -> Result<u64> {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(read_exact_bytes_at(bytes, pos, 8)?);
-    Ok(u64::from_be_bytes(buf))
+    let p = *pos;
+    let end = p + 8;
+    if end > bytes.len() {
+        return Err(Error::Corrupted("record payload shorter than declared"));
+    }
+    *pos = end;
+    unsafe {
+        let v = ptr::read_unaligned(bytes.as_ptr().add(p) as *const u64);
+        Ok(u64::from_be(v))
+    }
 }
 
 fn read_u32_checked(decoder: &mut Decoder<'_>, msg: &'static str) -> Result<u32> {
@@ -1227,14 +1342,13 @@ unsafe fn read_varint_unchecked_at(bytes: &[u8], pos: &mut usize) -> u64 {
 }
 
 fn read_exact_bytes_at<'row>(bytes: &'row [u8], pos: &mut usize, len: usize) -> Result<&'row [u8]> {
-    let end =
-        pos.checked_add(len).ok_or(Error::Corrupted("record payload shorter than declared"))?;
+    let start = *pos;
+    let end = start + len;
     if end > bytes.len() {
         return Err(Error::Corrupted("record payload shorter than declared"));
     }
-    let slice = &bytes[*pos..end];
     *pos = end;
-    Ok(slice)
+    Ok(unsafe { bytes.get_unchecked(start..end) })
 }
 
 #[derive(Clone, Copy, Debug)]

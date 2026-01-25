@@ -107,11 +107,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                             offset,
                             &mut self.scratch.overflow_buf,
                         )?;
-                        let key = decode_key_from_payload(
-                            self.key_col,
-                            payload,
-                            &mut self.scratch.decoded,
-                        )?;
+                        let key = decode_key_from_payload(self.key_col, payload)?;
                         let cmp = compare_total(target, key);
 
                         if cmp == Ordering::Greater {
@@ -227,7 +223,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
             let offset = u16::from_be_bytes([cell_ptrs[mid * 2], cell_ptrs[mid * 2 + 1]]);
             let payload =
                 read_index_leaf_payload(self.pager, page, offset, &mut self.scratch.overflow_buf)?;
-            let key = decode_key_from_payload(self.key_col, payload, &mut self.scratch.decoded)?;
+            let key = decode_key_from_payload(self.key_col, payload)?;
             let cmp = compare_total(target, key);
             if cmp == Ordering::Greater {
                 lo = mid + 1;
@@ -415,17 +411,11 @@ fn cmp_f64_total(left: f64, right: f64) -> Ordering {
     }
 }
 
-fn decode_key_from_payload<'row>(
-    key_col: u16,
-    payload: &'row [u8],
-    decoded: &mut Vec<ValueRefRaw>,
-) -> Result<ValueRef<'row>> {
-    table::decode_record_project_into(payload, None, decoded)?;
-    let idx = key_col as usize;
-    let Some(value) = decoded.get(idx).copied() else {
+fn decode_key_from_payload<'row>(key_col: u16, payload: &'row [u8]) -> Result<ValueRef<'row>> {
+    let Some(raw) = table::decode_record_column(payload, key_col)? else {
         return Err(JoinError::IndexKeyNotComparable.into());
     };
-    Ok(unsafe { value.as_value_ref() })
+    Ok(unsafe { raw.as_value_ref() })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -554,39 +544,43 @@ fn read_index_payload<'row>(
     }
 
     let start = pos;
-    let local_len = table::local_payload_len(page.usable_size(), payload_length)?;
-    let end_local =
-        start.checked_add(local_len).ok_or(table::Error::Corrupted("payload length overflow"))?;
+
+    let usable_size = page.usable_size();
+    let x = usable_size.checked_sub(35).ok_or(table::Error::Corrupted("usable size underflow"))?;
+    if payload_length <= x {
+        let end = start + payload_length;
+        if end > usable.len() {
+            return Err(table::Error::Corrupted("payload extends past page boundary"));
+        }
+        return Ok((child, &usable[start..end]));
+    }
+
+    let local_len = table::local_payload_len(usable_size, payload_length)?;
+    let end_local = start + local_len;
     if end_local > usable.len() {
         return Err(table::Error::Corrupted("payload extends past page boundary"));
     }
 
     overflow_buf.clear();
 
-    if payload_length <= local_len {
-        let payload = &usable[start..start + payload_length];
-        Ok((child, payload))
-    } else {
-        let overflow_end =
-            end_local.checked_add(4).ok_or(table::Error::Corrupted("overflow pointer overflow"))?;
-        if overflow_end > usable.len() {
-            return Err(table::Error::Corrupted("overflow pointer out of bounds"));
-        }
-        let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
-        if overflow_page == 0 {
-            return Err(table::Error::OverflowChainTruncated);
-        }
-        table::assemble_overflow_payload(
-            pager,
-            payload_length,
-            local_len,
-            overflow_page,
-            &usable[start..end_local],
-            overflow_buf,
-        )?;
-        let payload = overflow_buf.as_slice();
-        Ok((child, payload))
+    let overflow_end = end_local + 4;
+    if overflow_end > usable.len() {
+        return Err(table::Error::Corrupted("overflow pointer out of bounds"));
     }
+    let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
+    if overflow_page == 0 {
+        return Err(table::Error::OverflowChainTruncated);
+    }
+    table::assemble_overflow_payload(
+        pager,
+        payload_length,
+        local_len,
+        overflow_page,
+        &usable[start..end_local],
+        overflow_buf,
+    )?;
+    let payload = overflow_buf.as_slice();
+    Ok((child, payload))
 }
 
 fn child_page_for_slot(
