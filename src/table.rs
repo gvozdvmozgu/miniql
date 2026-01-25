@@ -294,6 +294,19 @@ impl<'row> PayloadRef<'row> {
             }
         }
     }
+
+    /// Return the total payload length in bytes.
+    pub fn len(&self) -> usize {
+        match self {
+            PayloadRef::Inline(bytes) => bytes.len(),
+            PayloadRef::Overflow(payload) => payload.total_len,
+        }
+    }
+
+    /// Returns true when the payload is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl ValueSlot {
@@ -1327,6 +1340,23 @@ pub(crate) fn decode_record_project_into(
     }
 }
 
+pub(crate) fn decode_record_project_into_mapped(
+    payload: PayloadRef<'_>,
+    needed_map: &[(u16, usize)],
+    out: &mut Vec<ValueSlot>,
+    bytes: &mut Vec<u8>,
+    serials: &mut Vec<u64>,
+) -> Result<usize> {
+    match payload {
+        PayloadRef::Inline(bytes) => {
+            decode_record_project_into_bytes_mapped(bytes, needed_map, out)
+        }
+        PayloadRef::Overflow(payload) => {
+            decode_record_project_into_overflow_mapped(&payload, needed_map, out, bytes, serials)
+        }
+    }
+}
+
 pub(crate) fn record_column_count(payload: PayloadRef<'_>) -> Result<usize> {
     match payload {
         PayloadRef::Inline(bytes) => record_column_count_bytes(bytes),
@@ -1445,6 +1475,110 @@ fn decode_record_project_into_bytes(
         }
         Ok(column_count)
     }
+}
+
+fn decode_record_project_into_bytes_mapped(
+    payload: &[u8],
+    needed_map: &[(u16, usize)],
+    out: &mut Vec<ValueSlot>,
+) -> Result<usize> {
+    out.clear();
+    out.resize(needed_map.len(), ValueSlot::Null);
+
+    let mut header_pos = 0usize;
+    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let header_len = if first < 0x80 {
+        header_pos = 1;
+        first as usize
+    } else {
+        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+    };
+    if header_len < header_pos || header_len > payload.len() {
+        return Err(Error::Corrupted("invalid record header length"));
+    }
+
+    let serial_bytes = &payload[header_pos..header_len];
+    let mut serial_pos = 0usize;
+    let mut value_pos = header_len;
+    let mut needed_iter = needed_map.iter().copied();
+    let mut next_needed = needed_iter.next();
+    let mut column_count = 0usize;
+
+    while serial_pos < serial_bytes.len() {
+        let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
+        let serial = if b < 0x80 {
+            serial_pos += 1;
+            b as u64
+        } else {
+            read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
+        };
+        let col_idx = column_count as u16;
+        if let Some((needed_col, out_idx)) = next_needed
+            && col_idx == needed_col
+        {
+            let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
+            if out_idx >= out.len() {
+                return Err(Error::Corrupted("mapped column index out of bounds"));
+            }
+            out[out_idx] = value;
+            next_needed = needed_iter.next();
+        } else {
+            skip_value_at(serial, payload, &mut value_pos)?;
+        }
+        column_count += 1;
+    }
+
+    Ok(column_count)
+}
+
+fn decode_record_project_into_overflow_mapped(
+    payload: &OverflowPayload<'_>,
+    needed_map: &[(u16, usize)],
+    out: &mut Vec<ValueSlot>,
+    bytes: &mut Vec<u8>,
+    serials: &mut Vec<u64>,
+) -> Result<usize> {
+    out.clear();
+    out.resize(needed_map.len(), ValueSlot::Null);
+    bytes.clear();
+    serials.clear();
+
+    let mut serial_cursor = OverflowCursor::new(payload, 0)?;
+    let header_len = serial_cursor.read_varint("record header truncated")? as usize;
+    let header_pos = serial_cursor.position();
+    if header_len < header_pos || header_len > payload.total_len {
+        return Err(Error::Corrupted("invalid record header length"));
+    }
+
+    while serial_cursor.position() < header_len {
+        let serial = serial_cursor.read_varint("record header truncated")?;
+        if serial_cursor.position() > header_len {
+            return Err(Error::Corrupted("record header truncated"));
+        }
+        push_checked(serials, serial, "serials")?;
+    }
+
+    let mut value_cursor = OverflowCursor::new(payload, header_len)?;
+    let mut needed_iter = needed_map.iter().copied();
+    let mut next_needed = needed_iter.next();
+
+    for (idx, serial) in serials.iter().copied().enumerate() {
+        let col_idx = idx as u16;
+        if let Some((needed_col, out_idx)) = next_needed
+            && col_idx == needed_col
+        {
+            let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, bytes)?;
+            if out_idx >= out.len() {
+                return Err(Error::Corrupted("mapped column index out of bounds"));
+            }
+            out[out_idx] = raw;
+            next_needed = needed_iter.next();
+        } else {
+            skip_value_at_cursor(serial, &mut value_cursor)?;
+        }
+    }
+
+    Ok(serials.len())
 }
 
 pub(crate) fn decode_record_column(

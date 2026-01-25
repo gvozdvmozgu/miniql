@@ -477,6 +477,10 @@ impl<'db> Scan<'db> {
         self.projection.as_deref()
     }
 
+    pub(crate) fn has_order_by(&self) -> bool {
+        matches!(self.order_by.as_deref(), Some(cols) if !cols.is_empty())
+    }
+
     pub(crate) fn with_projection_override(mut self, projection: Option<Vec<u16>>) -> Self {
         self.projection = projection;
         self
@@ -602,6 +606,49 @@ impl<'db> PreparedScan<'db> {
             }
             let _ = self.column_count_hint.set(count);
         }
+
+        let values = values.as_slice();
+        let scratch_bytes = bytes.as_slice();
+
+        if apply_filters {
+            if let Some(expr) = self.compiled_expr.as_ref()
+                && eval_compiled_expr(expr, values, scratch_bytes)? != Truth::True
+            {
+                return Ok(None);
+            }
+
+            if let Some(filter_fn) = self.filter_fn.as_mut() {
+                let row = Row { values, proj_map: None };
+                if !filter_fn(&row)? {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let row = Row { values, proj_map: self.proj_map.as_deref() };
+        Ok(Some(row))
+    }
+
+    pub(crate) fn eval_index_payload_with_map<'row>(
+        &'row mut self,
+        payload: table::PayloadRef<'row>,
+        needed_map: &[(u16, usize)],
+        values: &'row mut Vec<ValueSlot>,
+        bytes: &'row mut Vec<u8>,
+        serials: &'row mut Vec<u64>,
+        apply_filters: bool,
+    ) -> table::Result<Option<Row<'row>>> {
+        let Some(needed_cols) = self.needed_cols.as_deref() else {
+            return Err(table::Error::Corrupted("covering index requires column projection"));
+        };
+        if needed_cols.len() != needed_map.len() {
+            return Err(table::Error::Corrupted(
+                "covering index column map does not match needed columns",
+            ));
+        }
+
+        let _count =
+            table::decode_record_project_into_mapped(payload, needed_map, values, bytes, serials)?;
 
         let values = values.as_slice();
         let scratch_bytes = bytes.as_slice();

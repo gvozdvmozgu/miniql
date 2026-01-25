@@ -158,6 +158,23 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         }
     }
 
+    /// Advance forward until the current key is >= `target`.
+    pub fn advance_to_ge(&mut self, target: ValueRef<'_>) -> Result<bool> {
+        if self.leaf.is_none() {
+            return self.seek_ge(target);
+        }
+
+        loop {
+            let cmp = self.compare_current_key(target)?;
+            if cmp != Ordering::Greater {
+                return Ok(true);
+            }
+            if !self.next()? {
+                return Ok(false);
+            }
+        }
+    }
+
     #[allow(clippy::should_implement_trait)]
     /// Advance to the next entry.
     pub fn next(&mut self) -> Result<bool> {
@@ -240,6 +257,42 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         }
     }
 
+    /// Execute `f` with the payload and rowid at the current cursor position.
+    pub fn with_current_payload_and_rowid<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: for<'row> FnOnce(table::PayloadRef<'row>, i64) -> Result<T>,
+    {
+        let Some(leaf) = self.leaf else {
+            return Err(table::Error::Corrupted("index cursor not positioned"));
+        };
+
+        let page = self.pager.page(leaf.page_id)?;
+        let header = parse_header(&page)?;
+        if leaf.cell_index >= header.cell_count as usize {
+            return Err(table::Error::Corrupted("index cursor past end"));
+        }
+        let cell_ptrs = cell_ptrs(&page, &header)?;
+        let offset = cell_ptr_at(cell_ptrs, leaf.cell_index)?;
+        let cell = read_index_leaf_cell(self.pager, &page, offset)?;
+        let payload = cell.payload();
+
+        let count = table::record_column_count(payload)?;
+        let last =
+            count.checked_sub(1).ok_or_else(|| table::Error::from(Error::MissingIndexRowId))?;
+        let last = u16::try_from(last).map_err(|_| table::Error::from(Error::MissingIndexRowId))?;
+        let Some(value) = table::decode_record_column(payload, last, &mut self.scratch.bytes)?
+        else {
+            return Err(Error::MissingIndexRowId.into());
+        };
+
+        let rowid = match unsafe { value.as_value_ref() } {
+            ValueRef::Integer(rowid) => rowid,
+            _ => return Err(Error::MissingIndexRowId.into()),
+        };
+
+        f(payload, rowid)
+    }
+
     fn lower_bound_leaf(
         &mut self,
         page: &PageRef<'_>,
@@ -265,6 +318,23 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         }
 
         Ok(lo)
+    }
+
+    fn compare_current_key(&mut self, target: ValueRef<'_>) -> Result<Ordering> {
+        let Some(leaf) = self.leaf else {
+            return Err(table::Error::Corrupted("index cursor not positioned"));
+        };
+
+        let page = self.pager.page(leaf.page_id)?;
+        let header = parse_header(&page)?;
+        if leaf.cell_index >= header.cell_count as usize {
+            return Err(table::Error::Corrupted("index cursor past end"));
+        }
+        let cell_ptrs = cell_ptrs(&page, &header)?;
+        let offset = cell_ptr_at(cell_ptrs, leaf.cell_index)?;
+        let cell = read_index_leaf_cell(self.pager, &page, offset)?;
+        let key = decode_key_from_payload(self.key_col, cell.payload(), &mut self.scratch.bytes)?;
+        Ok(compare_total(target, key))
     }
 
     fn advance_from_leaf_end(&mut self) -> Result<bool> {

@@ -165,6 +165,7 @@ pub enum JoinStrategy {
     Auto,
     Hash,
     IndexNestedLoop { index_root: PageId, index_key_col: u16 },
+    IndexMerge { index_root: PageId, index_key_col: u16 },
     HashJoin,
     NestedLoopScan,
 }
@@ -199,12 +200,20 @@ pub struct PreparedJoin<'db> {
     order_by: Option<Box<[ResolvedOrderBy]>>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum JoinPlan {
-    IndexNestedLoop { index_root: PageId, index_key_col: u16 },
+    IndexNestedLoop { index_root: PageId, index_key_col: u16, index_cols: Option<Box<[u16]>> },
+    IndexMerge { index_root: PageId, index_key_col: u16, index_cols: Option<Box<[u16]>> },
     HashJoin,
     NestedLoopScan,
     RowIdNestedLoop,
+}
+
+#[derive(Clone, Debug)]
+struct IndexInfo {
+    root: PageId,
+    key_col: u16,
+    cols: Option<Vec<u16>>,
 }
 
 impl<'db> Join<'db> {
@@ -302,6 +311,7 @@ impl<'db> Join<'db> {
         let order_by = self.order_by.unwrap_or_default();
         let left_order_cols = collect_order_cols(&order_by, JoinSide::Left);
         let right_order_cols = collect_order_cols(&order_by, JoinSide::Right);
+        let left_has_order = self.left.has_order_by();
 
         let ((left_scan, left_meta), (mut right_scan, right_meta)) = build_sides(
             self.left,
@@ -319,7 +329,34 @@ impl<'db> Join<'db> {
                 if !matches!(right_key, JoinKey::Col(_)) {
                     return Err(Error::UnsupportedJoinKeyType.into());
                 }
-                JoinPlan::IndexNestedLoop { index_root, index_key_col }
+                let index_cols = discover_index_cols_for_root(
+                    right_scan.pager(),
+                    right_scan.root(),
+                    index_root,
+                )?;
+                JoinPlan::IndexNestedLoop {
+                    index_root,
+                    index_key_col,
+                    index_cols: index_cols.map(|cols| cols.into_boxed_slice()),
+                }
+            }
+            JoinStrategy::IndexMerge { index_root, index_key_col } => {
+                if !matches!(right_key, JoinKey::Col(_)) {
+                    return Err(Error::UnsupportedJoinKeyType.into());
+                }
+                if !matches!(left_key, JoinKey::RowId) || left_has_order {
+                    return Err(Error::UnsupportedJoinStrategy.into());
+                }
+                let index_cols = discover_index_cols_for_root(
+                    right_scan.pager(),
+                    right_scan.root(),
+                    index_root,
+                )?;
+                JoinPlan::IndexMerge {
+                    index_root,
+                    index_key_col,
+                    index_cols: index_cols.map(|cols| cols.into_boxed_slice()),
+                }
             }
             JoinStrategy::Hash | JoinStrategy::HashJoin => JoinPlan::HashJoin,
             JoinStrategy::NestedLoopScan => JoinPlan::NestedLoopScan,
@@ -327,10 +364,23 @@ impl<'db> Join<'db> {
                 if matches!(right_key, JoinKey::RowId) {
                     JoinPlan::RowIdNestedLoop
                 } else if let JoinKey::Col(col) = right_key {
-                    if let Some((index_root, index_key_col)) =
+                    if let Some(index) =
                         discover_index_for_join(right_scan.pager(), right_scan.root(), col)?
                     {
-                        JoinPlan::IndexNestedLoop { index_root, index_key_col }
+                        let index_cols = index.cols.map(|cols| cols.into_boxed_slice());
+                        if matches!(left_key, JoinKey::RowId) && !left_has_order {
+                            JoinPlan::IndexMerge {
+                                index_root: index.root,
+                                index_key_col: index.key_col,
+                                index_cols,
+                            }
+                        } else {
+                            JoinPlan::IndexNestedLoop {
+                                index_root: index.root,
+                                index_key_col: index.key_col,
+                                index_cols,
+                            }
+                        }
                     } else {
                         JoinPlan::HashJoin
                     }
@@ -410,14 +460,34 @@ impl<'db> PreparedJoin<'db> {
         ) = scratch.split_mut();
         let right_null_len = self.right_null_len;
 
-        match self.plan {
-            JoinPlan::IndexNestedLoop { index_root, index_key_col } => index_nested_loop(
+        match &self.plan {
+            JoinPlan::IndexNestedLoop { index_root, index_key_col, index_cols } => {
+                index_nested_loop(
+                    &mut self.left,
+                    &self.left_meta,
+                    &mut self.right,
+                    &self.right_meta,
+                    *index_root,
+                    *index_key_col,
+                    index_cols.as_deref(),
+                    left_scan_scratch,
+                    right_values,
+                    right_bytes,
+                    right_serials,
+                    index_scratch,
+                    right_nulls,
+                    right_null_len,
+                    cb,
+                )
+            }
+            JoinPlan::IndexMerge { index_root, index_key_col, index_cols } => index_merge_join(
                 &mut self.left,
                 &self.left_meta,
                 &mut self.right,
                 &self.right_meta,
-                index_root,
-                index_key_col,
+                *index_root,
+                *index_key_col,
+                index_cols.as_deref(),
                 left_scan_scratch,
                 right_values,
                 right_bytes,
@@ -861,6 +931,21 @@ fn cmp_f64_total(left: f64, right: f64) -> std::cmp::Ordering {
     }
 }
 
+fn covering_map_for_index(
+    right_scan: &PreparedScan<'_>,
+    index_cols: Option<&[u16]>,
+) -> Option<Vec<(u16, usize)>> {
+    let needed = right_scan.needed_cols()?;
+    let index_cols = index_cols?;
+    let mut map = Vec::with_capacity(needed.len());
+    for (out_idx, col) in needed.iter().enumerate() {
+        let pos = index_cols.iter().position(|idx| idx == col)?;
+        map.push((pos as u16, out_idx));
+    }
+    map.sort_by_key(|(pos, _)| *pos);
+    Some(map)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn index_nested_loop<F>(
     left_scan: &mut PreparedScan<'_>,
@@ -869,6 +954,7 @@ fn index_nested_loop<F>(
     right_meta: &SideMeta,
     index_root: PageId,
     index_key_col: u16,
+    index_cols: Option<&[u16]>,
     left_scratch: &mut ScanScratch,
     right_values: &mut Vec<ValueSlot>,
     right_bytes: &mut Vec<u8>,
@@ -884,6 +970,7 @@ where
     let right_root = right_scan.root();
     let pager = right_scan.pager();
     let mut cursor = IndexCursor::new(pager, index_root, index_key_col, index_scratch);
+    let covering_map = covering_map_for_index(right_scan, index_cols);
 
     left_scan.for_each(left_scratch, |left_rowid, left_row| {
         let left_out = left_meta.output_row(left_row.values_raw());
@@ -906,21 +993,160 @@ where
         }
 
         while cursor.key_eq(left_key_value)? {
-            let right_rowid = cursor.current_rowid()?;
-            if let Some(cell) = table::lookup_rowid_cell(pager, right_root, right_rowid)?
-                && let Some(right_row) = right_scan.eval_payload(
-                    cell.payload(),
-                    right_values,
-                    right_bytes,
-                    right_serials,
-                )?
-            {
-                let right_out = right_meta.output_row(right_row.values_raw());
-                cb(JoinedRow { left_rowid, right_rowid, left: left_out, right: right_out })?;
-                matched = true;
+            if let Some(map) = covering_map.as_ref() {
+                let emitted = cursor.with_current_payload_and_rowid(|payload, right_rowid| {
+                    if let Some(right_row) = right_scan.eval_index_payload_with_map(
+                        payload,
+                        map,
+                        right_values,
+                        right_bytes,
+                        right_serials,
+                        true,
+                    )? {
+                        let right_out = right_meta.output_row(right_row.values_raw());
+                        cb(JoinedRow {
+                            left_rowid,
+                            right_rowid,
+                            left: left_out,
+                            right: right_out,
+                        })?;
+                        return Ok(true);
+                    }
+                    Ok(false)
+                })?;
+                if emitted {
+                    matched = true;
+                }
+            } else {
+                let right_rowid = cursor.current_rowid()?;
+                if let Some(cell) = table::lookup_rowid_cell(pager, right_root, right_rowid)?
+                    && let Some(right_row) = right_scan.eval_payload(
+                        cell.payload(),
+                        right_values,
+                        right_bytes,
+                        right_serials,
+                    )?
+                {
+                    let right_out = right_meta.output_row(right_row.values_raw());
+                    cb(JoinedRow { left_rowid, right_rowid, left: left_out, right: right_out })?;
+                    matched = true;
+                }
             }
 
             if !cursor.next()? {
+                break;
+            }
+        }
+
+        if !matched && let Some(len) = right_null_len {
+            let right_out = null_right_row(right_nulls, len);
+            cb(JoinedRow {
+                left_rowid,
+                right_rowid: NULL_ROWID,
+                left: left_out,
+                right: right_out,
+            })?;
+        }
+
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_merge_join<F>(
+    left_scan: &mut PreparedScan<'_>,
+    left_meta: &SideMeta,
+    right_scan: &mut PreparedScan<'_>,
+    right_meta: &SideMeta,
+    index_root: PageId,
+    index_key_col: u16,
+    index_cols: Option<&[u16]>,
+    left_scratch: &mut ScanScratch,
+    right_values: &mut Vec<ValueSlot>,
+    right_bytes: &mut Vec<u8>,
+    right_serials: &mut Vec<u64>,
+    index_scratch: &mut IndexScratch,
+    right_nulls: &mut Vec<ValueSlot>,
+    right_null_len: Option<usize>,
+    cb: &mut F,
+) -> Result<()>
+where
+    F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
+{
+    let right_root = right_scan.root();
+    let pager = right_scan.pager();
+    let mut cursor = IndexCursor::new(pager, index_root, index_key_col, index_scratch);
+    let covering_map = covering_map_for_index(right_scan, index_cols);
+    let mut right_exhausted = false;
+
+    left_scan.for_each(left_scratch, |left_rowid, left_row| {
+        let left_out = left_meta.output_row(left_row.values_raw());
+        let Some(left_key_value) = left_meta.join_key(left_rowid, &left_row)? else {
+            return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
+        };
+
+        if right_exhausted {
+            return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
+        }
+
+        if !cursor.advance_to_ge(left_key_value)? {
+            right_exhausted = true;
+            return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
+        }
+
+        if !cursor.key_eq(left_key_value)? {
+            return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
+        }
+
+        let mut matched = false;
+        loop {
+            if let Some(map) = covering_map.as_ref() {
+                let emitted = cursor.with_current_payload_and_rowid(|payload, right_rowid| {
+                    if let Some(right_row) = right_scan.eval_index_payload_with_map(
+                        payload,
+                        map,
+                        right_values,
+                        right_bytes,
+                        right_serials,
+                        true,
+                    )? {
+                        let right_out = right_meta.output_row(right_row.values_raw());
+                        cb(JoinedRow {
+                            left_rowid,
+                            right_rowid,
+                            left: left_out,
+                            right: right_out,
+                        })?;
+                        return Ok(true);
+                    }
+                    Ok(false)
+                })?;
+                if emitted {
+                    matched = true;
+                }
+            } else {
+                let right_rowid = cursor.current_rowid()?;
+                if let Some(cell) = table::lookup_rowid_cell(pager, right_root, right_rowid)?
+                    && let Some(right_row) = right_scan.eval_payload(
+                        cell.payload(),
+                        right_values,
+                        right_bytes,
+                        right_serials,
+                    )?
+                {
+                    let right_out = right_meta.output_row(right_row.values_raw());
+                    cb(JoinedRow { left_rowid, right_rowid, left: left_out, right: right_out })?;
+                    matched = true;
+                }
+            }
+
+            if !cursor.next()? {
+                right_exhausted = true;
+                break;
+            }
+            if !cursor.key_eq(left_key_value)? {
                 break;
             }
         }
@@ -1183,6 +1409,7 @@ where
         }
         let rowid = cell.rowid();
         let payload = cell.payload();
+        let payload_len = payload.len();
         let Some(row) =
             right_scan.eval_payload_with_filters(payload, values, bytes, serials, true)?
         else {
@@ -1196,6 +1423,7 @@ where
             return Ok(None::<()>);
         };
         let numeric_key = numeric_key_from_value(key_value);
+        mem.charge(payload_len)?;
 
         let right_row = RightRow {
             rowid,
@@ -1442,11 +1670,20 @@ fn hash_key_from_value<'row>(value: ValueRef<'row>) -> Result<Option<HashKeyRef<
     })
 }
 
+fn index_cols_to_indices(schema: &TableSchema, index_cols: &[String]) -> Option<Vec<u16>> {
+    let mut mapped = Vec::with_capacity(index_cols.len());
+    for col in index_cols {
+        let idx = schema.columns.iter().position(|name| name.eq_ignore_ascii_case(col))?;
+        mapped.push(idx as u16);
+    }
+    Some(mapped)
+}
+
 fn discover_index_for_join(
     pager: &Pager,
     table_root: PageId,
     join_col: u16,
-) -> Result<Option<(PageId, u16)>> {
+) -> Result<Option<IndexInfo>> {
     let rows = table::read_table(pager, PageId::ROOT)?;
     let mut table_name: Option<String> = None;
     let mut table_sql: Option<String> = None;
@@ -1510,15 +1747,105 @@ fn discover_index_for_join(
             continue;
         };
 
-        if let Some((idx, _col)) =
-            index_cols.iter().enumerate().find(|(_, col)| col.eq_ignore_ascii_case(&join_col_name))
-            && idx == 0
-        {
-            return Ok(Some((PageId::new(rootpage), idx as u16)));
+        let Some(index_cols) = index_cols_to_indices(&schema, &index_cols) else {
+            continue;
+        };
+        if index_cols.first().copied() == Some(join_col) {
+            return Ok(Some(IndexInfo {
+                root: PageId::new(rootpage),
+                key_col: 0,
+                cols: Some(index_cols),
+            }));
         }
     }
 
     discover_autoindex_for_join(pager, &rows, &table_name, &schema, &join_col_name)
+}
+
+fn discover_index_cols_for_root(
+    pager: &Pager,
+    table_root: PageId,
+    index_root: PageId,
+) -> Result<Option<Vec<u16>>> {
+    let rows = table::read_table(pager, PageId::ROOT)?;
+    let mut table_name: Option<String> = None;
+    let mut table_sql: Option<String> = None;
+
+    for row in &rows {
+        if row.values.len() < 5 {
+            continue;
+        }
+        let row_type = row.values[0].as_text();
+        if row_type != Some("table") {
+            continue;
+        }
+        let rootpage = row.values[3].as_integer();
+        if rootpage != Some(table_root.into_inner() as i64) {
+            continue;
+        }
+        table_name = row.values[1].as_text().map(|s| s.to_owned());
+        table_sql = row.values[4].as_text().map(|s| s.to_owned());
+        break;
+    }
+
+    let Some(table_name) = table_name else {
+        return Ok(None);
+    };
+    let Some(table_sql) = table_sql else {
+        return Ok(None);
+    };
+
+    let schema = parse_table_schema(&table_sql);
+    if schema.without_rowid {
+        return Ok(None);
+    }
+
+    for row in &rows {
+        if row.values.len() < 5 {
+            continue;
+        }
+        let row_type = row.values[0].as_text();
+        if row_type != Some("index") {
+            continue;
+        }
+        let tbl_name = row.values[2].as_text();
+        if tbl_name.map(|s| s.eq_ignore_ascii_case(&table_name)) != Some(true) {
+            continue;
+        }
+        let rootpage = row.values[3].as_integer().and_then(|v| u32::try_from(v).ok());
+        let Some(rootpage) = rootpage else {
+            continue;
+        };
+        if PageId::new(rootpage) != index_root {
+            continue;
+        }
+        let sql = row.values[4].as_text();
+        let Some(sql) = sql else {
+            break;
+        };
+        let Some(index_cols) = parse_index_columns(sql) else {
+            return Ok(None);
+        };
+        return Ok(index_cols_to_indices(&schema, &index_cols));
+    }
+
+    let mut index_scratch = IndexScratch::new();
+    let Some(len) = index::index_key_len(pager, index_root, &mut index_scratch)? else {
+        return Ok(None);
+    };
+    let mut candidates = Vec::new();
+    for cols in &schema.unique_indexes {
+        if cols.len() == len
+            && let Some(mapped) = index_cols_to_indices(&schema, cols)
+        {
+            candidates.push(mapped);
+        }
+    }
+    if candidates.len() == 1 {
+        return Ok(Some(candidates.remove(0)));
+    }
+
+    Ok(None)
 }
 
 fn discover_autoindex_for_join(
@@ -1527,7 +1854,7 @@ fn discover_autoindex_for_join(
     table_name: &str,
     schema: &TableSchema,
     join_col_name: &str,
-) -> Result<Option<(PageId, u16)>> {
+) -> Result<Option<IndexInfo>> {
     let mut autoindexes = Vec::new();
     for row in rows {
         if row.values.len() < 5 {
@@ -1571,7 +1898,10 @@ fn discover_autoindex_for_join(
     }
 
     if autoindexes.len() == 1 && constraints.len() == 1 {
-        return Ok(Some((autoindexes[0], constraints[0].1 as u16)));
+        let Some(cols) = index_cols_to_indices(schema, constraints[0].0) else {
+            return Ok(None);
+        };
+        return Ok(Some(IndexInfo { root: autoindexes[0], key_col: 0, cols: Some(cols) }));
     }
 
     let mut index_scratch = IndexScratch::new();
@@ -1587,16 +1917,18 @@ fn discover_autoindex_for_join(
         let len = cols.len();
         let roots: Vec<PageId> =
             autoindex_lens.iter().filter(|(_, l)| *l == len).map(|(r, _)| *r).collect();
-        if roots.len() == 1 {
-            matches.push((roots[0], pos as u16));
+        if roots.len() == 1
+            && let Some(mapped) = index_cols_to_indices(schema, cols)
+        {
+            matches.push(IndexInfo { root: roots[0], key_col: pos as u16, cols: Some(mapped) });
         }
     }
 
-    matches.sort_by_key(|(root, pos)| (root.into_inner(), *pos));
-    matches.dedup();
+    matches.sort_by_key(|info| (info.root.into_inner(), info.key_col));
+    matches.dedup_by_key(|info| (info.root.into_inner(), info.key_col));
 
     if matches.len() == 1 {
-        return Ok(Some(matches[0]));
+        return Ok(Some(matches[0].clone()));
     }
 
     Ok(None)
