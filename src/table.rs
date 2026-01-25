@@ -723,14 +723,24 @@ fn read_table_cell_payload<'row>(
     }
 
     let mut pos = offset as usize;
-    let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
+    let remaining = usable.len().saturating_sub(pos);
+    let (payload_length, rowid) = if remaining >= 18 {
+        // SAFETY: remaining >= 18 guarantees two varints (max 9 bytes each) are
+        // in-bounds.
+        let payload_length = unsafe { read_varint_unchecked_at(usable, &mut pos) };
+        let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) } as i64;
+        (payload_length, rowid)
+    } else {
+        let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
+        let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+        (payload_length, rowid)
+    };
     let payload_length =
         usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
     if payload_length > MAX_PAYLOAD_BYTES {
         return Err(Error::PayloadTooLarge(payload_length));
     }
 
-    let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
     let start = pos;
     let local_len = local_payload_len(page.usable_size(), payload_length)?;
     let end_local =
@@ -997,6 +1007,33 @@ fn read_varint_at(bytes: &[u8], pos: &mut usize, msg: &'static str) -> Result<u6
     let byte = bytes[*pos];
     *pos += 1;
     Ok((result << 8) | u64::from(byte))
+}
+
+unsafe fn read_varint_unchecked_at(bytes: &[u8], pos: &mut usize) -> u64 {
+    let mut idx = *pos;
+    // SAFETY: caller guarantees enough bytes for full varint.
+    let first = unsafe { *bytes.get_unchecked(idx) };
+    idx += 1;
+    if first & 0x80 == 0 {
+        *pos = idx;
+        return u64::from(first);
+    }
+
+    let mut result = u64::from(first & 0x7F);
+    for _ in 0..7 {
+        let byte = unsafe { *bytes.get_unchecked(idx) };
+        idx += 1;
+        result = (result << 7) | u64::from(byte & 0x7F);
+        if byte & 0x80 == 0 {
+            *pos = idx;
+            return result;
+        }
+    }
+
+    let byte = unsafe { *bytes.get_unchecked(idx) };
+    idx += 1;
+    *pos = idx;
+    (result << 8) | u64::from(byte)
 }
 
 fn read_exact_bytes_at<'row>(bytes: &'row [u8], pos: &mut usize, len: usize) -> Result<&'row [u8]> {
