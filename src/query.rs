@@ -249,7 +249,7 @@ impl ScanScratch {
     /// Create a scratch buffer with capacity hints.
     pub fn with_capacity(values: usize, overflow: usize) -> Self {
         Self {
-            stack: Vec::new(),
+            stack: Vec::with_capacity(64),
             values: Vec::with_capacity(values),
             bytes: Vec::with_capacity(overflow),
             serials: Vec::with_capacity(values),
@@ -681,10 +681,14 @@ impl<'db> PreparedScan<'db> {
             return Ok(());
         }
 
-        let order_by =
-            self.order_by.as_deref().filter(|cols| !cols.is_empty()).map(|cols| cols.to_vec());
-        if let Some(order_by) = order_by.as_deref() {
-            return self.for_each_ordered(scratch, order_by, &mut cb);
+        if let Some(order_by) = self.order_by.take() {
+            if order_by.is_empty() {
+                self.order_by = Some(order_by);
+            } else {
+                let result = self.for_each_ordered(scratch, order_by.as_ref(), &mut cb);
+                self.order_by = Some(order_by);
+                return result;
+            }
         }
 
         let pager = self.pager;

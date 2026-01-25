@@ -10,7 +10,7 @@ pub type Result<T> = table::Result<T>;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Scratch buffers for index cursor operations.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct IndexScratch {
     stack: Vec<StackEntry>,
     bytes: Vec<u8>,
@@ -26,10 +26,16 @@ impl IndexScratch {
     /// Create a scratch buffer with capacity hints.
     pub fn with_capacity(values: usize, overflow: usize) -> Self {
         Self {
-            stack: Vec::new(),
+            stack: Vec::with_capacity(64),
             bytes: Vec::with_capacity(overflow),
             serials: Vec::with_capacity(values),
         }
+    }
+}
+
+impl Default for IndexScratch {
+    fn default() -> Self {
+        Self::with_capacity(0, 0)
     }
 }
 

@@ -11,7 +11,7 @@ use crate::index::{self, IndexCursor, IndexScratch};
 use crate::pager::{PageId, Pager};
 use crate::query::{OrderDir, PreparedScan, Row, Scan, ScanScratch};
 use crate::schema::{TableSchema, parse_index_columns, parse_table_schema};
-use crate::table::{self, BytesSpan, RawBytes, Value, ValueRef, ValueSlot};
+use crate::table::{self, BytesSpan, RawBytes, ValueRef, ValueSlot};
 
 /// Result type for join operations.
 pub type Result<T> = table::Result<T>;
@@ -435,10 +435,14 @@ impl<'db> PreparedJoin<'db> {
     where
         F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
     {
-        let order_by =
-            self.order_by.as_deref().filter(|cols| !cols.is_empty()).map(|cols| cols.to_vec());
-        if let Some(order_by) = order_by.as_deref() {
-            return self.for_each_ordered(scratch, order_by, &mut cb);
+        if let Some(order_by) = self.order_by.take() {
+            if order_by.is_empty() {
+                self.order_by = Some(order_by);
+            } else {
+                let result = self.for_each_ordered(scratch, order_by.as_ref(), &mut cb);
+                self.order_by = Some(order_by);
+                return result;
+            }
         }
 
         self.for_each_plan(scratch, &mut cb)
@@ -1679,36 +1683,63 @@ fn index_cols_to_indices(schema: &TableSchema, index_cols: &[String]) -> Option<
     Some(mapped)
 }
 
+fn row_text<'row>(row: table::RowView<'row>, idx: usize) -> Option<&'row str> {
+    match row.get(idx)? {
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
+        _ => None,
+    }
+}
+
+fn row_integer(row: table::RowView<'_>, idx: usize) -> Option<i64> {
+    match row.get(idx)? {
+        ValueRef::Integer(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn find_table_info(
+    pager: &Pager,
+    table_root: PageId,
+    scratch: &mut table::RowScratch,
+) -> Result<Option<(String, String)>> {
+    let target_root = table_root.into_inner() as i64;
+    table::scan_table_ref_until_with_scratch(pager, PageId::ROOT, scratch, |_, row| {
+        if row.len() < 5 {
+            return Ok(None);
+        }
+        let row_type = match row_text(row, 0) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        if !row_type.eq_ignore_ascii_case("table") {
+            return Ok(None);
+        }
+        let rootpage = match row_integer(row, 3) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        if rootpage != target_root {
+            return Ok(None);
+        }
+        let name = match row_text(row, 1) {
+            Some(value) => value.to_owned(),
+            None => return Ok(None),
+        };
+        let sql = match row_text(row, 4) {
+            Some(value) => value.to_owned(),
+            None => return Ok(None),
+        };
+        Ok(Some((name, sql)))
+    })
+}
+
 fn discover_index_for_join(
     pager: &Pager,
     table_root: PageId,
     join_col: u16,
 ) -> Result<Option<IndexInfo>> {
-    let rows = table::read_table(pager, PageId::ROOT)?;
-    let mut table_name: Option<String> = None;
-    let mut table_sql: Option<String> = None;
-
-    for row in &rows {
-        if row.values.len() < 5 {
-            continue;
-        }
-        let row_type = row.values[0].as_text();
-        if row_type != Some("table") {
-            continue;
-        }
-        let rootpage = row.values[3].as_integer();
-        if rootpage != Some(table_root.into_inner() as i64) {
-            continue;
-        }
-        table_name = row.values[1].as_text().map(|s| s.to_owned());
-        table_sql = row.values[4].as_text().map(|s| s.to_owned());
-        break;
-    }
-
-    let Some(table_name) = table_name else {
-        return Ok(None);
-    };
-    let Some(table_sql) = table_sql else {
+    let mut scratch = table::RowScratch::with_capacity(8, table::DEFAULT_SPILL_CAPACITY);
+    let Some((table_name, table_sql)) = find_table_info(pager, table_root, &mut scratch)? else {
         return Ok(None);
     };
 
@@ -1717,49 +1748,70 @@ fn discover_index_for_join(
         return Ok(None);
     }
 
-    let join_col_name = schema.columns.get(join_col as usize).cloned();
-    let Some(join_col_name) = join_col_name else {
-        return Ok(None);
+    let join_col_name = match schema.columns.get(join_col as usize) {
+        Some(name) => name.as_str(),
+        None => {
+            return Ok(None);
+        }
     };
 
-    for row in &rows {
-        if row.values.len() < 5 {
-            continue;
-        }
-        let row_type = row.values[0].as_text();
-        if row_type != Some("index") {
-            continue;
-        }
-        let tbl_name = row.values[2].as_text();
-        if tbl_name.map(|s| s.eq_ignore_ascii_case(&table_name)) != Some(true) {
-            continue;
-        }
-        let rootpage = row.values[3].as_integer().and_then(|v| u32::try_from(v).ok());
-        let Some(rootpage) = rootpage else {
-            continue;
-        };
-        let sql = row.values[4].as_text();
-        let Some(sql) = sql else {
-            continue;
-        };
+    let mut autoindexes = Vec::new();
+    let found =
+        table::scan_table_ref_until_with_scratch(pager, PageId::ROOT, &mut scratch, |_, row| {
+            if row.len() < 5 {
+                return Ok(None);
+            }
+            let row_type = match row_text(row, 0) {
+                Some(value) => value,
+                None => return Ok(None),
+            };
+            if !row_type.eq_ignore_ascii_case("index") {
+                return Ok(None);
+            }
+            let tbl_name = match row_text(row, 2) {
+                Some(value) => value,
+                None => return Ok(None),
+            };
+            if !tbl_name.eq_ignore_ascii_case(&table_name) {
+                return Ok(None);
+            }
+            let rootpage = match row_integer(row, 3).and_then(|value| u32::try_from(value).ok()) {
+                Some(value) => value,
+                None => return Ok(None),
+            };
+            match row.get(4) {
+                Some(ValueRef::Text(bytes)) => {
+                    let sql = match std::str::from_utf8(bytes) {
+                        Ok(value) => value,
+                        Err(_) => return Ok(None),
+                    };
+                    let Some(index_cols) = parse_index_columns(sql) else {
+                        return Ok(None);
+                    };
+                    let Some(index_cols) = index_cols_to_indices(&schema, &index_cols) else {
+                        return Ok(None);
+                    };
+                    if index_cols.first().copied() == Some(join_col) {
+                        return Ok(Some(IndexInfo {
+                            root: PageId::new(rootpage),
+                            key_col: 0,
+                            cols: Some(index_cols),
+                        }));
+                    }
+                }
+                Some(ValueRef::Null) | None => {
+                    autoindexes.push(PageId::new(rootpage));
+                }
+                _ => {}
+            }
+            Ok(None)
+        })?;
 
-        let Some(index_cols) = parse_index_columns(sql) else {
-            continue;
-        };
-
-        let Some(index_cols) = index_cols_to_indices(&schema, &index_cols) else {
-            continue;
-        };
-        if index_cols.first().copied() == Some(join_col) {
-            return Ok(Some(IndexInfo {
-                root: PageId::new(rootpage),
-                key_col: 0,
-                cols: Some(index_cols),
-            }));
-        }
+    if let Some(index) = found {
+        return Ok(Some(index));
     }
 
-    discover_autoindex_for_join(pager, &rows, &table_name, &schema, &join_col_name)
+    discover_autoindex_for_join(pager, &autoindexes, &schema, join_col_name)
 }
 
 fn discover_index_cols_for_root(
@@ -1767,31 +1819,8 @@ fn discover_index_cols_for_root(
     table_root: PageId,
     index_root: PageId,
 ) -> Result<Option<Vec<u16>>> {
-    let rows = table::read_table(pager, PageId::ROOT)?;
-    let mut table_name: Option<String> = None;
-    let mut table_sql: Option<String> = None;
-
-    for row in &rows {
-        if row.values.len() < 5 {
-            continue;
-        }
-        let row_type = row.values[0].as_text();
-        if row_type != Some("table") {
-            continue;
-        }
-        let rootpage = row.values[3].as_integer();
-        if rootpage != Some(table_root.into_inner() as i64) {
-            continue;
-        }
-        table_name = row.values[1].as_text().map(|s| s.to_owned());
-        table_sql = row.values[4].as_text().map(|s| s.to_owned());
-        break;
-    }
-
-    let Some(table_name) = table_name else {
-        return Ok(None);
-    };
-    let Some(table_sql) = table_sql else {
+    let mut scratch = table::RowScratch::with_capacity(8, table::DEFAULT_SPILL_CAPACITY);
+    let Some((table_name, table_sql)) = find_table_info(pager, table_root, &mut scratch)? else {
         return Ok(None);
     };
 
@@ -1800,33 +1829,61 @@ fn discover_index_cols_for_root(
         return Ok(None);
     }
 
-    for row in &rows {
-        if row.values.len() < 5 {
-            continue;
-        }
-        let row_type = row.values[0].as_text();
-        if row_type != Some("index") {
-            continue;
-        }
-        let tbl_name = row.values[2].as_text();
-        if tbl_name.map(|s| s.eq_ignore_ascii_case(&table_name)) != Some(true) {
-            continue;
-        }
-        let rootpage = row.values[3].as_integer().and_then(|v| u32::try_from(v).ok());
-        let Some(rootpage) = rootpage else {
-            continue;
-        };
-        if PageId::new(rootpage) != index_root {
-            continue;
-        }
-        let sql = row.values[4].as_text();
-        let Some(sql) = sql else {
-            break;
-        };
-        let Some(index_cols) = parse_index_columns(sql) else {
-            return Ok(None);
-        };
-        return Ok(index_cols_to_indices(&schema, &index_cols));
+    enum IndexColsOutcome {
+        Explicit(Vec<u16>),
+        Autoindex,
+        Unsupported,
+    }
+
+    let outcome =
+        table::scan_table_ref_until_with_scratch(pager, PageId::ROOT, &mut scratch, |_, row| {
+            if row.len() < 5 {
+                return Ok(None);
+            }
+            let row_type = match row_text(row, 0) {
+                Some(value) => value,
+                None => return Ok(None),
+            };
+            if !row_type.eq_ignore_ascii_case("index") {
+                return Ok(None);
+            }
+            let tbl_name = match row_text(row, 2) {
+                Some(value) => value,
+                None => return Ok(None),
+            };
+            if !tbl_name.eq_ignore_ascii_case(&table_name) {
+                return Ok(None);
+            }
+            let rootpage = match row_integer(row, 3).and_then(|value| u32::try_from(value).ok()) {
+                Some(value) => value,
+                None => return Ok(None),
+            };
+            if PageId::new(rootpage) != index_root {
+                return Ok(None);
+            }
+            match row.get(4) {
+                Some(ValueRef::Text(bytes)) => {
+                    let sql = match std::str::from_utf8(bytes) {
+                        Ok(value) => value,
+                        Err(_) => return Ok(Some(IndexColsOutcome::Unsupported)),
+                    };
+                    let Some(index_cols) = parse_index_columns(sql) else {
+                        return Ok(Some(IndexColsOutcome::Unsupported));
+                    };
+                    let Some(mapped) = index_cols_to_indices(&schema, &index_cols) else {
+                        return Ok(Some(IndexColsOutcome::Unsupported));
+                    };
+                    Ok(Some(IndexColsOutcome::Explicit(mapped)))
+                }
+                Some(ValueRef::Null) | None => Ok(Some(IndexColsOutcome::Autoindex)),
+                _ => Ok(Some(IndexColsOutcome::Unsupported)),
+            }
+        })?;
+
+    match outcome {
+        Some(IndexColsOutcome::Explicit(cols)) => return Ok(Some(cols)),
+        Some(IndexColsOutcome::Unsupported) => return Ok(None),
+        Some(IndexColsOutcome::Autoindex) | None => {}
     }
 
     let mut index_scratch = IndexScratch::new();
@@ -1850,35 +1907,10 @@ fn discover_index_cols_for_root(
 
 fn discover_autoindex_for_join(
     pager: &Pager,
-    rows: &[table::TableRow],
-    table_name: &str,
+    autoindexes: &[PageId],
     schema: &TableSchema,
     join_col_name: &str,
 ) -> Result<Option<IndexInfo>> {
-    let mut autoindexes = Vec::new();
-    for row in rows {
-        if row.values.len() < 5 {
-            continue;
-        }
-        let row_type = row.values[0].as_text();
-        if row_type != Some("index") {
-            continue;
-        }
-        let tbl_name = row.values[2].as_text();
-        if tbl_name.map(|s| s.eq_ignore_ascii_case(table_name)) != Some(true) {
-            continue;
-        }
-        match row.values[4] {
-            Value::Null => {}
-            _ => continue,
-        }
-        let rootpage = row.values[3].as_integer().and_then(|v| u32::try_from(v).ok());
-        let Some(rootpage) = rootpage else {
-            continue;
-        };
-        autoindexes.push(PageId::new(rootpage));
-    }
-
     if autoindexes.is_empty() {
         return Ok(None);
     }
@@ -1906,7 +1938,7 @@ fn discover_autoindex_for_join(
 
     let mut index_scratch = IndexScratch::new();
     let mut autoindex_lens = Vec::new();
-    for root in &autoindexes {
+    for root in autoindexes {
         if let Some(len) = index::index_key_len(pager, *root, &mut index_scratch)? {
             autoindex_lens.push((*root, len));
         }
@@ -1953,7 +1985,7 @@ fn resolve_right_null_len(
 
     let pager = right_scan.pager();
     let root = right_scan.root();
-    let mut stack = Vec::new();
+    let mut stack = Vec::with_capacity(64);
     let count =
         table::scan_table_cells_with_scratch_and_stack_until(pager, root, &mut stack, |cell| {
             let count = table::decode_record_project_into(

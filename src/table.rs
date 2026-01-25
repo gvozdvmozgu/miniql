@@ -8,7 +8,7 @@ use crate::pager::{PageId, PageRef, Pager};
 pub type Result<T> = std::result::Result<T, Error>;
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_SPILL_CAPACITY: usize = 8 * 1024;
+pub(crate) const DEFAULT_SPILL_CAPACITY: usize = 8 * 1024;
 
 /// Table decoding and validation errors.
 #[non_exhaustive]
@@ -457,7 +457,7 @@ impl RowScratch {
             values: Vec::with_capacity(values),
             bytes: Vec::with_capacity(overflow),
             serials: Vec::with_capacity(values),
-            btree_stack: Vec::new(),
+            btree_stack: Vec::with_capacity(64),
         }
     }
 
@@ -546,6 +546,18 @@ where
 {
     let mut scratch = RowScratch::with_capacity(8, DEFAULT_SPILL_CAPACITY);
     scan_table_page_ref_until(pager, page_id, &mut scratch, &mut f)
+}
+
+pub(crate) fn scan_table_ref_until_with_scratch<F, T>(
+    pager: &Pager,
+    page_id: PageId,
+    scratch: &mut RowScratch,
+    mut f: F,
+) -> Result<Option<T>>
+where
+    F: for<'row> FnMut(i64, RowView<'row>) -> Result<Option<T>>,
+{
+    scan_table_page_ref_until(pager, page_id, scratch, &mut f)
 }
 
 /// Scan raw table cells with a caller-provided scratch buffer.
@@ -690,7 +702,8 @@ fn scan_table_page_cells<'pager, F>(pager: &'pager Pager, page_id: PageId, f: &m
 where
     F: for<'row> FnMut(CellRef<'row>) -> Result<()>,
 {
-    let mut stack = vec![page_id];
+    let mut stack = Vec::with_capacity(64);
+    stack.push(page_id);
     scan_table_page_cells_with_stack(pager, &mut stack, f)
 }
 

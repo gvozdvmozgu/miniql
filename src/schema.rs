@@ -36,7 +36,7 @@ pub(crate) fn parse_table_schema(sql: &str) -> TableSchema {
 }
 
 pub(crate) fn parse_index_columns(sql: &str) -> Option<Vec<String>> {
-    if sql.to_ascii_uppercase().contains(" WHERE ") {
+    if contains_where_clause(sql) {
         return None;
     }
 
@@ -48,6 +48,15 @@ pub(crate) fn parse_index_columns(sql: &str) -> Option<Vec<String>> {
         cols.push(name.to_ascii_lowercase());
     }
     Some(cols)
+}
+
+fn contains_where_clause(sql: &str) -> bool {
+    const NEEDLE: &[u8] = b" WHERE ";
+    let bytes = sql.as_bytes();
+    if bytes.len() < NEEDLE.len() {
+        return false;
+    }
+    bytes.windows(NEEDLE.len()).any(|window| window.eq_ignore_ascii_case(NEEDLE))
 }
 
 fn parse_table_constraint_index_cols(part: &str) -> Option<Vec<String>> {
