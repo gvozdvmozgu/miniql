@@ -722,22 +722,16 @@ fn read_table_cell_payload<'row>(
         return Err(Error::Corrupted("cell offset out of bounds"));
     }
 
-    let mut decoder = Decoder::new(usable).split_at(offset as usize);
-
-    let before = decoder.remaining();
-    let payload_length = read_varint_checked(&mut decoder, "cell payload length truncated")?;
-    let payload_length_len = before - decoder.remaining();
+    let mut pos = offset as usize;
+    let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
     let payload_length =
         usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
     if payload_length > MAX_PAYLOAD_BYTES {
         return Err(Error::PayloadTooLarge(payload_length));
     }
 
-    let before = decoder.remaining();
-    let rowid = read_varint_checked(&mut decoder, "cell rowid truncated")? as i64;
-    let rowid_len = before - decoder.remaining();
-
-    let start = offset as usize + payload_length_len + rowid_len;
+    let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+    let start = pos;
     let local_len = local_payload_len(page.usable_size(), payload_length)?;
     let end_local =
         start.checked_add(local_len).ok_or(Error::Corrupted("payload length overflow"))?;
@@ -964,20 +958,44 @@ fn read_u64_be(decoder: &mut Decoder<'_>) -> Result<u64> {
     Ok(u64::from_be_bytes(buf))
 }
 
-fn read_u8_checked(decoder: &mut Decoder<'_>, msg: &'static str) -> Result<u8> {
-    decoder.try_read_u8().ok_or(Error::Corrupted(msg))
-}
-
-fn read_u16_checked(decoder: &mut Decoder<'_>, msg: &'static str) -> Result<u16> {
-    decoder.try_read_u16().ok_or(Error::Corrupted(msg))
-}
-
 fn read_u32_checked(decoder: &mut Decoder<'_>, msg: &'static str) -> Result<u32> {
     decoder.try_read_u32().ok_or(Error::Corrupted(msg))
 }
 
 fn read_varint_checked(decoder: &mut Decoder<'_>, msg: &'static str) -> Result<u64> {
     decoder.try_read_varint().ok_or(Error::Corrupted(msg))
+}
+
+fn read_varint_at(bytes: &[u8], pos: &mut usize, msg: &'static str) -> Result<u64> {
+    if *pos >= bytes.len() {
+        return Err(Error::Corrupted(msg));
+    }
+
+    let first = bytes[*pos];
+    *pos += 1;
+    if first & 0x80 == 0 {
+        return Ok(u64::from(first));
+    }
+
+    let mut result = u64::from(first & 0x7F);
+    for _ in 0..7 {
+        if *pos >= bytes.len() {
+            return Err(Error::Corrupted(msg));
+        }
+        let byte = bytes[*pos];
+        *pos += 1;
+        result = (result << 7) | u64::from(byte & 0x7F);
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+    }
+
+    if *pos >= bytes.len() {
+        return Err(Error::Corrupted(msg));
+    }
+    let byte = bytes[*pos];
+    *pos += 1;
+    Ok((result << 8) | u64::from(byte))
 }
 
 fn read_exact_bytes<'row>(decoder: &mut Decoder<'row>, len: usize) -> Result<&'row [u8]> {
@@ -998,15 +1016,21 @@ struct BTreeHeader {
 }
 
 fn parse_header(page: &PageRef<'_>) -> Result<BTreeHeader> {
-    if page.offset() >= page.usable_size() {
+    let offset = page.offset();
+    if offset >= page.usable_size() {
         return Err(Error::Corrupted("page header offset out of bounds"));
     }
-    let mut decoder = Decoder::new(page.usable_bytes()).split_at(page.offset());
-    let page_type = read_u8_checked(&mut decoder, "page header truncated")?;
-    let _first_freeblock = read_u16_checked(&mut decoder, "page header truncated")?;
-    let cell_count = read_u16_checked(&mut decoder, "page header truncated")?;
-    let _start_of_cell_content = read_u16_checked(&mut decoder, "page header truncated")?;
-    let _fragmented_free_bytes = read_u8_checked(&mut decoder, "page header truncated")?;
+
+    let bytes = page.usable_bytes();
+    if offset + 8 > bytes.len() {
+        return Err(Error::Corrupted("page header truncated"));
+    }
+
+    let page_type = bytes[offset];
+    let _first_freeblock = u16::from_be_bytes([bytes[offset + 1], bytes[offset + 2]]);
+    let cell_count = u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]);
+    let _start_of_cell_content = u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]);
+    let _fragmented_free_bytes = bytes[offset + 7];
 
     let kind = match page_type {
         0x0D => BTreeKind::TableLeaf,
@@ -1015,7 +1039,17 @@ fn parse_header(page: &PageRef<'_>) -> Result<BTreeHeader> {
     };
 
     let right_most_child = match kind {
-        BTreeKind::TableInterior => Some(read_u32_checked(&mut decoder, "page header truncated")?),
+        BTreeKind::TableInterior => {
+            if offset + 12 > bytes.len() {
+                return Err(Error::Corrupted("page header truncated"));
+            }
+            Some(u32::from_be_bytes([
+                bytes[offset + 8],
+                bytes[offset + 9],
+                bytes[offset + 10],
+                bytes[offset + 11],
+            ]))
+        }
         BTreeKind::TableLeaf => None,
     };
 
@@ -1023,10 +1057,8 @@ fn parse_header(page: &PageRef<'_>) -> Result<BTreeHeader> {
         BTreeKind::TableLeaf => 8,
         BTreeKind::TableInterior => 12,
     };
-    let cell_ptrs_start = page
-        .offset()
-        .checked_add(header_size)
-        .ok_or(Error::Corrupted("cell pointer array overflow"))?;
+    let cell_ptrs_start =
+        offset.checked_add(header_size).ok_or(Error::Corrupted("cell pointer array overflow"))?;
 
     Ok(BTreeHeader { kind, cell_count, cell_ptrs_start, right_most_child })
 }
