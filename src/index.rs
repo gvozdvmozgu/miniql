@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::join::JoinError;
 use crate::pager::{PageId, PageRef, Pager};
-use crate::table::{self, ValueRef, ValueSlot};
+use crate::table::{self, ValueRef};
 
 pub type Result<T> = table::Result<T>;
 
@@ -13,7 +13,6 @@ pub struct IndexScratch {
     stack: Vec<StackEntry>,
     bytes: Vec<u8>,
     serials: Vec<u64>,
-    decoded: Vec<ValueSlot>,
 }
 
 impl IndexScratch {
@@ -26,7 +25,6 @@ impl IndexScratch {
             stack: Vec::new(),
             bytes: Vec::with_capacity(overflow),
             serials: Vec::with_capacity(values),
-            decoded: Vec::with_capacity(values),
         }
     }
 }
@@ -43,13 +41,30 @@ struct LeafPos {
     cell_index: usize,
 }
 
+#[derive(Clone, Copy)]
+struct IndexCellRef<'row> {
+    child: Option<PageId>,
+    payload: table::PayloadRef<'row>,
+}
+
+impl<'row> IndexCellRef<'row> {
+    #[inline]
+    fn child(self) -> Option<PageId> {
+        self.child
+    }
+
+    #[inline]
+    fn payload(self) -> table::PayloadRef<'row> {
+        self.payload
+    }
+}
+
 pub struct IndexCursor<'db, 'scratch> {
     pager: &'db Pager,
     root: PageId,
     key_col: u16,
     scratch: &'scratch mut IndexScratch,
     leaf: Option<LeafPos>,
-    cached_cell: Option<(PageId, usize)>,
 }
 
 impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
@@ -59,13 +74,12 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         key_col: u16,
         scratch: &'scratch mut IndexScratch,
     ) -> Self {
-        Self { pager, root, key_col, scratch, leaf: None, cached_cell: None }
+        Self { pager, root, key_col, scratch, leaf: None }
     }
 
     pub fn seek_ge(&mut self, target: ValueRef<'_>) -> Result<bool> {
         self.scratch.stack.clear();
         self.leaf = None;
-        self.cached_cell = None;
 
         let mut page_id = self.root;
         let max_pages = self.pager.page_count().max(1);
@@ -86,7 +100,6 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                     let cell_count = header.cell_count as usize;
                     let idx = self.lower_bound_leaf(&page, cell_ptrs, cell_count, target)?;
                     self.leaf = Some(LeafPos { page_id, cell_index: idx });
-                    self.cached_cell = None;
 
                     if idx < cell_count {
                         return Ok(true);
@@ -101,13 +114,11 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
 
                     while lo < hi {
                         let mid = (lo + hi) / 2;
-                        let offset =
-                            u16::from_be_bytes([cell_ptrs[mid * 2], cell_ptrs[mid * 2 + 1]]);
-                        let (_child, payload) =
-                            read_index_interior_cell(self.pager, &page, offset)?;
+                        let offset = cell_ptr_at(cell_ptrs, mid)?;
+                        let cell = read_index_interior_cell(self.pager, &page, offset)?;
                         let key = decode_key_from_payload(
                             self.key_col,
-                            payload,
+                            cell.payload(),
                             &mut self.scratch.bytes,
                         )?;
                         let cmp = compare_total(target, key);
@@ -120,9 +131,10 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                     }
 
                     if lo < cell_count {
-                        let offset = u16::from_be_bytes([cell_ptrs[lo * 2], cell_ptrs[lo * 2 + 1]]);
-                        let (child, _payload) =
-                            read_index_interior_cell(self.pager, &page, offset)?;
+                        let offset = cell_ptr_at(cell_ptrs, lo)?;
+                        let cell = read_index_interior_cell(self.pager, &page, offset)?;
+                        let child =
+                            cell.child().ok_or(table::Error::Corrupted("missing child pointer"))?;
                         self.scratch.stack.push(StackEntry { page_id, child_slot: lo });
                         page_id = child;
                     } else {
@@ -151,12 +163,10 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
 
         if leaf.cell_index + 1 < cell_count {
             self.leaf = Some(LeafPos { page_id: leaf.page_id, cell_index: leaf.cell_index + 1 });
-            self.cached_cell = None;
             return Ok(true);
         }
 
         self.leaf = Some(LeafPos { page_id: leaf.page_id, cell_index: cell_count });
-        self.cached_cell = None;
         self.advance_from_leaf_end()
     }
 
@@ -170,10 +180,12 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         if leaf.cell_index >= header.cell_count as usize {
             return Ok(false);
         }
-
-        self.ensure_decoded_current(&page, &header)?;
-        let idx = self.key_col as usize;
-        let Some(value) = self.scratch.decoded.get(idx).copied() else {
+        let cell_ptrs = cell_ptrs(&page, &header)?;
+        let offset = cell_ptr_at(cell_ptrs, leaf.cell_index)?;
+        let cell = read_index_leaf_cell(self.pager, &page, offset)?;
+        let Some(value) =
+            table::decode_record_column(cell.payload(), self.key_col, &mut self.scratch.bytes)?
+        else {
             return Err(JoinError::IndexKeyNotComparable.into());
         };
         let key = unsafe { value.as_value_ref() };
@@ -194,9 +206,17 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         if leaf.cell_index >= header.cell_count as usize {
             return Err(table::Error::Corrupted("index cursor past end"));
         }
-
-        self.ensure_decoded_current(&page, &header)?;
-        let Some(value) = self.scratch.decoded.last().copied() else {
+        let cell_ptrs = cell_ptrs(&page, &header)?;
+        let offset = cell_ptr_at(cell_ptrs, leaf.cell_index)?;
+        let cell = read_index_leaf_cell(self.pager, &page, offset)?;
+        let count = table::record_column_count(cell.payload())?;
+        let last =
+            count.checked_sub(1).ok_or_else(|| table::Error::from(JoinError::MissingIndexRowId))?;
+        let last =
+            u16::try_from(last).map_err(|_| table::Error::from(JoinError::MissingIndexRowId))?;
+        let Some(value) =
+            table::decode_record_column(cell.payload(), last, &mut self.scratch.bytes)?
+        else {
             return Err(JoinError::MissingIndexRowId.into());
         };
 
@@ -218,9 +238,10 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
 
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let offset = u16::from_be_bytes([cell_ptrs[mid * 2], cell_ptrs[mid * 2 + 1]]);
-            let payload = read_index_leaf_payload(self.pager, page, offset)?;
-            let key = decode_key_from_payload(self.key_col, payload, &mut self.scratch.bytes)?;
+            let offset = cell_ptr_at(cell_ptrs, mid)?;
+            let cell = read_index_leaf_cell(self.pager, page, offset)?;
+            let key =
+                decode_key_from_payload(self.key_col, cell.payload(), &mut self.scratch.bytes)?;
             let cmp = compare_total(target, key);
             if cmp == Ordering::Greater {
                 lo = mid + 1;
@@ -230,35 +251,6 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         }
 
         Ok(lo)
-    }
-
-    fn ensure_decoded_current(&mut self, page: &PageRef<'_>, header: &IndexHeader) -> Result<()> {
-        let Some(leaf) = self.leaf else {
-            return Err(table::Error::Corrupted("index cursor not positioned"));
-        };
-
-        if self.cached_cell == Some((leaf.page_id, leaf.cell_index)) {
-            return Ok(());
-        }
-
-        let cell_ptrs = cell_ptrs(page, header)?;
-        if leaf.cell_index >= header.cell_count as usize {
-            return Err(table::Error::Corrupted("index cursor past end"));
-        }
-        let offset = u16::from_be_bytes([
-            cell_ptrs[leaf.cell_index * 2],
-            cell_ptrs[leaf.cell_index * 2 + 1],
-        ]);
-        let payload = read_index_leaf_payload(self.pager, page, offset)?;
-        table::decode_record_project_into(
-            payload,
-            None,
-            &mut self.scratch.decoded,
-            &mut self.scratch.bytes,
-            &mut self.scratch.serials,
-        )?;
-        self.cached_cell = Some((leaf.page_id, leaf.cell_index));
-        Ok(())
     }
 
     fn advance_from_leaf_end(&mut self) -> Result<bool> {
@@ -276,7 +268,6 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                 let child = child_page_for_slot(self.pager, &page, &header, next_slot)?;
                 let leaf = self.descend_leftmost(child)?;
                 self.leaf = Some(leaf);
-                self.cached_cell = None;
                 return Ok(true);
             }
         }
@@ -305,8 +296,9 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
             if header.cell_count == 0 {
                 return Err(table::Error::Corrupted("interior index page has no cells"));
             }
-            let offset = u16::from_be_bytes([cell_ptrs[0], cell_ptrs[1]]);
-            let (child, _payload) = read_index_interior_cell(self.pager, &page, offset)?;
+            let offset = cell_ptr_at(cell_ptrs, 0)?;
+            let cell = read_index_interior_cell(self.pager, &page, offset)?;
+            let child = cell.child().ok_or(table::Error::Corrupted("missing child pointer"))?;
             self.scratch.stack.push(StackEntry { page_id, child_slot: 0 });
             page_id = child;
         }
@@ -319,7 +311,6 @@ pub(crate) fn index_key_len(
     scratch: &mut IndexScratch,
 ) -> Result<Option<usize>> {
     scratch.stack.clear();
-    scratch.decoded.clear();
     scratch.bytes.clear();
     scratch.serials.clear();
 
@@ -348,15 +339,9 @@ pub(crate) fn index_key_len(
         match header.kind {
             IndexKind::Leaf => {
                 let cell_ptrs = cell_ptrs(&page, &header)?;
-                let offset = u16::from_be_bytes([cell_ptrs[0], cell_ptrs[1]]);
-                let payload = read_index_leaf_payload(pager, &page, offset)?;
-                let count = table::decode_record_project_into(
-                    payload,
-                    None,
-                    &mut scratch.decoded,
-                    &mut scratch.bytes,
-                    &mut scratch.serials,
-                )?;
+                let offset = cell_ptr_at(cell_ptrs, 0)?;
+                let cell = read_index_leaf_cell(pager, &page, offset)?;
+                let count = table::record_column_count(cell.payload())?;
                 if count == 0 {
                     return Err(table::Error::Corrupted("index record has no columns"));
                 }
@@ -364,9 +349,9 @@ pub(crate) fn index_key_len(
             }
             IndexKind::Interior => {
                 let cell_ptrs = cell_ptrs(&page, &header)?;
-                let offset = u16::from_be_bytes([cell_ptrs[0], cell_ptrs[1]]);
-                let (child, _payload) = read_index_interior_cell(pager, &page, offset)?;
-                page_id = child;
+                let offset = cell_ptr_at(cell_ptrs, 0)?;
+                let cell = read_index_interior_cell(pager, &page, offset)?;
+                page_id = cell.child().ok_or(table::Error::Corrupted("missing child pointer"))?;
             }
         }
     }
@@ -409,7 +394,7 @@ fn cmp_f64_total(left: f64, right: f64) -> Ordering {
 
 fn decode_key_from_payload<'row>(
     key_col: u16,
-    payload: table::RecordPayload<'row>,
+    payload: table::PayloadRef<'row>,
     bytes: &'row mut Vec<u8>,
 ) -> Result<ValueRef<'row>> {
     let Some(raw) = table::decode_record_column(payload, key_col, bytes)? else {
@@ -493,28 +478,38 @@ fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &IndexHeader) -> Result<&'a [u8]
     Ok(&bytes[header.cell_ptrs_start..cell_ptrs_end])
 }
 
-fn read_index_leaf_payload<'row>(
+#[inline]
+fn cell_ptr_at(cell_ptrs: &[u8], idx: usize) -> Result<u16> {
+    let offset =
+        idx.checked_mul(2).ok_or(table::Error::Corrupted("cell pointer array overflow"))?;
+    if offset + 1 >= cell_ptrs.len() {
+        return Err(table::Error::Corrupted("cell pointer array out of bounds"));
+    }
+    Ok(u16::from_be_bytes([cell_ptrs[offset], cell_ptrs[offset + 1]]))
+}
+
+fn read_index_leaf_cell<'row>(
     pager: &'row Pager,
     page: &'row PageRef<'_>,
     offset: u16,
-) -> Result<table::RecordPayload<'row>> {
-    read_index_payload(pager, page, offset, false).map(|(_, payload)| payload)
+) -> Result<IndexCellRef<'row>> {
+    read_index_cell(pager, page, offset, false)
 }
 
 fn read_index_interior_cell<'row>(
     pager: &'row Pager,
     page: &'row PageRef<'_>,
     offset: u16,
-) -> Result<(PageId, table::RecordPayload<'row>)> {
-    read_index_payload(pager, page, offset, true)
+) -> Result<IndexCellRef<'row>> {
+    read_index_cell(pager, page, offset, true)
 }
 
-fn read_index_payload<'row>(
+fn read_index_cell<'row>(
     pager: &'row Pager,
     page: &'row PageRef<'_>,
     offset: u16,
     has_child: bool,
-) -> Result<(PageId, table::RecordPayload<'row>)> {
+) -> Result<IndexCellRef<'row>> {
     let usable = page.usable_bytes();
     let mut pos = offset as usize;
     if pos >= usable.len() {
@@ -528,9 +523,9 @@ fn read_index_payload<'row>(
         let child =
             u32::from_be_bytes([usable[pos], usable[pos + 1], usable[pos + 2], usable[pos + 3]]);
         pos += 4;
-        PageId::try_new(child).ok_or(table::Error::Corrupted("child page id is zero"))?
+        Some(PageId::try_new(child).ok_or(table::Error::Corrupted("child page id is zero"))?)
     } else {
-        PageId::ROOT
+        None
     };
 
     let payload_length = table::read_varint_at(usable, &mut pos, "cell payload length truncated")?;
@@ -549,7 +544,7 @@ fn read_index_payload<'row>(
         if end > usable.len() {
             return Err(table::Error::Corrupted("payload extends past page boundary"));
         }
-        return Ok((child, table::RecordPayload::Inline(&usable[start..end])));
+        return Ok(IndexCellRef { child, payload: table::PayloadRef::Inline(&usable[start..end]) });
     }
 
     let local_len = table::local_payload_len(usable_size, payload_length)?;
@@ -572,7 +567,7 @@ fn read_index_payload<'row>(
         &usable[start..end_local],
         overflow_page,
     );
-    Ok((child, table::RecordPayload::Overflow(payload)))
+    Ok(IndexCellRef { child, payload: table::PayloadRef::Overflow(payload) })
 }
 
 fn child_page_for_slot(
@@ -583,9 +578,9 @@ fn child_page_for_slot(
 ) -> Result<PageId> {
     if child_slot < header.cell_count as usize {
         let cell_ptrs = cell_ptrs(page, header)?;
-        let offset = u16::from_be_bytes([cell_ptrs[child_slot * 2], cell_ptrs[child_slot * 2 + 1]]);
-        let (child, _payload) = read_index_interior_cell(pager, page, offset)?;
-        Ok(child)
+        let offset = cell_ptr_at(cell_ptrs, child_slot)?;
+        let cell = read_index_interior_cell(pager, page, offset)?;
+        cell.child().ok_or(table::Error::Corrupted("missing child pointer"))
     } else {
         let right_most = header
             .right_most_child

@@ -15,4 +15,4 @@ pub use query::{
     Expr, PreparedScan, Row, Scan, ScanScratch, ValueLit, col, lit_bytes, lit_f64, lit_i64,
     lit_null,
 };
-pub use table::{Error, RecordPayload, Result, ValueRef};
+pub use table::{CellRef, Error, PayloadRef, Result, ValueRef};

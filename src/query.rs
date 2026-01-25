@@ -394,7 +394,7 @@ impl<'db> PreparedScan<'db> {
 
     pub(crate) fn eval_payload<'row>(
         &'row mut self,
-        payload: table::RecordPayload<'row>,
+        payload: table::PayloadRef<'row>,
         values: &'row mut Vec<ValueSlot>,
         bytes: &'row mut Vec<u8>,
         serials: &'row mut Vec<u64>,
@@ -404,7 +404,7 @@ impl<'db> PreparedScan<'db> {
 
     pub(crate) fn eval_payload_with_filters<'row>(
         &'row mut self,
-        payload: table::RecordPayload<'row>,
+        payload: table::PayloadRef<'row>,
         values: &'row mut Vec<ValueSlot>,
         bytes: &'row mut Vec<u8>,
         serials: &'row mut Vec<u64>,
@@ -464,27 +464,23 @@ impl<'db> PreparedScan<'db> {
 
         let (values, bytes, serials, btree_stack) = scratch.split_mut();
 
-        table::scan_table_cells_with_scratch_and_stack_until(
-            pager,
-            root,
-            btree_stack,
-            |rowid, payload| {
-                let Some(row) = self.eval_payload(payload, values, bytes, serials)? else {
-                    return Ok(None);
-                };
+        table::scan_table_cells_with_scratch_and_stack_until(pager, root, btree_stack, |cell| {
+            let rowid = cell.rowid();
+            let Some(row) = self.eval_payload(cell.payload(), values, bytes, serials)? else {
+                return Ok(None);
+            };
 
-                cb(rowid, row)?;
-                seen += 1;
+            cb(rowid, row)?;
+            seen += 1;
 
-                if let Some(limit) = limit
-                    && seen >= limit
-                {
-                    return Ok(Some(()));
-                }
+            if let Some(limit) = limit
+                && seen >= limit
+            {
+                return Ok(Some(()));
+            }
 
-                Ok(None)
-            },
-        )?;
+            Ok(None)
+        })?;
 
         Ok(())
     }
@@ -931,7 +927,7 @@ mod tests {
         let mut bytes = Vec::new();
         let mut serials = Vec::with_capacity(needed.len());
         let _ = table::decode_record_project_into(
-            table::RecordPayload::Inline(&payload),
+            table::PayloadRef::Inline(&payload),
             Some(&needed),
             &mut decoded,
             &mut bytes,

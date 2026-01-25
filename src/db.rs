@@ -149,15 +149,15 @@ pub struct CellScan<'db> {
 impl<'db> CellScan<'db> {
     pub fn for_each<F>(self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
     where
-        F: for<'row> FnMut(i64, table::RecordPayload<'row>) -> table::Result<()>,
+        F: for<'row> FnMut(table::CellRef<'row>) -> table::Result<()>,
     {
         let (_, _, _, stack) = scratch.split_mut();
         table::scan_table_cells_with_scratch_and_stack_until::<_, ()>(
             self.pager,
             self.root,
             stack,
-            |rowid, payload| {
-                cb(rowid, payload)?;
+            |cell| {
+                cb(cell)?;
                 Ok(None)
             },
         )?;

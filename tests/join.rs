@@ -68,17 +68,18 @@ fn lookup_rowid_payload_matches_scan() {
     let (users_root, _orders_root, _index_root) = join_roots(&pager);
 
     let mut payloads = Vec::new();
-    table::scan_table_cells_with_scratch(&pager, users_root, |rowid, payload| {
-        let bytes = payload.to_vec()?;
-        payloads.push((rowid, bytes));
+    table::scan_table_cells_with_scratch(&pager, users_root, |cell| {
+        let bytes = cell.payload().to_vec()?;
+        payloads.push((cell.rowid(), bytes));
         Ok(())
     })
     .expect("scan users table");
 
     for (rowid, payload) in payloads {
-        let found = table::lookup_rowid_payload(&pager, users_root, rowid)
+        let found = table::lookup_rowid_cell(&pager, users_root, rowid)
             .expect("lookup rowid")
             .expect("row exists")
+            .payload()
             .to_vec()
             .expect("materialize payload");
         assert_eq!(found, payload);

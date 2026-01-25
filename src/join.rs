@@ -497,9 +497,13 @@ where
 
         while cursor.key_eq(left_key_value)? {
             let right_rowid = cursor.current_rowid()?;
-            if let Some(payload) = table::lookup_rowid_payload(pager, right_root, right_rowid)?
-                && let Some(right_row) =
-                    right_scan.eval_payload(payload, right_values, right_bytes, right_serials)?
+            if let Some(cell) = table::lookup_rowid_cell(pager, right_root, right_rowid)?
+                && let Some(right_row) = right_scan.eval_payload(
+                    cell.payload(),
+                    right_values,
+                    right_bytes,
+                    right_serials,
+                )?
             {
                 let right_out = right_meta.output_row(right_row.values_raw());
                 cb(JoinedRow { left_rowid, right_rowid, left: left_out, right: right_out })?;
@@ -556,9 +560,9 @@ where
         let ValueRef::Integer(target_rowid) = left_key_value else {
             return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
         };
-        if let Some(payload) = table::lookup_rowid_payload(pager, right_root, target_rowid)?
+        if let Some(cell) = table::lookup_rowid_cell(pager, right_root, target_rowid)?
             && let Some(right_row) =
-                right_scan.eval_payload(payload, right_values, right_bytes, right_serials)?
+                right_scan.eval_payload(cell.payload(), right_values, right_bytes, right_serials)?
         {
             let right_out = right_meta.output_row(right_row.values_raw());
             cb(JoinedRow {
@@ -697,10 +701,9 @@ where
             match rowids {
                 RowIdList::One(v) => {
                     let right_rowid = *v;
-                    if let Some(payload) =
-                        table::lookup_rowid_payload(pager, right_root, right_rowid)?
+                    if let Some(cell) = table::lookup_rowid_cell(pager, right_root, right_rowid)?
                         && let Some(right_row) = right_scan.eval_payload_with_filters(
-                            payload,
+                            cell.payload(),
                             right_values,
                             right_bytes,
                             right_serials,
@@ -719,10 +722,10 @@ where
                 }
                 RowIdList::Many(vs) => {
                     for &right_rowid in vs.iter() {
-                        if let Some(payload) =
-                            table::lookup_rowid_payload(pager, right_root, right_rowid)?
+                        if let Some(cell) =
+                            table::lookup_rowid_cell(pager, right_root, right_rowid)?
                             && let Some(right_row) = right_scan.eval_payload_with_filters(
-                                payload,
+                                cell.payload(),
                                 right_values,
                                 right_bytes,
                                 right_serials,
@@ -1034,21 +1037,17 @@ fn resolve_right_null_len(
     let pager = right_scan.pager();
     let root = right_scan.root();
     let mut stack = Vec::new();
-    let count = table::scan_table_cells_with_scratch_and_stack_until(
-        pager,
-        root,
-        &mut stack,
-        |_, payload| {
+    let count =
+        table::scan_table_cells_with_scratch_and_stack_until(pager, root, &mut stack, |cell| {
             let count = table::decode_record_project_into(
-                payload,
+                cell.payload(),
                 None,
                 right_values,
                 right_bytes,
                 right_serials,
             )?;
             Ok(Some(count))
-        },
-    )?;
+        })?;
     right_values.clear();
     count.ok_or_else(|| JoinError::LeftJoinMissingRightColumns.into())
 }

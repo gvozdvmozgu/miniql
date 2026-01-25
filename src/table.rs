@@ -193,9 +193,27 @@ pub(crate) enum ValueSlot {
 }
 
 #[derive(Clone, Copy)]
-pub enum RecordPayload<'row> {
+pub enum PayloadRef<'row> {
     Inline(&'row [u8]),
     Overflow(OverflowPayload<'row>),
+}
+
+#[derive(Clone, Copy)]
+pub struct CellRef<'row> {
+    rowid: i64,
+    payload: PayloadRef<'row>,
+}
+
+impl<'row> CellRef<'row> {
+    #[inline]
+    pub fn rowid(self) -> i64 {
+        self.rowid
+    }
+
+    #[inline]
+    pub fn payload(self) -> PayloadRef<'row> {
+        self.payload
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -217,11 +235,11 @@ impl<'row> OverflowPayload<'row> {
     }
 }
 
-impl<'row> RecordPayload<'row> {
+impl<'row> PayloadRef<'row> {
     pub fn to_vec(&self) -> Result<Vec<u8>> {
         match self {
-            RecordPayload::Inline(bytes) => Ok(bytes.to_vec()),
-            RecordPayload::Overflow(payload) => {
+            PayloadRef::Inline(bytes) => Ok(bytes.to_vec()),
+            PayloadRef::Overflow(payload) => {
                 let mut out = Vec::with_capacity(payload.total_len);
                 assemble_overflow_payload(
                     payload.pager,
@@ -430,16 +448,16 @@ where
 
 pub fn scan_table_cells_with_scratch<F>(pager: &Pager, page_id: PageId, mut f: F) -> Result<()>
 where
-    F: for<'row> FnMut(i64, RecordPayload<'row>) -> Result<()>,
+    F: for<'row> FnMut(CellRef<'row>) -> Result<()>,
 {
     scan_table_page_cells(pager, page_id, &mut f)
 }
 
-pub fn lookup_rowid_payload<'row>(
+pub fn lookup_rowid_cell<'row>(
     pager: &'row Pager,
     page_id: PageId,
     target_rowid: i64,
-) -> Result<Option<RecordPayload<'row>>> {
+) -> Result<Option<CellRef<'row>>> {
     let mut page_id = page_id;
     let max_pages = pager.page_count().max(1);
     let mut seen_pages = 0u32;
@@ -462,7 +480,7 @@ pub fn lookup_rowid_payload<'row>(
 
                 while lo < hi {
                     let mid = (lo + hi) / 2;
-                    let offset = u16::from_be_bytes([cell_ptrs[mid * 2], cell_ptrs[mid * 2 + 1]]);
+                    let offset = cell_ptr_at(cell_ptrs, mid)?;
                     let rowid = read_table_leaf_rowid(&page, offset)?;
                     if rowid < target_rowid {
                         lo = mid + 1;
@@ -472,12 +490,11 @@ pub fn lookup_rowid_payload<'row>(
                 }
 
                 if lo < cell_count {
-                    let offset = u16::from_be_bytes([cell_ptrs[lo * 2], cell_ptrs[lo * 2 + 1]]);
+                    let offset = cell_ptr_at(cell_ptrs, lo)?;
                     let rowid = read_table_leaf_rowid(&page, offset)?;
                     if rowid == target_rowid {
-                        let (_rowid, payload) =
-                            read_table_cell_payload_from_bytes(pager, page_id, offset)?;
-                        return Ok(Some(payload));
+                        let cell = read_table_cell_ref_from_bytes(pager, page_id, offset)?;
+                        return Ok(Some(cell));
                     }
                 }
 
@@ -490,7 +507,7 @@ pub fn lookup_rowid_payload<'row>(
 
                 while lo < hi {
                     let mid = (lo + hi) / 2;
-                    let offset = u16::from_be_bytes([cell_ptrs[mid * 2], cell_ptrs[mid * 2 + 1]]);
+                    let offset = cell_ptr_at(cell_ptrs, mid)?;
                     let (_child, key) = read_table_interior_cell(&page, offset)?;
                     if target_rowid <= key {
                         hi = mid;
@@ -500,7 +517,7 @@ pub fn lookup_rowid_payload<'row>(
                 }
 
                 if lo < cell_count {
-                    let offset = u16::from_be_bytes([cell_ptrs[lo * 2], cell_ptrs[lo * 2 + 1]]);
+                    let offset = cell_ptr_at(cell_ptrs, lo)?;
                     let (child, _key) = read_table_interior_cell(&page, offset)?;
                     page_id = child;
                 } else {
@@ -522,7 +539,7 @@ pub(crate) fn scan_table_cells_with_scratch_and_stack_until<F, T>(
     mut f: F,
 ) -> Result<Option<T>>
 where
-    F: for<'row> FnMut(i64, RecordPayload<'row>) -> Result<Option<T>>,
+    F: for<'row> FnMut(CellRef<'row>) -> Result<Option<T>>,
 {
     stack.clear();
     stack.push(page_id);
@@ -538,107 +555,27 @@ fn scan_table_page_ref<'pager, F>(
 where
     F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
 {
-    let page = pager.page(page_id)?;
-    let header = parse_header(&page)?;
-    let root_cell_ptrs = cell_ptrs(&page, &header)?;
-
-    if matches!(header.kind, BTreeKind::TableLeaf) {
-        for idx in 0..header.cell_count as usize {
-            let offset = u16::from_be_bytes([root_cell_ptrs[idx * 2], root_cell_ptrs[idx * 2 + 1]]);
-            let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
-            let row = RowView { values: scratch.values_slice() };
-            f(rowid, row)?;
-        }
-        return Ok(());
-    }
-
     let mut stack = scratch.take_stack();
-    stack.clear();
-
-    let max_pages = pager.page_count().max(1);
-    let mut seen_pages = 1u32;
-
-    if let Some(right_most) = header.right_most_child {
-        let right_most =
-            PageId::try_new(right_most).ok_or(Error::Corrupted("child page id is zero"))?;
-        stack.push(right_most);
-    }
-
-    let page_len = page.usable_bytes().len();
-    for idx in (0..header.cell_count as usize).rev() {
-        let offset = u16::from_be_bytes([root_cell_ptrs[idx * 2], root_cell_ptrs[idx * 2 + 1]]);
-        if offset as usize >= page_len {
-            return Err(Error::Corrupted("cell offset out of bounds"));
-        }
-
-        let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
-        let child = read_u32_checked(&mut decoder, "cell child pointer truncated")?;
-        let child = PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
-
-        // Skip the key separating subtrees; it is not needed for scanning.
-        let _ = read_varint_checked(&mut decoder, "cell key truncated")?;
-        stack.push(child);
-    }
-
-    let result = (|| {
-        while let Some(page_id) = stack.pop() {
-            seen_pages += 1;
-            if seen_pages > max_pages {
-                return Err(Error::Corrupted("btree page cycle detected"));
-            }
-
-            let page = pager.page(page_id)?;
-            let header = parse_header(&page)?;
-            let cell_ptrs = cell_ptrs(&page, &header)?;
-
-            match header.kind {
-                BTreeKind::TableLeaf => {
-                    for idx in 0..header.cell_count as usize {
-                        let offset =
-                            u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                        let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
-                        let row = RowView { values: scratch.values_slice() };
-                        f(rowid, row)?;
-                    }
-                }
-                BTreeKind::TableInterior => {
-                    if let Some(right_most) = header.right_most_child {
-                        let right_most = PageId::try_new(right_most)
-                            .ok_or(Error::Corrupted("child page id is zero"))?;
-                        stack.push(right_most);
-                    }
-
-                    let page_len = page.usable_bytes().len();
-                    for idx in (0..header.cell_count as usize).rev() {
-                        let offset =
-                            u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                        if offset as usize >= page_len {
-                            return Err(Error::Corrupted("cell offset out of bounds"));
-                        }
-
-                        let mut decoder =
-                            Decoder::new(page.usable_bytes()).split_at(offset as usize);
-                        let child = read_u32_checked(&mut decoder, "cell child pointer truncated")?;
-                        let child = PageId::try_new(child)
-                            .ok_or(Error::Corrupted("child page id is zero"))?;
-
-                        // Skip the key separating subtrees; it is not needed for scanning.
-                        let _ = read_varint_checked(&mut decoder, "cell key truncated")?;
-                        stack.push(child);
-                    }
-                }
-            }
-        }
-        Ok(())
-    })();
-
+    let result = scan_table_cells_with_scratch_and_stack_until::<_, ()>(
+        pager,
+        page_id,
+        &mut stack,
+        |cell| {
+            scratch.prepare_row();
+            let (values, bytes, serials) = scratch.split_mut();
+            let _ = decode_record_project_into(cell.payload(), None, values, bytes, serials)?;
+            let row = RowView { values: scratch.values_slice() };
+            f(cell.rowid(), row)?;
+            Ok(None)
+        },
+    );
     scratch.return_stack(stack);
-    result
+    result.map(|_| ())
 }
 
 fn scan_table_page_cells<'pager, F>(pager: &'pager Pager, page_id: PageId, f: &mut F) -> Result<()>
 where
-    F: for<'row> FnMut(i64, RecordPayload<'row>) -> Result<()>,
+    F: for<'row> FnMut(CellRef<'row>) -> Result<()>,
 {
     let mut stack = vec![page_id];
     scan_table_page_cells_with_stack(pager, &mut stack, f)
@@ -650,7 +587,7 @@ fn scan_table_page_cells_with_stack<'pager, F>(
     f: &mut F,
 ) -> Result<()>
 where
-    F: for<'row> FnMut(i64, RecordPayload<'row>) -> Result<()>,
+    F: for<'row> FnMut(CellRef<'row>) -> Result<()>,
 {
     let max_pages = pager.page_count().max(1);
     let mut seen_pages = 0u32;
@@ -668,9 +605,9 @@ where
         match header.kind {
             BTreeKind::TableLeaf => {
                 for idx in 0..header.cell_count as usize {
-                    let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                    let (rowid, payload) = read_table_cell_payload(pager, &page, offset)?;
-                    f(rowid, payload)?;
+                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let cell = read_table_cell_ref(pager, &page, offset)?;
+                    f(cell)?;
                 }
             }
             BTreeKind::TableInterior => {
@@ -682,7 +619,7 @@ where
 
                 let page_len = page.usable_bytes().len();
                 for idx in (0..header.cell_count as usize).rev() {
-                    let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
+                    let offset = cell_ptr_at(cell_ptrs, idx)?;
                     if offset as usize >= page_len {
                         return Err(Error::Corrupted("cell offset out of bounds"));
                     }
@@ -711,83 +648,15 @@ fn scan_table_page_ref_until<'pager, F, T>(
 where
     F: for<'row> FnMut(i64, RowView<'row>) -> Result<Option<T>>,
 {
-    let page = pager.page(page_id)?;
-    let header = parse_header(&page)?;
-    let root_cell_ptrs = cell_ptrs(&page, &header)?;
-
-    if matches!(header.kind, BTreeKind::TableLeaf) {
-        for idx in 0..header.cell_count as usize {
-            let offset = u16::from_be_bytes([root_cell_ptrs[idx * 2], root_cell_ptrs[idx * 2 + 1]]);
-            let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
-            let row = RowView { values: scratch.values_slice() };
-            if let Some(value) = f(rowid, row)? {
-                return Ok(Some(value));
-            }
-        }
-        return Ok(None);
-    }
-
     let mut stack = scratch.take_stack();
-    stack.clear();
-    stack.push(page_id);
-    let max_pages = pager.page_count().max(1);
-    let mut seen_pages = 0u32;
-
-    let result = (|| {
-        while let Some(page_id) = stack.pop() {
-            seen_pages += 1;
-            if seen_pages > max_pages {
-                return Err(Error::Corrupted("btree page cycle detected"));
-            }
-
-            let page = pager.page(page_id)?;
-            let header = parse_header(&page)?;
-            let cell_ptrs = cell_ptrs(&page, &header)?;
-
-            match header.kind {
-                BTreeKind::TableLeaf => {
-                    for idx in 0..header.cell_count as usize {
-                        let offset =
-                            u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                        let rowid = read_table_cell_into(pager, &page, offset, scratch)?;
-                        let row = RowView { values: scratch.values_slice() };
-                        if let Some(value) = f(rowid, row)? {
-                            return Ok(Some(value));
-                        }
-                    }
-                }
-                BTreeKind::TableInterior => {
-                    if let Some(right_most) = header.right_most_child {
-                        let right_most = PageId::try_new(right_most)
-                            .ok_or(Error::Corrupted("child page id is zero"))?;
-                        stack.push(right_most);
-                    }
-
-                    let page_len = page.usable_bytes().len();
-                    for idx in (0..header.cell_count as usize).rev() {
-                        let offset =
-                            u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                        if offset as usize >= page_len {
-                            return Err(Error::Corrupted("cell offset out of bounds"));
-                        }
-
-                        let mut decoder =
-                            Decoder::new(page.usable_bytes()).split_at(offset as usize);
-                        let child = read_u32_checked(&mut decoder, "cell child pointer truncated")?;
-                        let child = PageId::try_new(child)
-                            .ok_or(Error::Corrupted("child page id is zero"))?;
-
-                        // Skip the key separating subtrees; it is not needed for scanning.
-                        let _ = read_varint_checked(&mut decoder, "cell key truncated")?;
-                        stack.push(child);
-                    }
-                }
-            }
-        }
-
-        Ok(None)
-    })();
-
+    let result =
+        scan_table_cells_with_scratch_and_stack_until(pager, page_id, &mut stack, |cell| {
+            scratch.prepare_row();
+            let (values, bytes, serials) = scratch.split_mut();
+            let _ = decode_record_project_into(cell.payload(), None, values, bytes, serials)?;
+            let row = RowView { values: scratch.values_slice() };
+            f(cell.rowid(), row)
+        });
     scratch.return_stack(stack);
     result
 }
@@ -798,7 +667,7 @@ fn scan_table_page_cells_until_with_stack<'pager, F, T>(
     f: &mut F,
 ) -> Result<Option<T>>
 where
-    F: for<'row> FnMut(i64, RecordPayload<'row>) -> Result<Option<T>>,
+    F: for<'row> FnMut(CellRef<'row>) -> Result<Option<T>>,
 {
     let max_pages = pager.page_count().max(1);
     let mut seen_pages = 0u32;
@@ -816,9 +685,9 @@ where
         match header.kind {
             BTreeKind::TableLeaf => {
                 for idx in 0..header.cell_count as usize {
-                    let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
-                    let (rowid, payload) = read_table_cell_payload(pager, &page, offset)?;
-                    if let Some(value) = f(rowid, payload)? {
+                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let cell = read_table_cell_ref(pager, &page, offset)?;
+                    if let Some(value) = f(cell)? {
                         return Ok(Some(value));
                     }
                 }
@@ -832,7 +701,7 @@ where
 
                 let page_len = page.usable_bytes().len();
                 for idx in (0..header.cell_count as usize).rev() {
-                    let offset = u16::from_be_bytes([cell_ptrs[idx * 2], cell_ptrs[idx * 2 + 1]]);
+                    let offset = cell_ptr_at(cell_ptrs, idx)?;
                     if offset as usize >= page_len {
                         return Err(Error::Corrupted("cell offset out of bounds"));
                     }
@@ -852,76 +721,11 @@ where
     Ok(None)
 }
 
-fn read_table_cell_into(
-    pager: &Pager,
-    page: &PageRef<'_>,
-    offset: u16,
-    scratch: &mut RowScratch,
-) -> Result<i64> {
-    scratch.prepare_row();
-    let (values, bytes, serials) = scratch.split_mut();
-    let usable = page.usable_bytes();
-    if offset as usize >= usable.len() {
-        return Err(Error::Corrupted("cell offset out of bounds"));
-    }
-
-    let mut pos = offset as usize;
-    let remaining = usable.len().saturating_sub(pos);
-    let (payload_length, rowid) = if remaining >= 18 {
-        // SAFETY: remaining >= 18 guarantees two varints (max 9 bytes each) are
-        // in-bounds.
-        let payload_length = unsafe { read_varint_unchecked_at(usable, &mut pos) };
-        let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) } as i64;
-        (payload_length, rowid)
-    } else {
-        let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
-        let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
-        (payload_length, rowid)
-    };
-    let payload_length =
-        usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
-    if payload_length > MAX_PAYLOAD_BYTES {
-        return Err(Error::PayloadTooLarge(payload_length));
-    }
-
-    let start = pos;
-    let usable_size = page.usable_size();
-    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted("usable size underflow"))?;
-    if payload_length <= x {
-        let end = start + payload_length;
-        if end > usable.len() {
-            return Err(Error::Corrupted("payload extends past page boundary"));
-        }
-        decode_record_into_bytes(&usable[start..end], values)?;
-        return Ok(rowid);
-    }
-
-    let local_len = local_payload_len(usable_size, payload_length)?;
-    let end_local = start + local_len;
-    if end_local > usable.len() {
-        return Err(Error::Corrupted("payload extends past page boundary"));
-    }
-
-    let overflow_end = end_local + 4;
-    if overflow_end > usable.len() {
-        return Err(Error::Corrupted("overflow pointer out of bounds"));
-    }
-    let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
-    if overflow_page == 0 {
-        return Err(Error::OverflowChainTruncated);
-    }
-
-    let payload =
-        OverflowPayload::new(pager, payload_length, &usable[start..end_local], overflow_page);
-    decode_record_into_overflow(&payload, values, bytes, serials)?;
-    Ok(rowid)
-}
-
-fn read_table_cell_payload<'row>(
+fn read_table_cell_ref<'row>(
     pager: &'row Pager,
     page: &'row PageRef<'_>,
     offset: u16,
-) -> Result<(i64, RecordPayload<'row>)> {
+) -> Result<CellRef<'row>> {
     let usable = page.usable_bytes();
     if offset as usize >= usable.len() {
         return Err(Error::Corrupted("cell offset out of bounds"));
@@ -954,7 +758,7 @@ fn read_table_cell_payload<'row>(
         if end > usable.len() {
             return Err(Error::Corrupted("payload extends past page boundary"));
         }
-        return Ok((rowid, RecordPayload::Inline(&usable[start..end])));
+        return Ok(CellRef { rowid, payload: PayloadRef::Inline(&usable[start..end]) });
     }
 
     let local_len = local_payload_len(usable_size, payload_length)?;
@@ -973,14 +777,14 @@ fn read_table_cell_payload<'row>(
     }
     let payload =
         OverflowPayload::new(pager, payload_length, &usable[start..end_local], overflow_page);
-    Ok((rowid, RecordPayload::Overflow(payload)))
+    Ok(CellRef { rowid, payload: PayloadRef::Overflow(payload) })
 }
 
-fn read_table_cell_payload_from_bytes<'row>(
+fn read_table_cell_ref_from_bytes<'row>(
     pager: &'row Pager,
     page_id: PageId,
     offset: u16,
-) -> Result<(i64, RecordPayload<'row>)> {
+) -> Result<CellRef<'row>> {
     let page_bytes = pager.page_bytes(page_id)?;
     let usable_end = pager.header().usable_size.min(page_bytes.len());
     let usable = &page_bytes[..usable_end];
@@ -1006,7 +810,7 @@ fn read_table_cell_payload_from_bytes<'row>(
         if end > usable.len() {
             return Err(Error::Corrupted("payload extends past page boundary"));
         }
-        return Ok((rowid, RecordPayload::Inline(&usable[start..end])));
+        return Ok(CellRef { rowid, payload: PayloadRef::Inline(&usable[start..end]) });
     }
 
     let local_len = local_payload_len(usable_size, payload_length)?;
@@ -1025,7 +829,7 @@ fn read_table_cell_payload_from_bytes<'row>(
     }
     let payload =
         OverflowPayload::new(pager, payload_length, &usable[start..end_local], overflow_page);
-    Ok((rowid, RecordPayload::Overflow(payload)))
+    Ok(CellRef { rowid, payload: PayloadRef::Overflow(payload) })
 }
 
 fn read_table_leaf_rowid(page: &PageRef<'_>, offset: u16) -> Result<i64> {
@@ -1375,18 +1179,74 @@ fn decode_record_project_into_overflow(
 }
 
 pub(crate) fn decode_record_project_into(
-    payload: RecordPayload<'_>,
+    payload: PayloadRef<'_>,
     needed_cols: Option<&[u16]>,
     out: &mut Vec<ValueSlot>,
     bytes: &mut Vec<u8>,
     serials: &mut Vec<u64>,
 ) -> Result<usize> {
     match payload {
-        RecordPayload::Inline(bytes) => decode_record_project_into_bytes(bytes, needed_cols, out),
-        RecordPayload::Overflow(payload) => {
+        PayloadRef::Inline(bytes) => decode_record_project_into_bytes(bytes, needed_cols, out),
+        PayloadRef::Overflow(payload) => {
             decode_record_project_into_overflow(&payload, needed_cols, out, bytes, serials)
         }
     }
+}
+
+pub(crate) fn record_column_count(payload: PayloadRef<'_>) -> Result<usize> {
+    match payload {
+        PayloadRef::Inline(bytes) => record_column_count_bytes(bytes),
+        PayloadRef::Overflow(payload) => record_column_count_overflow(&payload),
+    }
+}
+
+fn record_column_count_bytes(payload: &[u8]) -> Result<usize> {
+    let mut header_pos = 0usize;
+    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let header_len = if first < 0x80 {
+        header_pos = 1;
+        first as usize
+    } else {
+        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+    };
+    if header_len < header_pos || header_len > payload.len() {
+        return Err(Error::Corrupted("invalid record header length"));
+    }
+
+    let serial_bytes = &payload[header_pos..header_len];
+    let mut serial_pos = 0usize;
+    let mut count = 0usize;
+    while serial_pos < serial_bytes.len() {
+        let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
+        if b < 0x80 {
+            serial_pos += 1;
+        } else {
+            read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?;
+        }
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+fn record_column_count_overflow(payload: &OverflowPayload<'_>) -> Result<usize> {
+    let mut serial_cursor = OverflowCursor::new(payload, 0)?;
+    let header_len = serial_cursor.read_varint("record header truncated")? as usize;
+    let header_pos = serial_cursor.position();
+    if header_len < header_pos || header_len > payload.total_len {
+        return Err(Error::Corrupted("invalid record header length"));
+    }
+
+    let mut count = 0usize;
+    while serial_cursor.position() < header_len {
+        let _serial = serial_cursor.read_varint("record header truncated")?;
+        if serial_cursor.position() > header_len {
+            return Err(Error::Corrupted("record header truncated"));
+        }
+        count += 1;
+    }
+
+    Ok(count)
 }
 
 fn decode_record_project_into_bytes(
@@ -1454,13 +1314,13 @@ fn decode_record_project_into_bytes(
 }
 
 pub(crate) fn decode_record_column(
-    payload: RecordPayload<'_>,
+    payload: PayloadRef<'_>,
     col: u16,
     bytes: &mut Vec<u8>,
 ) -> Result<Option<ValueSlot>> {
     match payload {
-        RecordPayload::Inline(bytes) => decode_record_column_bytes(bytes, col),
-        RecordPayload::Overflow(payload) => decode_record_column_overflow(&payload, col, bytes),
+        PayloadRef::Inline(bytes) => decode_record_column_bytes(bytes, col),
+        PayloadRef::Overflow(payload) => decode_record_column_overflow(&payload, col, bytes),
     }
 }
 
@@ -1502,73 +1362,6 @@ fn decode_record_column_bytes(payload: &[u8], col: u16) -> Result<Option<ValueSl
         idx += 1;
     }
     Ok(None)
-}
-
-fn decode_record_into_bytes(payload: &[u8], out: &mut Vec<ValueSlot>) -> Result<()> {
-    out.clear();
-
-    let mut header_pos = 0usize;
-    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
-    let header_len = if first < 0x80 {
-        header_pos = 1;
-        first as usize
-    } else {
-        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
-    };
-    if header_len < header_pos || header_len > payload.len() {
-        return Err(Error::Corrupted("invalid record header length"));
-    }
-
-    let serial_bytes = &payload[header_pos..header_len];
-    let mut serial_pos = 0usize;
-    let mut value_pos = header_len;
-    while serial_pos < serial_bytes.len() {
-        let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
-        let serial = if b < 0x80 {
-            serial_pos += 1;
-            b as u64
-        } else {
-            read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
-        };
-        let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
-        push_checked(out, value, "values")?;
-    }
-
-    Ok(())
-}
-
-fn decode_record_into_overflow(
-    payload: &OverflowPayload<'_>,
-    out: &mut Vec<ValueSlot>,
-    bytes: &mut Vec<u8>,
-    serials: &mut Vec<u64>,
-) -> Result<()> {
-    out.clear();
-    bytes.clear();
-    serials.clear();
-
-    let mut serial_cursor = OverflowCursor::new(payload, 0)?;
-    let header_len = serial_cursor.read_varint("record header truncated")? as usize;
-    let header_pos = serial_cursor.position();
-    if header_len < header_pos || header_len > payload.total_len {
-        return Err(Error::Corrupted("invalid record header length"));
-    }
-
-    while serial_cursor.position() < header_len {
-        let serial = serial_cursor.read_varint("record header truncated")?;
-        if serial_cursor.position() > header_len {
-            return Err(Error::Corrupted("record header truncated"));
-        }
-        push_checked(serials, serial, "serials")?;
-    }
-
-    let mut value_cursor = OverflowCursor::new(payload, header_len)?;
-    for serial in serials.iter().copied() {
-        let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, bytes)?;
-        push_checked(out, raw, "values")?;
-    }
-
-    Ok(())
 }
 
 fn decode_record_column_overflow(
@@ -1903,6 +1696,15 @@ fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &BTreeHeader) -> Result<&'a [u8]
         return Err(Error::Corrupted("cell pointer array out of bounds"));
     }
     Ok(&bytes[header.cell_ptrs_start..cell_ptrs_end])
+}
+
+#[inline]
+fn cell_ptr_at(cell_ptrs: &[u8], idx: usize) -> Result<u16> {
+    let offset = idx.checked_mul(2).ok_or(Error::Corrupted("cell pointer array overflow"))?;
+    if offset + 1 >= cell_ptrs.len() {
+        return Err(Error::Corrupted("cell pointer array out of bounds"));
+    }
+    Ok(u16::from_be_bytes([cell_ptrs[offset], cell_ptrs[offset + 1]]))
 }
 
 pub(crate) fn local_payload_len(usable_size: usize, payload_len: usize) -> Result<usize> {
