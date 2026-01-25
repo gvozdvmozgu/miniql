@@ -80,7 +80,7 @@ fn bench_join_hash_hot(c: &mut Criterion) {
             .on(JoinKey::RowId, JoinKey::Col(0))
             .project_left([0])
             .project_right([1])
-            .strategy(JoinStrategy::HashJoin)
+            .strategy(JoinStrategy::Hash)
             .for_each(&mut scratch, |_jr| {
                 rows += 1;
                 Ok(())

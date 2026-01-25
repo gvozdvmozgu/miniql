@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::join::JoinError;
+use crate::join::Error;
 use crate::pager::{PageId, PageRef, Pager};
 use crate::table::{self, ValueRef};
 
@@ -186,7 +186,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         let Some(value) =
             table::decode_record_column(cell.payload(), self.key_col, &mut self.scratch.bytes)?
         else {
-            return Err(JoinError::IndexKeyNotComparable.into());
+            return Err(Error::IndexKeyNotComparable.into());
         };
         let key = unsafe { value.as_value_ref() };
         if matches!(key, ValueRef::Null) || matches!(target, ValueRef::Null) {
@@ -211,18 +211,17 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         let cell = read_index_leaf_cell(self.pager, &page, offset)?;
         let count = table::record_column_count(cell.payload())?;
         let last =
-            count.checked_sub(1).ok_or_else(|| table::Error::from(JoinError::MissingIndexRowId))?;
-        let last =
-            u16::try_from(last).map_err(|_| table::Error::from(JoinError::MissingIndexRowId))?;
+            count.checked_sub(1).ok_or_else(|| table::Error::from(Error::MissingIndexRowId))?;
+        let last = u16::try_from(last).map_err(|_| table::Error::from(Error::MissingIndexRowId))?;
         let Some(value) =
             table::decode_record_column(cell.payload(), last, &mut self.scratch.bytes)?
         else {
-            return Err(JoinError::MissingIndexRowId.into());
+            return Err(Error::MissingIndexRowId.into());
         };
 
         match unsafe { value.as_value_ref() } {
             ValueRef::Integer(rowid) => Ok(rowid),
-            _ => Err(JoinError::MissingIndexRowId.into()),
+            _ => Err(Error::MissingIndexRowId.into()),
         }
     }
 
@@ -398,7 +397,7 @@ fn decode_key_from_payload<'row>(
     bytes: &'row mut Vec<u8>,
 ) -> Result<ValueRef<'row>> {
     let Some(raw) = table::decode_record_column(payload, key_col, bytes)? else {
-        return Err(JoinError::IndexKeyNotComparable.into());
+        return Err(Error::IndexKeyNotComparable.into());
     };
     Ok(unsafe { raw.as_value_ref() })
 }

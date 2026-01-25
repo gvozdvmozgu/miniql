@@ -175,7 +175,7 @@ fn null_join_keys_do_not_match() {
         .on(JoinKey::Col(0), JoinKey::RowId)
         .project_left([0])
         .project_right([0])
-        .strategy(JoinStrategy::HashJoin)
+        .strategy(JoinStrategy::Hash)
         .compile()
         .expect("compile join");
 
@@ -202,7 +202,7 @@ fn left_join_emits_null_right_rows() {
         .on(JoinKey::Col(0), JoinKey::RowId)
         .project_left([0, 1])
         .project_right([1])
-        .strategy(JoinStrategy::HashJoin)
+        .strategy(JoinStrategy::Hash)
         .compile()
         .expect("compile join");
 

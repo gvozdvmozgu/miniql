@@ -17,7 +17,7 @@ pub type Result<T> = table::Result<T>;
 
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum JoinError {
+pub enum Error {
     UnsupportedJoinKeyType,
     IndexKeyNotComparable,
     MissingIndexRowId,
@@ -28,7 +28,7 @@ pub enum JoinError {
     LeftJoinMissingRightColumns,
 }
 
-impl std::fmt::Display for JoinError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedJoinKeyType => f.write_str("Unsupported join key type"),
@@ -45,7 +45,9 @@ impl std::fmt::Display for JoinError {
     }
 }
 
-impl std::error::Error for JoinError {}
+impl std::error::Error for Error {}
+
+pub type JoinError = Error;
 
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +67,7 @@ pub enum JoinKey {
 #[derive(Debug, Clone, Copy)]
 pub enum JoinStrategy {
     Auto,
+    Hash,
     IndexNestedLoop { index_root: PageId, index_key_col: u16 },
     HashJoin,
     NestedLoopScan,
@@ -154,8 +157,8 @@ impl<'db> Join<'db> {
     }
 
     pub fn compile(self) -> Result<PreparedJoin<'db>> {
-        let left_key = self.left_key.ok_or(JoinError::MissingJoinCondition)?;
-        let right_key = self.right_key.ok_or(JoinError::MissingJoinCondition)?;
+        let left_key = self.left_key.ok_or(Error::MissingJoinCondition)?;
+        let right_key = self.right_key.ok_or(Error::MissingJoinCondition)?;
 
         let ((left_scan, left_meta), (mut right_scan, right_meta)) = build_sides(
             self.left,
@@ -169,11 +172,11 @@ impl<'db> Join<'db> {
         let plan = match self.strategy {
             JoinStrategy::IndexNestedLoop { index_root, index_key_col } => {
                 if !matches!(right_key, JoinKey::Col(_)) {
-                    return Err(JoinError::UnsupportedJoinKeyType.into());
+                    return Err(Error::UnsupportedJoinKeyType.into());
                 }
                 JoinPlan::IndexNestedLoop { index_root, index_key_col }
             }
-            JoinStrategy::HashJoin => JoinPlan::HashJoin,
+            JoinStrategy::Hash | JoinStrategy::HashJoin => JoinPlan::HashJoin,
             JoinStrategy::NestedLoopScan => JoinPlan::NestedLoopScan,
             JoinStrategy::Auto => {
                 if matches!(right_key, JoinKey::RowId) {
@@ -405,7 +408,7 @@ impl SideMeta {
         match self.join_key {
             JoinKey::RowId => Ok(Some(ValueRef::Integer(rowid))),
             JoinKey::Col(_) => {
-                let idx = self.join_key_index.ok_or(JoinError::UnsupportedJoinKeyType)?;
+                let idx = self.join_key_index.ok_or(Error::UnsupportedJoinKeyType)?;
                 match row.get(idx) {
                     Some(ValueRef::Null) | None => Ok(None),
                     Some(value) => Ok(Some(value)),
@@ -445,9 +448,7 @@ fn build_side<'db>(
         JoinKey::RowId => None,
         JoinKey::Col(col) => match scan_proj.as_ref() {
             Some(cols) => Some(
-                cols.iter()
-                    .position(|value| *value == col)
-                    .ok_or(JoinError::UnsupportedJoinKeyType)?,
+                cols.iter().position(|value| *value == col).ok_or(Error::UnsupportedJoinKeyType)?,
             ),
             None => Some(col as usize),
         },
@@ -1163,7 +1164,7 @@ fn resolve_right_null_len(
             Ok(Some(count))
         })?;
     right_values.clear();
-    count.ok_or_else(|| JoinError::LeftJoinMissingRightColumns.into())
+    count.ok_or_else(|| Error::LeftJoinMissingRightColumns.into())
 }
 
 fn null_right_row<'row>(nulls: &'row mut Vec<ValueSlot>, len: usize) -> Row<'row> {
@@ -1208,7 +1209,7 @@ impl MemTracker {
         if let Some(limit) = self.limit
             && new_total > limit
         {
-            return Err(JoinError::HashMemoryLimitExceeded.into());
+            return Err(Error::HashMemoryLimitExceeded.into());
         }
         self.used = new_total;
         Ok(())
