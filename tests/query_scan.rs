@@ -1,6 +1,9 @@
+mod util;
+
 use std::path::{Path, PathBuf};
 
-use miniql::{Db, ScanScratch, ValueRef, col, lit_bytes, lit_i64};
+use miniql::{Db, ScanScratch, ValueRef, asc, col, desc, lit_bytes, lit_i64};
+use rusqlite::params;
 
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
@@ -107,4 +110,43 @@ fn scan_without_projection_decodes_all_columns() {
     .expect("scan users table");
 
     assert_eq!(first, Some((1, "alice".to_string(), 30)));
+}
+
+#[test]
+fn order_by_multi_column_with_limit() {
+    let file = util::make_db(|conn| {
+        conn.execute_batch("CREATE TABLE people (name TEXT, age INTEGER, city TEXT);").unwrap();
+        let rows = [
+            ("alice", 30, "austin"),
+            ("bob", 25, "boston"),
+            ("carol", 25, "chicago"),
+            ("dave", 40, "denver"),
+            ("eve", 35, "elpaso"),
+        ];
+        for (name, age, city) in rows {
+            conn.execute(
+                "INSERT INTO people (name, age, city) VALUES (?1, ?2, ?3)",
+                params![name, age, city],
+            )
+            .unwrap();
+        }
+    });
+
+    let db = Db::open(file.path()).expect("open temp db");
+    let people = db.table("people").expect("people table");
+    let mut scratch = ScanScratch::with_capacity(3, 0);
+    let mut seen = Vec::new();
+
+    people
+        .scan()
+        .project([0])
+        .order_by([asc(1), desc(0)])
+        .limit(3)
+        .for_each(&mut scratch, |_, row| {
+            seen.push(row.get_text(0)?.to_owned());
+            Ok(())
+        })
+        .expect("scan people table");
+
+    assert_eq!(seen, vec!["carol".to_string(), "bob".to_string(), "alice".to_string()]);
 }

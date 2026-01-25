@@ -1,10 +1,12 @@
 mod util;
 
-use miniql::join::{Error as JoinError, Join, JoinKey, JoinScratch, JoinStrategy, JoinType};
+use miniql::join::{
+    Error as JoinError, Join, JoinKey, JoinOrderBy, JoinScratch, JoinStrategy, JoinType,
+};
 use miniql::pager::{PageId, Pager};
 use miniql::query::{col, lit_f64, lit_i64};
 use miniql::table::{self, TableRow, ValueRef};
-use miniql::{Db, Error as TableError};
+use miniql::{Db, Error as TableError, OrderDir};
 use rusqlite::params;
 
 fn schema_root(rows: &[TableRow], kind: &str, name: &str) -> Option<u32> {
@@ -157,6 +159,53 @@ fn join_compile_index_nested_loop_requires_right_col_key() {
         .strategy(JoinStrategy::IndexNestedLoop { index_root, index_key_col: 0 })
         .compile();
     assert!(matches!(err, Err(TableError::Join(JoinError::UnsupportedJoinKeyType))));
+}
+
+#[test]
+fn join_order_by_left_right_columns() {
+    let file = util::make_db(|conn| {
+        conn.execute_batch(
+            "CREATE TABLE left_t (k INTEGER, name TEXT);
+             CREATE TABLE right_t (k INTEGER, score INTEGER, tag TEXT);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO left_t (k, name) VALUES (?1, ?2)", params![1, "bob"]).unwrap();
+        conn.execute("INSERT INTO left_t (k, name) VALUES (?1, ?2)", params![2, "alice"]).unwrap();
+        conn.execute("INSERT INTO right_t (k, score, tag) VALUES (?1, ?2, ?3)", params![1, 5, "x"])
+            .unwrap();
+        conn.execute("INSERT INTO right_t (k, score, tag) VALUES (?1, ?2, ?3)", params![1, 3, "y"])
+            .unwrap();
+        conn.execute("INSERT INTO right_t (k, score, tag) VALUES (?1, ?2, ?3)", params![2, 4, "z"])
+            .unwrap();
+    });
+
+    let db = Db::open(file.path()).expect("open db");
+    let left = db.table("left_t").expect("left table");
+    let right = db.table("right_t").expect("right table");
+    let mut scratch = new_scratch();
+    let mut seen = Vec::new();
+
+    Join::inner(left.scan(), right.scan())
+        .on(JoinKey::Col(0), JoinKey::Col(0))
+        .project_left([1])
+        .project_right([2])
+        .order_by([JoinOrderBy::left(0, OrderDir::Asc), JoinOrderBy::right(1, OrderDir::Desc)])
+        .for_each(&mut scratch, |jr| {
+            let name = jr.left.get_text(0)?.to_owned();
+            let tag = jr.right.get_text(0)?.to_owned();
+            seen.push((name, tag));
+            Ok(())
+        })
+        .expect("join");
+
+    assert_eq!(
+        seen,
+        vec![
+            ("bob".to_string(), "x".to_string()),
+            ("bob".to_string(), "y".to_string()),
+            ("alice".to_string(), "z".to_string())
+        ]
+    );
 }
 
 #[test]

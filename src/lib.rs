@@ -9,10 +9,13 @@ pub mod db;
 mod schema;
 
 pub use db::{CellScan, Db, Index, Table};
-pub use join::{Join, JoinKey, JoinScratch, JoinStrategy, JoinType, JoinedRow, PreparedJoin};
+pub use join::{
+    Join, JoinKey, JoinOrderBy, JoinScratch, JoinSide, JoinStrategy, JoinType, JoinedRow,
+    PreparedJoin, left_asc, left_desc, right_asc, right_desc,
+};
 pub use pager::PageId;
 pub use query::{
-    Expr, PreparedScan, Row, Scan, ScanScratch, ValueLit, col, lit_bytes, lit_f64, lit_i64,
-    lit_null,
+    Expr, OrderBy, OrderDir, PreparedScan, Row, Scan, ScanScratch, ValueLit, asc, col, desc,
+    lit_bytes, lit_f64, lit_i64, lit_null,
 };
 pub use table::{CellRef, Error, PayloadRef, Result, ValueRef};

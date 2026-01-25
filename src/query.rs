@@ -1,4 +1,6 @@
 use std::cell::OnceCell;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 use crate::pager::{PageId, Pager};
 use crate::table::{self, ValueRef, ValueSlot};
@@ -50,6 +52,36 @@ pub enum ValueLit {
     Integer(i64),
     Real(f64),
     Text(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderDir {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderBy {
+    pub col: u16,
+    pub dir: OrderDir,
+}
+
+impl OrderBy {
+    pub fn asc(col: u16) -> Self {
+        Self { col, dir: OrderDir::Asc }
+    }
+
+    pub fn desc(col: u16) -> Self {
+        Self { col, dir: OrderDir::Desc }
+    }
+}
+
+pub fn asc(col: u16) -> OrderBy {
+    OrderBy::asc(col)
+}
+
+pub fn desc(col: u16) -> OrderBy {
+    OrderBy::desc(col)
 }
 
 pub fn col(i: u16) -> Expr {
@@ -265,6 +297,7 @@ pub struct Scan<'db> {
     projection: Option<Vec<u16>>,
     filter_expr: Option<Expr>,
     filter_fn: Option<FilterFn<'db>>,
+    order_by: Option<Vec<OrderBy>>,
     limit: Option<usize>,
 }
 
@@ -276,6 +309,7 @@ pub struct PreparedScan<'db> {
     referenced_cols: Box<[u16]>,
     compiled_expr: Option<CompiledExpr>,
     filter_fn: Option<FilterFn<'db>>,
+    order_by: Option<Box<[OrderBy]>>,
     limit: Option<usize>,
     column_count_hint: OnceCell<usize>,
 }
@@ -292,6 +326,7 @@ impl<'db> Scan<'db> {
             projection: None,
             filter_expr: None,
             filter_fn: None,
+            order_by: None,
             limit: None,
         }
     }
@@ -308,6 +343,7 @@ impl<'db> Scan<'db> {
             projection: None,
             filter_expr: None,
             filter_fn: None,
+            order_by: None,
             limit: None,
         }
     }
@@ -339,6 +375,15 @@ impl<'db> Scan<'db> {
         self.filter_fn_slow(f)
     }
 
+    pub fn order_by<const N: usize>(mut self, cols: [OrderBy; N]) -> Self {
+        if N == 0 {
+            self.order_by = None;
+        } else {
+            self.order_by = Some(cols.to_vec());
+        }
+        self
+    }
+
     pub fn limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
         self
@@ -354,7 +399,16 @@ impl<'db> Scan<'db> {
     }
 
     pub fn compile(self) -> table::Result<PreparedScan<'db>> {
-        let Scan { pager, root, col_count_hint, projection, filter_expr, filter_fn, limit } = self;
+        let Scan {
+            pager,
+            root,
+            col_count_hint,
+            projection,
+            filter_expr,
+            filter_fn,
+            order_by,
+            limit,
+        } = self;
 
         let mut pred_cols = Vec::new();
         if let Some(expr) = &filter_expr {
@@ -362,7 +416,7 @@ impl<'db> Scan<'db> {
         }
 
         let decode_all = filter_fn.is_some();
-        let plan = build_plan(projection.as_ref(), &pred_cols, decode_all);
+        let plan = build_plan(projection.as_ref(), &pred_cols, order_by.as_deref(), decode_all);
         let compiled_expr = filter_expr
             .as_ref()
             .map(|expr| compile_expr(expr, plan.needed_cols.as_deref()))
@@ -388,6 +442,7 @@ impl<'db> Scan<'db> {
             referenced_cols: referenced_cols.into_boxed_slice(),
             compiled_expr,
             filter_fn,
+            order_by: order_by.map(|cols| cols.into_boxed_slice()),
             limit,
             column_count_hint,
         })
@@ -409,6 +464,10 @@ impl<'db> PreparedScan<'db> {
 
     pub(crate) fn root(&self) -> PageId {
         self.root
+    }
+
+    pub(crate) fn needed_cols(&self) -> Option<&[u16]> {
+        self.needed_cols.as_deref()
     }
 
     pub(crate) fn proj_map(&self) -> Option<&[usize]> {
@@ -488,6 +547,12 @@ impl<'db> PreparedScan<'db> {
             return Ok(());
         }
 
+        let order_by =
+            self.order_by.as_deref().filter(|cols| !cols.is_empty()).map(|cols| cols.to_vec());
+        if let Some(order_by) = order_by.as_deref() {
+            return self.for_each_ordered(scratch, order_by, &mut cb);
+        }
+
         let pager = self.pager;
         let root = self.root;
         let limit = self.limit;
@@ -515,6 +580,167 @@ impl<'db> PreparedScan<'db> {
 
         Ok(())
     }
+
+    fn for_each_ordered<F>(
+        &mut self,
+        scratch: &mut ScanScratch,
+        order_by: &[OrderBy],
+        cb: &mut F,
+    ) -> table::Result<()>
+    where
+        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+    {
+        let pager = self.pager;
+        let root = self.root;
+        let limit = self.limit;
+
+        let (values, bytes, serials, btree_stack) = scratch.split_mut();
+        let mut order_bytes = Vec::new();
+        let mut seq = 0u64;
+
+        let mut heap = BinaryHeap::new();
+        let mut entries = Vec::new();
+
+        table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
+            let rowid = cell.rowid();
+            let Some(_row) = self.eval_payload(cell.payload(), values, bytes, serials)? else {
+                return Ok(());
+            };
+
+            let payload = cell.payload().to_vec()?;
+            let inline = table::PayloadRef::Inline(payload.as_slice());
+            let mut keys = Vec::with_capacity(order_by.len());
+            for order in order_by {
+                let Some(value) = table::decode_record_column(inline, order.col, &mut order_bytes)?
+                else {
+                    return Err(table::Error::Corrupted("ORDER BY column missing"));
+                };
+                keys.push(SortKey { value, dir: order.dir });
+            }
+
+            let entry = SortEntry { rowid, payload, keys, seq };
+            seq = seq.wrapping_add(1);
+
+            if let Some(limit) = limit {
+                if heap.len() < limit {
+                    heap.push(entry);
+                } else if let Some(top) = heap.peek()
+                    && entry.cmp(top) == Ordering::Less
+                {
+                    heap.pop();
+                    heap.push(entry);
+                }
+            } else {
+                entries.push(entry);
+            }
+
+            Ok(())
+        })?;
+
+        let mut rows = if limit.is_some() { heap.into_vec() } else { entries };
+        rows.sort();
+
+        for entry in rows {
+            let payload = table::PayloadRef::Inline(entry.payload.as_slice());
+            if let Some(row) =
+                self.eval_payload_with_filters(payload, values, bytes, serials, false)?
+            {
+                cb(entry.rowid, row)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct SortKey {
+    value: ValueSlot,
+    dir: OrderDir,
+}
+
+#[derive(Clone)]
+struct SortEntry {
+    rowid: i64,
+    payload: Vec<u8>,
+    keys: Vec<SortKey>,
+    seq: u64,
+}
+
+impl SortEntry {
+    fn cmp_keys(&self, other: &Self) -> Ordering {
+        for (left, right) in self.keys.iter().zip(other.keys.iter()) {
+            let mut ord = compare_value_slots(left.value, right.value);
+            if matches!(left.dir, OrderDir::Desc) {
+                ord = ord.reverse();
+            }
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        self.seq.cmp(&other.seq)
+    }
+}
+
+impl PartialEq for SortEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp_keys(other) == Ordering::Equal
+    }
+}
+
+impl Eq for SortEntry {}
+
+impl PartialOrd for SortEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(std::cmp::Ord::cmp(self, other))
+    }
+}
+
+impl Ord for SortEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.cmp_keys(other)
+    }
+}
+
+fn compare_value_slots(left: ValueSlot, right: ValueSlot) -> Ordering {
+    let left = unsafe { left.as_value_ref() };
+    let right = unsafe { right.as_value_ref() };
+    compare_value_refs(left, right)
+}
+
+fn compare_value_refs(left: ValueRef<'_>, right: ValueRef<'_>) -> Ordering {
+    let rank = |value: ValueRef<'_>| match value {
+        ValueRef::Null => 0u8,
+        ValueRef::Integer(_) | ValueRef::Real(_) => 1u8,
+        ValueRef::Text(_) => 2u8,
+        ValueRef::Blob(_) => 3u8,
+    };
+
+    let left_rank = rank(left);
+    let right_rank = rank(right);
+    if left_rank != right_rank {
+        return left_rank.cmp(&right_rank);
+    }
+
+    match (left, right) {
+        (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
+        (ValueRef::Integer(l), ValueRef::Integer(r)) => l.cmp(&r),
+        (ValueRef::Integer(l), ValueRef::Real(r)) => cmp_f64_total(l as f64, r),
+        (ValueRef::Real(l), ValueRef::Integer(r)) => cmp_f64_total(l, r as f64),
+        (ValueRef::Real(l), ValueRef::Real(r)) => cmp_f64_total(l, r),
+        (ValueRef::Text(l), ValueRef::Text(r)) => l.cmp(r),
+        (ValueRef::Blob(l), ValueRef::Blob(r)) => l.cmp(r),
+        _ => Ordering::Equal,
+    }
+}
+
+fn cmp_f64_total(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+    }
 }
 
 struct Plan {
@@ -523,11 +749,19 @@ struct Plan {
     referenced_cols: Vec<u16>,
 }
 
-fn build_plan(projection: Option<&Vec<u16>>, pred_cols: &[u16], decode_all: bool) -> Plan {
+fn build_plan(
+    projection: Option<&Vec<u16>>,
+    pred_cols: &[u16],
+    order_by: Option<&[OrderBy]>,
+    decode_all: bool,
+) -> Plan {
     let decode_all = decode_all || projection.is_none();
     let mut referenced_cols = pred_cols.to_vec();
     if let Some(proj) = projection {
         referenced_cols.extend(proj.iter().copied());
+    }
+    if let Some(order_by) = order_by {
+        referenced_cols.extend(order_by.iter().map(|order| order.col));
     }
     referenced_cols.sort_unstable();
     referenced_cols.dedup();
@@ -959,7 +1193,7 @@ mod tests {
     #[test]
     fn projection_mapping_remaps_columns() {
         let projection = vec![3u16, 1u16];
-        let plan = build_plan(Some(&projection), &[], false);
+        let plan = build_plan(Some(&projection), &[], None, false);
         assert_eq!(plan.needed_cols, Some(vec![1, 3]));
         assert_eq!(plan.proj_map, Some(vec![1, 0]));
     }

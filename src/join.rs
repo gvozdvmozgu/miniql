@@ -9,9 +9,9 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::index::{self, IndexCursor, IndexScratch};
 use crate::pager::{PageId, Pager};
-use crate::query::{PreparedScan, Row, Scan, ScanScratch};
+use crate::query::{OrderDir, PreparedScan, Row, Scan, ScanScratch};
 use crate::schema::{TableSchema, parse_index_columns, parse_table_schema};
-use crate::table::{self, Value, ValueRef, ValueSlot};
+use crate::table::{self, BytesSpan, RawBytes, Value, ValueRef, ValueSlot};
 
 pub type Result<T> = table::Result<T>;
 
@@ -23,6 +23,7 @@ pub enum Error {
     MissingIndexRowId,
     HashMemoryLimitExceeded,
     MissingJoinCondition,
+    InvalidOrderByColumn,
     UnsupportedJoinType,
     UnsupportedJoinStrategy,
     LeftJoinMissingRightColumns,
@@ -36,6 +37,7 @@ impl std::fmt::Display for Error {
             Self::MissingIndexRowId => f.write_str("Index record does not end with a rowid"),
             Self::HashMemoryLimitExceeded => f.write_str("Hash join memory limit exceeded"),
             Self::MissingJoinCondition => f.write_str("Join condition is missing"),
+            Self::InvalidOrderByColumn => f.write_str("ORDER BY column is not available"),
             Self::UnsupportedJoinType => f.write_str("Join type is not supported"),
             Self::UnsupportedJoinStrategy => f.write_str("Join strategy is not supported"),
             Self::LeftJoinMissingRightColumns => {
@@ -64,6 +66,63 @@ pub enum JoinKey {
 }
 
 #[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinSide {
+    Left,
+    Right,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinOrderBy {
+    pub side: JoinSide,
+    pub col: u16,
+    pub dir: OrderDir,
+}
+
+impl JoinOrderBy {
+    pub fn left(col: u16, dir: OrderDir) -> Self {
+        Self { side: JoinSide::Left, col, dir }
+    }
+
+    pub fn right(col: u16, dir: OrderDir) -> Self {
+        Self { side: JoinSide::Right, col, dir }
+    }
+
+    pub fn left_asc(col: u16) -> Self {
+        Self::left(col, OrderDir::Asc)
+    }
+
+    pub fn left_desc(col: u16) -> Self {
+        Self::left(col, OrderDir::Desc)
+    }
+
+    pub fn right_asc(col: u16) -> Self {
+        Self::right(col, OrderDir::Asc)
+    }
+
+    pub fn right_desc(col: u16) -> Self {
+        Self::right(col, OrderDir::Desc)
+    }
+}
+
+pub fn left_asc(col: u16) -> JoinOrderBy {
+    JoinOrderBy::left_asc(col)
+}
+
+pub fn left_desc(col: u16) -> JoinOrderBy {
+    JoinOrderBy::left_desc(col)
+}
+
+pub fn right_asc(col: u16) -> JoinOrderBy {
+    JoinOrderBy::right_asc(col)
+}
+
+pub fn right_desc(col: u16) -> JoinOrderBy {
+    JoinOrderBy::right_desc(col)
+}
+
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum JoinStrategy {
     Auto,
@@ -83,6 +142,7 @@ pub struct Join<'db> {
     hash_mem_limit: Option<usize>,
     project_left: Option<Vec<u16>>,
     project_right: Option<Vec<u16>>,
+    order_by: Option<Vec<JoinOrderBy>>,
 }
 
 // For left joins without a match, right_rowid is set to 0 and right values are
@@ -97,6 +157,7 @@ pub struct PreparedJoin<'db> {
     plan: JoinPlan,
     hash_mem_limit: Option<usize>,
     right_null_len: Option<usize>,
+    order_by: Option<Box<[ResolvedOrderBy]>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -119,6 +180,7 @@ impl<'db> Join<'db> {
             hash_mem_limit: None,
             project_left: None,
             project_right: None,
+            order_by: None,
         }
     }
 
@@ -156,9 +218,22 @@ impl<'db> Join<'db> {
         self
     }
 
+    pub fn order_by<const N: usize>(mut self, cols: [JoinOrderBy; N]) -> Self {
+        if N == 0 {
+            self.order_by = None;
+        } else {
+            self.order_by = Some(cols.to_vec());
+        }
+        self
+    }
+
     pub fn compile(self) -> Result<PreparedJoin<'db>> {
         let left_key = self.left_key.ok_or(Error::MissingJoinCondition)?;
         let right_key = self.right_key.ok_or(Error::MissingJoinCondition)?;
+
+        let order_by = self.order_by.unwrap_or_default();
+        let left_order_cols = collect_order_cols(&order_by, JoinSide::Left);
+        let right_order_cols = collect_order_cols(&order_by, JoinSide::Right);
 
         let ((left_scan, left_meta), (mut right_scan, right_meta)) = build_sides(
             self.left,
@@ -167,6 +242,8 @@ impl<'db> Join<'db> {
             right_key,
             self.project_left,
             self.project_right,
+            &left_order_cols,
+            &right_order_cols,
         )?;
 
         let plan = match self.strategy {
@@ -210,6 +287,8 @@ impl<'db> Join<'db> {
             None
         };
 
+        let resolved_order_by = resolve_order_by(&order_by, &left_scan, &right_scan)?;
+
         Ok(PreparedJoin {
             left: left_scan,
             right: right_scan,
@@ -218,6 +297,7 @@ impl<'db> Join<'db> {
             plan,
             hash_mem_limit: self.hash_mem_limit,
             right_null_len,
+            order_by: resolved_order_by,
         })
     }
 
@@ -232,6 +312,19 @@ impl<'db> Join<'db> {
 
 impl<'db> PreparedJoin<'db> {
     pub fn for_each<F>(&mut self, scratch: &mut JoinScratch, mut cb: F) -> Result<()>
+    where
+        F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
+    {
+        let order_by =
+            self.order_by.as_deref().filter(|cols| !cols.is_empty()).map(|cols| cols.to_vec());
+        if let Some(order_by) = order_by.as_deref() {
+            return self.for_each_ordered(scratch, order_by, &mut cb);
+        }
+
+        self.for_each_plan(scratch, &mut cb)
+    }
+
+    fn for_each_plan<F>(&mut self, scratch: &mut JoinScratch, cb: &mut F) -> Result<()>
     where
         F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
     {
@@ -262,7 +355,7 @@ impl<'db> PreparedJoin<'db> {
                 index_scratch,
                 right_nulls,
                 right_null_len,
-                &mut cb,
+                cb,
             ),
             JoinPlan::HashJoin => hash_join(
                 &mut self.left,
@@ -278,7 +371,7 @@ impl<'db> PreparedJoin<'db> {
                 hash_state,
                 right_nulls,
                 right_null_len,
-                &mut cb,
+                cb,
             ),
             JoinPlan::NestedLoopScan => nested_loop_scan(
                 &mut self.left,
@@ -289,7 +382,7 @@ impl<'db> PreparedJoin<'db> {
                 right_scan_scratch,
                 right_nulls,
                 right_null_len,
-                &mut cb,
+                cb,
             ),
             JoinPlan::RowIdNestedLoop => rowid_nested_loop(
                 &mut self.left,
@@ -302,9 +395,69 @@ impl<'db> PreparedJoin<'db> {
                 right_serials,
                 right_nulls,
                 right_null_len,
-                &mut cb,
+                cb,
             ),
         }
+    }
+
+    fn for_each_ordered<F>(
+        &mut self,
+        scratch: &mut JoinScratch,
+        order_by: &[ResolvedOrderBy],
+        cb: &mut F,
+    ) -> Result<()>
+    where
+        F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
+    {
+        let mut entries = Vec::new();
+        let mut seq = 0u64;
+
+        self.for_each_plan(scratch, &mut |jr| {
+            let left_values: Vec<OwnedValue> =
+                jr.left.values_raw().iter().copied().map(owned_value_from_slot).collect();
+            let right_values: Vec<OwnedValue> =
+                jr.right.values_raw().iter().copied().map(owned_value_from_slot).collect();
+
+            for order in order_by {
+                let len = match order.side {
+                    JoinSide::Left => left_values.len(),
+                    JoinSide::Right => right_values.len(),
+                };
+                if order.idx >= len {
+                    return Err(Error::InvalidOrderByColumn.into());
+                }
+            }
+
+            entries.push(JoinSortEntry {
+                left_rowid: jr.left_rowid,
+                right_rowid: jr.right_rowid,
+                left_values,
+                right_values,
+                seq,
+            });
+            seq = seq.wrapping_add(1);
+            Ok(())
+        })?;
+
+        entries.sort_by(|left, right| compare_join_entries(left, right, order_by));
+
+        let mut left_slots = Vec::new();
+        let mut right_slots = Vec::new();
+
+        for entry in entries {
+            build_slots_from_owned(&entry.left_values, &mut left_slots);
+            build_slots_from_owned(&entry.right_values, &mut right_slots);
+            let left_row = self.left_meta.output_row(&left_slots);
+            let right_row = self.right_meta.output_row(&right_slots);
+            cb(JoinedRow {
+                left_rowid: entry.left_rowid,
+                right_rowid: entry.right_rowid,
+                left: left_row,
+                right: right_row,
+            })?;
+        }
+
+        Ok(())
     }
 }
 
@@ -418,6 +571,32 @@ impl SideMeta {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ResolvedOrderBy {
+    side: JoinSide,
+    idx: usize,
+    dir: OrderDir,
+}
+
+#[derive(Clone, Debug)]
+enum OwnedValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+struct JoinSortEntry {
+    left_rowid: i64,
+    right_rowid: i64,
+    left_values: Vec<OwnedValue>,
+    right_values: Vec<OwnedValue>,
+    seq: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_sides<'db>(
     left: Scan<'db>,
     right: Scan<'db>,
@@ -425,9 +604,11 @@ fn build_sides<'db>(
     right_key: JoinKey,
     project_left: Option<Vec<u16>>,
     project_right: Option<Vec<u16>>,
+    left_order_cols: &[u16],
+    right_order_cols: &[u16],
 ) -> Result<((PreparedScan<'db>, SideMeta), (PreparedScan<'db>, SideMeta))> {
-    let left_state = build_side(left, left_key, project_left)?;
-    let right_state = build_side(right, right_key, project_right)?;
+    let left_state = build_side(left, left_key, project_left, left_order_cols)?;
+    let right_state = build_side(right, right_key, project_right, right_order_cols)?;
     Ok((left_state, right_state))
 }
 
@@ -435,6 +616,7 @@ fn build_side<'db>(
     scan: Scan<'db>,
     join_key: JoinKey,
     output_override: Option<Vec<u16>>,
+    order_cols: &[u16],
 ) -> Result<(PreparedScan<'db>, SideMeta)> {
     let output_cols = output_override.or_else(|| scan.projection().map(|cols| cols.to_vec()));
     let mut scan_proj = output_cols.clone();
@@ -442,6 +624,13 @@ fn build_side<'db>(
         && !cols.contains(&col)
     {
         cols.push(col);
+    }
+    if let Some(cols) = scan_proj.as_mut() {
+        for col in order_cols {
+            if !cols.contains(col) {
+                cols.push(*col);
+            }
+        }
     }
 
     let join_key_index = match join_key {
@@ -466,6 +655,136 @@ fn build_side<'db>(
 
     let meta = SideMeta { join_key, join_key_index, proj_map, output_map };
     Ok((compiled, meta))
+}
+
+fn collect_order_cols(order_by: &[JoinOrderBy], side: JoinSide) -> Vec<u16> {
+    let mut cols = Vec::new();
+    for order in order_by {
+        if order.side != side {
+            continue;
+        }
+        if !cols.contains(&order.col) {
+            cols.push(order.col);
+        }
+    }
+    cols
+}
+
+fn resolve_order_by(
+    order_by: &[JoinOrderBy],
+    left_scan: &PreparedScan<'_>,
+    right_scan: &PreparedScan<'_>,
+) -> Result<Option<Box<[ResolvedOrderBy]>>> {
+    if order_by.is_empty() {
+        return Ok(None);
+    }
+
+    let mut resolved = Vec::with_capacity(order_by.len());
+    for order in order_by {
+        let (scan, side) = match order.side {
+            JoinSide::Left => (left_scan, JoinSide::Left),
+            JoinSide::Right => (right_scan, JoinSide::Right),
+        };
+        if let Some(count) = scan.column_count_hint()
+            && order.col as usize >= count
+        {
+            return Err(Error::InvalidOrderByColumn.into());
+        }
+        let idx = match scan.needed_cols() {
+            Some(cols) => {
+                cols.binary_search(&order.col).map_err(|_| Error::InvalidOrderByColumn)?
+            }
+            None => order.col as usize,
+        };
+        resolved.push(ResolvedOrderBy { side, idx, dir: order.dir });
+    }
+
+    Ok(Some(resolved.into_boxed_slice()))
+}
+
+fn owned_value_from_slot(slot: ValueSlot) -> OwnedValue {
+    match unsafe { slot.as_value_ref() } {
+        ValueRef::Null => OwnedValue::Null,
+        ValueRef::Integer(value) => OwnedValue::Integer(value),
+        ValueRef::Real(value) => OwnedValue::Real(value),
+        ValueRef::Text(bytes) => OwnedValue::Text(bytes.to_vec()),
+        ValueRef::Blob(bytes) => OwnedValue::Blob(bytes.to_vec()),
+    }
+}
+
+fn build_slots_from_owned(values: &[OwnedValue], out: &mut Vec<ValueSlot>) {
+    out.clear();
+    out.reserve(values.len());
+    for value in values {
+        let slot = match value {
+            OwnedValue::Null => ValueSlot::Null,
+            OwnedValue::Integer(value) => ValueSlot::Integer(*value),
+            OwnedValue::Real(value) => ValueSlot::Real(*value),
+            OwnedValue::Text(bytes) => {
+                ValueSlot::Text(BytesSpan::Scratch(RawBytes::from_slice(bytes)))
+            }
+            OwnedValue::Blob(bytes) => {
+                ValueSlot::Blob(BytesSpan::Scratch(RawBytes::from_slice(bytes)))
+            }
+        };
+        out.push(slot);
+    }
+}
+
+fn compare_join_entries(
+    left: &JoinSortEntry,
+    right: &JoinSortEntry,
+    order_by: &[ResolvedOrderBy],
+) -> std::cmp::Ordering {
+    for order in order_by {
+        let (left_value, right_value) = match order.side {
+            JoinSide::Left => (&left.left_values[order.idx], &right.left_values[order.idx]),
+            JoinSide::Right => (&left.right_values[order.idx], &right.right_values[order.idx]),
+        };
+        let mut cmp = compare_owned_values(left_value, right_value);
+        if matches!(order.dir, OrderDir::Desc) {
+            cmp = cmp.reverse();
+        }
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    left.seq.cmp(&right.seq)
+}
+
+fn compare_owned_values(left: &OwnedValue, right: &OwnedValue) -> std::cmp::Ordering {
+    let rank = |value: &OwnedValue| match value {
+        OwnedValue::Null => 0u8,
+        OwnedValue::Integer(_) | OwnedValue::Real(_) => 1u8,
+        OwnedValue::Text(_) => 2u8,
+        OwnedValue::Blob(_) => 3u8,
+    };
+
+    let left_rank = rank(left);
+    let right_rank = rank(right);
+    if left_rank != right_rank {
+        return left_rank.cmp(&right_rank);
+    }
+
+    match (left, right) {
+        (OwnedValue::Null, OwnedValue::Null) => std::cmp::Ordering::Equal,
+        (OwnedValue::Integer(l), OwnedValue::Integer(r)) => l.cmp(r),
+        (OwnedValue::Integer(l), OwnedValue::Real(r)) => cmp_f64_total(*l as f64, *r),
+        (OwnedValue::Real(l), OwnedValue::Integer(r)) => cmp_f64_total(*l, *r as f64),
+        (OwnedValue::Real(l), OwnedValue::Real(r)) => cmp_f64_total(*l, *r),
+        (OwnedValue::Text(l), OwnedValue::Text(r)) => l.cmp(r),
+        (OwnedValue::Blob(l), OwnedValue::Blob(r)) => l.cmp(r),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn cmp_f64_total(left: f64, right: f64) -> std::cmp::Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => left.partial_cmp(&right).unwrap_or(std::cmp::Ordering::Equal),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -148,7 +148,7 @@ pub(crate) struct RawBytes {
 
 impl RawBytes {
     #[inline]
-    fn from_slice(bytes: &[u8]) -> Self {
+    pub(crate) fn from_slice(bytes: &[u8]) -> Self {
         Self { ptr: bytes.as_ptr(), len: bytes.len() }
     }
 
