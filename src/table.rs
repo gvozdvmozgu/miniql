@@ -1,6 +1,7 @@
 use std::{fmt, str};
 
 use crate::decoder::Decoder;
+use crate::join::JoinError;
 use crate::pager::{PageId, PageRef, Pager};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -20,6 +21,7 @@ pub enum Error {
     PayloadTooLarge(usize),
     OverflowChainTruncated,
     OverflowLoopDetected,
+    Join(JoinError),
 }
 
 impl fmt::Display for Error {
@@ -44,6 +46,7 @@ impl fmt::Display for Error {
             Self::PayloadTooLarge(size) => write!(f, "Payload too large: {size} bytes"),
             Self::OverflowChainTruncated => f.write_str("Overflow chain is truncated"),
             Self::OverflowLoopDetected => f.write_str("Overflow chain contains a loop"),
+            Self::Join(err) => write!(f, "{err}"),
         }
     }
 }
@@ -53,6 +56,7 @@ impl std::error::Error for Error {
         match self {
             Self::Pager(err) => Some(err),
             Self::Utf8(err) => Some(err),
+            Self::Join(err) => Some(err),
             _ => None,
         }
     }
@@ -67,6 +71,12 @@ impl From<crate::pager::Error> for Error {
 impl From<str::Utf8Error> for Error {
     fn from(err: str::Utf8Error) -> Self {
         Self::Utf8(err)
+    }
+}
+
+impl From<JoinError> for Error {
+    fn from(err: JoinError) -> Self {
+        Self::Join(err)
     }
 }
 
@@ -349,6 +359,91 @@ where
     F: for<'row> FnMut(i64, &'row [u8]) -> Result<()>,
 {
     scan_table_page_cells(pager, page_id, overflow_buf, &mut f)
+}
+
+pub fn lookup_rowid_payload<'row>(
+    pager: &'row Pager,
+    page_id: PageId,
+    target_rowid: i64,
+    overflow_buf: &'row mut Vec<u8>,
+) -> Result<Option<&'row [u8]>> {
+    let mut page_id = page_id;
+    let max_pages = pager.page_count().max(1);
+    let mut seen_pages = 0u32;
+
+    loop {
+        seen_pages += 1;
+        if seen_pages > max_pages {
+            return Err(Error::Corrupted("btree page cycle detected"));
+        }
+
+        let page = pager.page(page_id)?;
+        let header = parse_header(&page)?;
+        let cell_ptrs = cell_ptrs(&page, &header)?;
+
+        match header.kind {
+            BTreeKind::TableLeaf => {
+                let cell_count = header.cell_count as usize;
+                let mut lo = 0usize;
+                let mut hi = cell_count;
+
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let offset = u16::from_be_bytes([cell_ptrs[mid * 2], cell_ptrs[mid * 2 + 1]]);
+                    let rowid = read_table_leaf_rowid(&page, offset)?;
+                    if rowid < target_rowid {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+
+                if lo < cell_count {
+                    let offset = u16::from_be_bytes([cell_ptrs[lo * 2], cell_ptrs[lo * 2 + 1]]);
+                    let rowid = read_table_leaf_rowid(&page, offset)?;
+                    if rowid == target_rowid {
+                        let (_rowid, payload) = read_table_cell_payload_from_bytes(
+                            pager,
+                            page_id,
+                            offset,
+                            overflow_buf,
+                        )?;
+                        return Ok(Some(payload));
+                    }
+                }
+
+                return Ok(None);
+            }
+            BTreeKind::TableInterior => {
+                let cell_count = header.cell_count as usize;
+                let mut lo = 0usize;
+                let mut hi = cell_count;
+
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let offset = u16::from_be_bytes([cell_ptrs[mid * 2], cell_ptrs[mid * 2 + 1]]);
+                    let (_child, key) = read_table_interior_cell(&page, offset)?;
+                    if target_rowid <= key {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+
+                if lo < cell_count {
+                    let offset = u16::from_be_bytes([cell_ptrs[lo * 2], cell_ptrs[lo * 2 + 1]]);
+                    let (child, _key) = read_table_interior_cell(&page, offset)?;
+                    page_id = child;
+                } else {
+                    let right_most = header
+                        .right_most_child
+                        .ok_or(Error::Corrupted("missing right-most child pointer"))?;
+                    page_id = PageId::try_new(right_most)
+                        .ok_or(Error::Corrupted("child page id is zero"))?;
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn scan_table_cells_with_scratch_and_stack_until<F, T>(
@@ -777,7 +872,102 @@ fn read_table_cell_payload<'row>(
     }
 }
 
-fn assemble_overflow_payload(
+fn read_table_cell_payload_from_bytes<'row>(
+    pager: &'row Pager,
+    page_id: PageId,
+    offset: u16,
+    overflow_buf: &'row mut Vec<u8>,
+) -> Result<(i64, &'row [u8])> {
+    let page_bytes = pager.page_bytes(page_id)?;
+    let usable_end = pager.header().usable_size.min(page_bytes.len());
+    let usable = &page_bytes[..usable_end];
+
+    if offset as usize >= usable.len() {
+        return Err(Error::Corrupted("cell offset out of bounds"));
+    }
+
+    let mut pos = offset as usize;
+    let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
+    let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+    let payload_length =
+        usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
+    if payload_length > MAX_PAYLOAD_BYTES {
+        return Err(Error::PayloadTooLarge(payload_length));
+    }
+
+    let start = pos;
+    let local_len = local_payload_len(pager.header().usable_size, payload_length)?;
+    let end_local =
+        start.checked_add(local_len).ok_or(Error::Corrupted("payload length overflow"))?;
+    if end_local > usable.len() {
+        return Err(Error::Corrupted("payload extends past page boundary"));
+    }
+
+    overflow_buf.clear();
+
+    if payload_length <= local_len {
+        let payload = &usable[start..start + payload_length];
+        Ok((rowid, payload))
+    } else {
+        let overflow_end =
+            end_local.checked_add(4).ok_or(Error::Corrupted("overflow pointer overflow"))?;
+        if overflow_end > usable.len() {
+            return Err(Error::Corrupted("overflow pointer out of bounds"));
+        }
+        let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
+        if overflow_page == 0 {
+            return Err(Error::OverflowChainTruncated);
+        }
+        assemble_overflow_payload(
+            pager,
+            payload_length,
+            local_len,
+            overflow_page,
+            &usable[start..end_local],
+            overflow_buf,
+        )?;
+        let payload = overflow_buf.as_slice();
+        Ok((rowid, payload))
+    }
+}
+
+fn read_table_leaf_rowid(page: &PageRef<'_>, offset: u16) -> Result<i64> {
+    let usable = page.usable_bytes();
+    if offset as usize >= usable.len() {
+        return Err(Error::Corrupted("cell offset out of bounds"));
+    }
+
+    let mut pos = offset as usize;
+    let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
+    let payload_length =
+        usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
+    if payload_length > MAX_PAYLOAD_BYTES {
+        return Err(Error::PayloadTooLarge(payload_length));
+    }
+    let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+    Ok(rowid)
+}
+
+fn read_table_interior_cell(page: &PageRef<'_>, offset: u16) -> Result<(PageId, i64)> {
+    let usable = page.usable_bytes();
+    let start = offset as usize;
+    if start + 4 > usable.len() {
+        return Err(Error::Corrupted("cell offset out of bounds"));
+    }
+
+    let child = u32::from_be_bytes([
+        usable[start],
+        usable[start + 1],
+        usable[start + 2],
+        usable[start + 3],
+    ]);
+    let child = PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
+    let mut pos = start + 4;
+    let key = read_varint_at(usable, &mut pos, "cell key truncated")? as i64;
+    Ok((child, key))
+}
+
+pub(crate) fn assemble_overflow_payload(
     pager: &Pager,
     payload_len: usize,
     local_len: usize,
@@ -977,7 +1167,7 @@ fn read_varint_checked(decoder: &mut Decoder<'_>, msg: &'static str) -> Result<u
     decoder.try_read_varint().ok_or(Error::Corrupted(msg))
 }
 
-fn read_varint_at(bytes: &[u8], pos: &mut usize, msg: &'static str) -> Result<u64> {
+pub(crate) fn read_varint_at(bytes: &[u8], pos: &mut usize, msg: &'static str) -> Result<u64> {
     if *pos >= bytes.len() {
         return Err(Error::Corrupted(msg));
     }
@@ -1121,7 +1311,7 @@ fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &BTreeHeader) -> Result<&'a [u8]
     Ok(&bytes[header.cell_ptrs_start..cell_ptrs_end])
 }
 
-fn local_payload_len(usable_size: usize, payload_len: usize) -> Result<usize> {
+pub(crate) fn local_payload_len(usable_size: usize, payload_len: usize) -> Result<usize> {
     if payload_len == 0 {
         return Ok(0);
     }

@@ -174,7 +174,7 @@ impl<'a> PageRef<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PageId(NonZero<u32>);
 
 impl PageId {

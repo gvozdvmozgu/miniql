@@ -49,3 +49,7 @@ memmap2 = "0.9"
 [[bench]]
 name = "read_table"
 harness = false
+
+[[bench]]
+name = "join"
+harness = false

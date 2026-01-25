@@ -170,12 +170,21 @@ impl ScanScratch {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Row<'row> {
     values: &'row [ValueRefRaw],
     proj_map: Option<&'row [usize]>,
 }
 
 impl<'row> Row<'row> {
+    pub(crate) fn from_raw(values: &'row [ValueRefRaw], proj_map: Option<&'row [usize]>) -> Self {
+        Self { values, proj_map }
+    }
+
+    pub(crate) fn values_raw(&self) -> &'row [ValueRefRaw] {
+        self.values
+    }
+
     pub fn len(&self) -> usize {
         self.proj_map.map_or(self.values.len(), |map| map.len())
     }
@@ -258,6 +267,7 @@ pub struct CompiledScan<'db> {
     compiled_expr: Option<CompiledExpr>,
     filter_fn: Option<FilterFn<'db>>,
     limit: Option<usize>,
+    col_count: Option<usize>,
 }
 
 impl<'db> Scan<'db> {
@@ -290,6 +300,15 @@ impl<'db> Scan<'db> {
         self
     }
 
+    pub(crate) fn projection(&self) -> Option<&[u16]> {
+        self.projection.as_deref()
+    }
+
+    pub(crate) fn with_projection_override(mut self, projection: Option<Vec<u16>>) -> Self {
+        self.projection = projection;
+        self
+    }
+
     pub fn compile(self) -> table::Result<CompiledScan<'db>> {
         let Scan { pager, root, projection, filter_expr, filter_fn, limit } = self;
 
@@ -304,7 +323,7 @@ impl<'db> Scan<'db> {
             .map(|expr| compile_expr(expr, plan.needed_cols.as_deref()))
             .transpose()?;
 
-        Ok(CompiledScan { pager, root, plan, compiled_expr, filter_fn, limit })
+        Ok(CompiledScan { pager, root, plan, compiled_expr, filter_fn, limit, col_count: None })
     }
 
     pub fn for_each<F>(self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
@@ -317,6 +336,68 @@ impl<'db> Scan<'db> {
 }
 
 impl<'db> CompiledScan<'db> {
+    pub(crate) fn pager(&self) -> &'db Pager {
+        self.pager
+    }
+
+    pub(crate) fn root(&self) -> PageId {
+        self.root
+    }
+
+    pub(crate) fn proj_map(&self) -> Option<&[usize]> {
+        self.plan.proj_map.as_deref()
+    }
+
+    pub(crate) fn column_count_hint(&self) -> Option<usize> {
+        self.col_count
+    }
+
+    pub(crate) fn eval_payload<'row>(
+        &'row mut self,
+        payload: &'row [u8],
+        decoded: &'row mut Vec<ValueRefRaw>,
+    ) -> table::Result<Option<Row<'row>>> {
+        self.eval_payload_with_filters(payload, decoded, true)
+    }
+
+    pub(crate) fn eval_payload_with_filters<'row>(
+        &'row mut self,
+        payload: &'row [u8],
+        decoded: &'row mut Vec<ValueRefRaw>,
+        apply_filters: bool,
+    ) -> table::Result<Option<Row<'row>>> {
+        let needed_cols = self.plan.needed_cols.as_deref();
+        let count = table::decode_record_project_into(payload, needed_cols, decoded)?;
+
+        if self.col_count.is_none() {
+            if let Some(err) = validate_columns(&self.plan.referenced_cols, count) {
+                return Err(err);
+            }
+            self.col_count = Some(count);
+        }
+
+        let values = decoded.as_slice();
+        let row_eval = RowEval { values, column_count: count };
+
+        if apply_filters {
+            if let Some(expr) = self.compiled_expr.as_ref()
+                && eval_compiled_expr(expr, &row_eval)? != Truth::True
+            {
+                return Ok(None);
+            }
+
+            if let Some(filter_fn) = self.filter_fn.as_mut() {
+                let row_full = Row { values, proj_map: None };
+                if !filter_fn(&row_full)? {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let row = Row { values, proj_map: self.plan.proj_map.as_deref() };
+        Ok(Some(row))
+    }
+
     pub fn for_each<F>(&mut self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
     where
         F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
@@ -327,12 +408,8 @@ impl<'db> CompiledScan<'db> {
 
         let pager = self.pager;
         let root = self.root;
-        let plan = &self.plan;
-        let compiled_expr = self.compiled_expr.as_ref();
-        let filter_fn = &mut self.filter_fn;
         let limit = self.limit;
         let mut seen = 0usize;
-        let mut col_count: Option<usize> = None;
 
         let (decoded, overflow_buf, btree_stack) = scratch.split_mut();
 
@@ -342,35 +419,10 @@ impl<'db> CompiledScan<'db> {
             overflow_buf,
             btree_stack,
             |rowid, payload| {
-                decoded.clear();
-
-                let needed_cols = plan.needed_cols.as_deref();
-                let count = table::decode_record_project_into(payload, needed_cols, decoded)?;
-
-                if col_count.is_none() {
-                    if let Some(err) = validate_columns(&plan.referenced_cols, count) {
-                        return Err(err);
-                    }
-                    col_count = Some(count);
-                }
-
-                let values = decoded.as_slice();
-                let row_eval = RowEval { values, column_count: count };
-
-                if let Some(expr) = compiled_expr.as_ref()
-                    && eval_compiled_expr(expr, &row_eval)? != Truth::True
-                {
+                let Some(row) = self.eval_payload(payload, decoded)? else {
                     return Ok(None);
-                }
+                };
 
-                if let Some(filter_fn) = filter_fn.as_mut() {
-                    let row_full = Row { values, proj_map: None };
-                    if !filter_fn(&row_full)? {
-                        return Ok(None);
-                    }
-                }
-
-                let row = Row { values, proj_map: plan.proj_map.as_deref() };
                 cb(rowid, row)?;
                 seen += 1;
 
