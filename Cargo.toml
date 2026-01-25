@@ -44,6 +44,8 @@ edition.workspace = true
 codspeed-criterion-compat = "4"
 
 [dependencies]
+bumpalo = "3.19"
+hashbrown = "0.16"
 memmap2 = "0.9"
 rustc-hash = "2.1"
 

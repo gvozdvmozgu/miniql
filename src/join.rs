@@ -1,6 +1,11 @@
+use std::borrow::Borrow;
 use std::collections::hash_map::Entry;
+use std::hash::{Hash, Hasher};
+use std::ptr::NonNull;
 
-use rustc_hash::FxHashMap;
+use bumpalo::Bump;
+use hashbrown::HashMap as HbHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::index::{self, IndexCursor, IndexScratch};
 use crate::pager::{PageId, Pager};
@@ -82,13 +87,13 @@ pub struct Join<'db> {
 const NULL_ROWID: i64 = 0;
 
 pub struct PreparedJoin<'db> {
-    join_type: JoinType,
     left: PreparedScan<'db>,
     right: PreparedScan<'db>,
     left_meta: SideMeta,
     right_meta: SideMeta,
     plan: JoinPlan,
     hash_mem_limit: Option<usize>,
+    right_null_len: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -152,7 +157,7 @@ impl<'db> Join<'db> {
         let left_key = self.left_key.ok_or(JoinError::MissingJoinCondition)?;
         let right_key = self.right_key.ok_or(JoinError::MissingJoinCondition)?;
 
-        let ((left_scan, left_meta), (right_scan, right_meta)) = build_sides(
+        let ((left_scan, left_meta), (mut right_scan, right_meta)) = build_sides(
             self.left,
             self.right,
             left_key,
@@ -187,14 +192,29 @@ impl<'db> Join<'db> {
             }
         };
 
+        let right_null_len = if matches!(self.join_type, JoinType::Left) {
+            let mut right_values = Vec::new();
+            let mut right_bytes = Vec::new();
+            let mut right_serials = Vec::new();
+            Some(resolve_right_null_len(
+                &mut right_scan,
+                &right_meta,
+                &mut right_values,
+                &mut right_bytes,
+                &mut right_serials,
+            )?)
+        } else {
+            None
+        };
+
         Ok(PreparedJoin {
-            join_type: self.join_type,
             left: left_scan,
             right: right_scan,
             left_meta,
             right_meta,
             plan,
             hash_mem_limit: self.hash_mem_limit,
+            right_null_len,
         })
     }
 
@@ -219,20 +239,10 @@ impl<'db> PreparedJoin<'db> {
             right_bytes,
             right_serials,
             index_scratch,
+            hash_state,
             right_nulls,
         ) = scratch.split_mut();
-
-        let right_null_len = if matches!(self.join_type, JoinType::Left) {
-            Some(resolve_right_null_len(
-                &mut self.right,
-                &self.right_meta,
-                right_values,
-                right_bytes,
-                right_serials,
-            )?)
-        } else {
-            None
-        };
+        let right_null_len = self.right_null_len;
 
         match self.plan {
             JoinPlan::IndexNestedLoop { index_root, index_key_col } => index_nested_loop(
@@ -262,6 +272,7 @@ impl<'db> PreparedJoin<'db> {
                 right_values,
                 right_bytes,
                 right_serials,
+                hash_state,
                 right_nulls,
                 right_null_len,
                 &mut cb,
@@ -309,6 +320,7 @@ pub struct JoinScratch {
     right_bytes: Vec<u8>,
     right_serials: Vec<u64>,
     index: IndexScratch,
+    hash: HashState,
     right_nulls: Vec<ValueSlot>,
 }
 
@@ -319,6 +331,7 @@ type JoinScratchParts<'a> = (
     &'a mut Vec<u8>,
     &'a mut Vec<u64>,
     &'a mut IndexScratch,
+    &'a mut HashState,
     &'a mut Vec<ValueSlot>,
 );
 
@@ -331,6 +344,7 @@ impl JoinScratch {
             right_bytes: Vec::new(),
             right_serials: Vec::new(),
             index: IndexScratch::new(),
+            hash: HashState::new(),
             right_nulls: Vec::new(),
         }
     }
@@ -343,6 +357,7 @@ impl JoinScratch {
             right_bytes: Vec::with_capacity(overflow),
             right_serials: Vec::with_capacity(right_values),
             index: IndexScratch::with_capacity(right_values, overflow),
+            hash: HashState::with_capacity(right_values, overflow),
             right_nulls: Vec::with_capacity(right_values),
         }
     }
@@ -355,6 +370,7 @@ impl JoinScratch {
             &mut self.right_bytes,
             &mut self.right_serials,
             &mut self.index,
+            &mut self.hash,
             &mut self.right_nulls,
         )
     }
@@ -619,6 +635,101 @@ impl RowIdList {
     }
 }
 
+// BytesKey points into HashState::arena. Keys are only valid until
+// HashState::clear() which clears the maps before resetting the arena.
+#[derive(Clone, Copy)]
+struct BytesKey {
+    ptr: NonNull<u8>,
+    len: u32,
+}
+
+impl BytesKey {
+    fn from_slice_in(arena: &Bump, bytes: &[u8]) -> Self {
+        if bytes.is_empty() {
+            return Self { ptr: NonNull::dangling(), len: 0 };
+        }
+        debug_assert!(bytes.len() <= u32::MAX as usize);
+        let stored = arena.alloc_slice_copy(bytes);
+        // SAFETY: bump allocation returns a valid, non-null pointer for the slice.
+        let ptr = unsafe { NonNull::new_unchecked(stored.as_mut_ptr()) };
+        let len = bytes.len() as u32;
+        Self { ptr, len }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        // SAFETY: pointer comes from the arena and is valid until HashState::clear.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
+    }
+}
+
+impl Borrow<[u8]> for BytesKey {
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for BytesKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for BytesKey {}
+
+impl Hash for BytesKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
+struct HashState {
+    numeric: FxHashMap<u64, RowIdList>,
+    text: HbHashMap<BytesKey, RowIdList, FxBuildHasher>,
+    blob: HbHashMap<BytesKey, RowIdList, FxBuildHasher>,
+    arena: Bump,
+}
+
+impl HashState {
+    fn new() -> Self {
+        Self {
+            numeric: FxHashMap::default(),
+            text: HbHashMap::with_hasher(FxBuildHasher),
+            blob: HbHashMap::with_hasher(FxBuildHasher),
+            arena: Bump::new(),
+        }
+    }
+
+    fn with_capacity(keys: usize, bytes: usize) -> Self {
+        let arena = if bytes > 0 { Bump::with_capacity(bytes) } else { Bump::new() };
+        Self {
+            numeric: FxHashMap::with_capacity_and_hasher(keys, FxBuildHasher),
+            text: HbHashMap::with_capacity_and_hasher(keys, FxBuildHasher),
+            blob: HbHashMap::with_capacity_and_hasher(keys, FxBuildHasher),
+            arena,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.numeric.clear();
+        self.text.clear();
+        self.blob.clear();
+        self.arena.reset();
+    }
+}
+
+impl std::fmt::Debug for HashState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HashState")
+            .field("numeric_len", &self.numeric.len())
+            .field("text_len", &self.text.len())
+            .field("blob_len", &self.blob.len())
+            .finish()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hash_join<F>(
     left_scan: &mut PreparedScan<'_>,
@@ -631,6 +742,7 @@ fn hash_join<F>(
     right_values: &mut Vec<ValueSlot>,
     right_bytes: &mut Vec<u8>,
     right_serials: &mut Vec<u64>,
+    hash_state: &mut HashState,
     right_nulls: &mut Vec<ValueSlot>,
     right_null_len: Option<usize>,
     cb: &mut F,
@@ -639,9 +751,11 @@ where
     F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
 {
     let mut mem = MemTracker::new(mem_limit);
-    let mut numeric: FxHashMap<u64, RowIdList> = FxHashMap::default();
-    let mut text: FxHashMap<Box<[u8]>, RowIdList> = FxHashMap::default();
-    let mut blob: FxHashMap<Box<[u8]>, RowIdList> = FxHashMap::default();
+    hash_state.clear();
+    let arena = &hash_state.arena;
+    let numeric = &mut hash_state.numeric;
+    let text = &mut hash_state.text;
+    let blob = &mut hash_state.blob;
 
     right_scan.for_each(right_scratch, |rowid, row| {
         let Some(key_ref) = join_key_ref(right_meta, rowid, &row)? else {
@@ -658,26 +772,26 @@ where
                     e.insert(RowIdList::new(rowid));
                 }
             },
-            HashKeyRef::Text(bytes) => match text.entry(bytes.to_vec().into_boxed_slice()) {
-                Entry::Occupied(mut e) => {
-                    let (old, new) = e.get_mut().push(rowid);
+            HashKeyRef::Text(bytes) => {
+                if let Some(list) = text.get_mut(bytes) {
+                    let (old, new) = list.push(rowid);
                     mem.charge_capacity_growth(old, new)?;
-                }
-                Entry::Vacant(e) => {
+                } else {
                     mem.charge(bytes.len())?;
-                    e.insert(RowIdList::new(rowid));
+                    let key = BytesKey::from_slice_in(arena, bytes);
+                    text.insert(key, RowIdList::new(rowid));
                 }
-            },
-            HashKeyRef::Blob(bytes) => match blob.entry(bytes.to_vec().into_boxed_slice()) {
-                Entry::Occupied(mut e) => {
-                    let (old, new) = e.get_mut().push(rowid);
+            }
+            HashKeyRef::Blob(bytes) => {
+                if let Some(list) = blob.get_mut(bytes) {
+                    let (old, new) = list.push(rowid);
                     mem.charge_capacity_growth(old, new)?;
-                }
-                Entry::Vacant(e) => {
+                } else {
                     mem.charge(bytes.len())?;
-                    e.insert(RowIdList::new(rowid));
+                    let key = BytesKey::from_slice_in(arena, bytes);
+                    blob.insert(key, RowIdList::new(rowid));
                 }
-            },
+            }
         }
         Ok(())
     })?;
