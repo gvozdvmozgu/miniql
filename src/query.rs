@@ -150,7 +150,6 @@ impl std::ops::Not for Expr {
 pub struct ScanScratch {
     decoded: Vec<ValueRefRaw>,
     overflow_buf: Vec<u8>,
-    pending: Vec<table::PendingBytes>,
     btree_stack: Vec<PageId>,
 }
 
@@ -163,16 +162,12 @@ impl ScanScratch {
         Self {
             decoded: Vec::with_capacity(values),
             overflow_buf: Vec::with_capacity(overflow),
-            pending: Vec::with_capacity(values),
             btree_stack: Vec::new(),
         }
     }
 
-    pub(crate) fn split_mut(
-        &mut self,
-    ) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>, &mut Vec<PageId>, &mut Vec<table::PendingBytes>)
-    {
-        (&mut self.decoded, &mut self.overflow_buf, &mut self.btree_stack, &mut self.pending)
+    pub(crate) fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>, &mut Vec<PageId>) {
+        (&mut self.decoded, &mut self.overflow_buf, &mut self.btree_stack)
     }
 }
 
@@ -398,9 +393,8 @@ impl<'db> PreparedScan<'db> {
         payload: table::RecordPayload<'row>,
         decoded: &'row mut Vec<ValueRefRaw>,
         spill: &'row mut Vec<u8>,
-        pending: &'row mut Vec<table::PendingBytes>,
     ) -> table::Result<Option<Row<'row>>> {
-        self.eval_payload_with_filters(payload, decoded, spill, pending, true)
+        self.eval_payload_with_filters(payload, decoded, spill, true)
     }
 
     pub(crate) fn eval_payload_with_filters<'row>(
@@ -408,12 +402,10 @@ impl<'db> PreparedScan<'db> {
         payload: table::RecordPayload<'row>,
         decoded: &'row mut Vec<ValueRefRaw>,
         spill: &'row mut Vec<u8>,
-        pending: &'row mut Vec<table::PendingBytes>,
         apply_filters: bool,
     ) -> table::Result<Option<Row<'row>>> {
         let needed_cols = self.plan.needed_cols.as_deref();
-        let count =
-            table::decode_record_project_into(payload, needed_cols, decoded, spill, pending)?;
+        let count = table::decode_record_project_into(payload, needed_cols, decoded, spill)?;
 
         if let Some(expected) = self.col_count {
             if expected != count {
@@ -463,14 +455,14 @@ impl<'db> PreparedScan<'db> {
         let limit = self.limit;
         let mut seen = 0usize;
 
-        let (decoded, overflow_buf, btree_stack, pending) = scratch.split_mut();
+        let (decoded, overflow_buf, btree_stack) = scratch.split_mut();
 
         table::scan_table_cells_with_scratch_and_stack_until(
             pager,
             root,
             btree_stack,
             |rowid, payload| {
-                let Some(row) = self.eval_payload(payload, decoded, overflow_buf, pending)? else {
+                let Some(row) = self.eval_payload(payload, decoded, overflow_buf)? else {
                     return Ok(None);
                 };
 
@@ -930,13 +922,11 @@ mod tests {
         let needed = vec![0u16, 2u16];
         let mut decoded = Vec::with_capacity(needed.len());
         let mut spill = Vec::new();
-        let mut pending = Vec::with_capacity(needed.len());
         let _ = table::decode_record_project_into(
             table::RecordPayload::Inline(&payload),
             Some(&needed),
             &mut decoded,
             &mut spill,
-            &mut pending,
         )
         .expect("decode");
         assert_eq!(decoded.len(), 2);

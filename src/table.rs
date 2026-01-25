@@ -316,7 +316,6 @@ pub struct TableRow {
 pub struct RowScratch {
     values: Vec<ValueRefRaw>,
     overflow_buf: Vec<u8>,
-    pending: Vec<PendingBytes>,
     btree_stack: Vec<PageId>,
 }
 
@@ -329,7 +328,6 @@ impl RowScratch {
         Self {
             values: Vec::with_capacity(values),
             overflow_buf: Vec::with_capacity(overflow),
-            pending: Vec::with_capacity(values),
             btree_stack: Vec::new(),
         }
     }
@@ -345,11 +343,10 @@ impl RowScratch {
     fn prepare_row(&mut self) {
         self.values.clear();
         self.overflow_buf.clear();
-        self.pending.clear();
     }
 
-    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>, &mut Vec<PendingBytes>) {
-        (&mut self.values, &mut self.overflow_buf, &mut self.pending)
+    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>) {
+        (&mut self.values, &mut self.overflow_buf)
     }
 
     fn values_slice(&self) -> &[ValueRefRaw] {
@@ -834,7 +831,7 @@ fn read_table_cell_into(
     scratch: &mut RowScratch,
 ) -> Result<i64> {
     scratch.prepare_row();
-    let (values, spill, pending) = scratch.split_mut();
+    let (values, spill) = scratch.split_mut();
     let usable = page.usable_bytes();
     if offset as usize >= usable.len() {
         return Err(Error::Corrupted("cell offset out of bounds"));
@@ -888,7 +885,7 @@ fn read_table_cell_into(
 
     let payload =
         OverflowPayload::new(pager, payload_length, &usable[start..end_local], overflow_page);
-    decode_record_into_overflow(&payload, values, spill, pending)?;
+    decode_record_into_overflow(&payload, values, spill)?;
     Ok(rowid)
 }
 
@@ -1102,20 +1099,6 @@ enum ValueBytes {
     Spill { start: usize, len: usize },
 }
 
-#[derive(Debug)]
-enum PendingKind {
-    Text,
-    Blob,
-}
-
-#[derive(Debug)]
-pub(crate) struct PendingBytes {
-    out_index: usize,
-    start: usize,
-    len: usize,
-    kind: PendingKind,
-}
-
 fn push_checked<T>(out: &mut Vec<T>, value: T, kind: &'static str) -> Result<()> {
     if out.len() == out.capacity() {
         let needed = out.len().saturating_add(1);
@@ -1323,11 +1306,9 @@ fn decode_record_project_into_overflow(
     needed_cols: Option<&[u16]>,
     out: &mut Vec<ValueRefRaw>,
     spill: &mut Vec<u8>,
-    pending: &mut Vec<PendingBytes>,
 ) -> Result<usize> {
     out.clear();
     spill.clear();
-    pending.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
     let header_len = serial_cursor.read_varint("record header truncated")? as usize;
@@ -1348,33 +1329,13 @@ fn decode_record_project_into_overflow(
             }
             let col_idx = column_count as u16;
             if Some(col_idx) == next_needed {
-                let decoded = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
-                match decoded {
-                    DecodedValue::Ready(raw) => push_checked(out, raw, "values")?,
-                    DecodedValue::Spill { start, len, kind } => {
-                        let out_index = out.len();
-                        push_checked(out, ValueRefRaw::Null, "values")?;
-                        push_checked(
-                            pending,
-                            PendingBytes { out_index, start, len, kind },
-                            "pending",
-                        )?;
-                    }
-                }
+                let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
+                push_checked(out, raw, "values")?;
                 next_needed = needed_iter.next();
             } else {
                 skip_value_at_cursor(serial, &mut value_cursor)?;
             }
             column_count += 1;
-        }
-
-        for pending in pending {
-            let slice = &spill[pending.start..pending.start + pending.len];
-            let raw = RawBytes::from_slice(slice);
-            out[pending.out_index] = match pending.kind {
-                PendingKind::Text => ValueRefRaw::Text(raw),
-                PendingKind::Blob => ValueRefRaw::Blob(raw),
-            };
         }
 
         Ok(column_count)
@@ -1385,25 +1346,9 @@ fn decode_record_project_into_overflow(
             if serial_cursor.position() > header_len {
                 return Err(Error::Corrupted("record header truncated"));
             }
-            let decoded = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
-            match decoded {
-                DecodedValue::Ready(raw) => push_checked(out, raw, "values")?,
-                DecodedValue::Spill { start, len, kind } => {
-                    let out_index = out.len();
-                    push_checked(out, ValueRefRaw::Null, "values")?;
-                    push_checked(pending, PendingBytes { out_index, start, len, kind }, "pending")?;
-                }
-            }
+            let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
+            push_checked(out, raw, "values")?;
             column_count += 1;
-        }
-
-        for pending in pending {
-            let slice = &spill[pending.start..pending.start + pending.len];
-            let raw = RawBytes::from_slice(slice);
-            out[pending.out_index] = match pending.kind {
-                PendingKind::Text => ValueRefRaw::Text(raw),
-                PendingKind::Blob => ValueRefRaw::Blob(raw),
-            };
         }
 
         Ok(column_count)
@@ -1415,13 +1360,11 @@ pub(crate) fn decode_record_project_into(
     needed_cols: Option<&[u16]>,
     out: &mut Vec<ValueRefRaw>,
     spill: &mut Vec<u8>,
-    pending: &mut Vec<PendingBytes>,
 ) -> Result<usize> {
-    pending.clear();
     match payload {
         RecordPayload::Inline(bytes) => decode_record_project_into_bytes(bytes, needed_cols, out),
         RecordPayload::Overflow(payload) => {
-            decode_record_project_into_overflow(&payload, needed_cols, out, spill, pending)
+            decode_record_project_into_overflow(&payload, needed_cols, out, spill)
         }
     }
 }
@@ -1578,11 +1521,9 @@ fn decode_record_into_overflow(
     payload: &OverflowPayload<'_>,
     out: &mut Vec<ValueRefRaw>,
     spill: &mut Vec<u8>,
-    pending: &mut Vec<PendingBytes>,
 ) -> Result<()> {
     out.clear();
     spill.clear();
-    pending.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
     let header_len = serial_cursor.read_varint("record header truncated")? as usize;
@@ -1597,24 +1538,8 @@ fn decode_record_into_overflow(
         if serial_cursor.position() > header_len {
             return Err(Error::Corrupted("record header truncated"));
         }
-        let decoded = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
-        match decoded {
-            DecodedValue::Ready(raw) => push_checked(out, raw, "values")?,
-            DecodedValue::Spill { start, len, kind } => {
-                let out_index = out.len();
-                push_checked(out, ValueRefRaw::Null, "values")?;
-                push_checked(pending, PendingBytes { out_index, start, len, kind }, "pending")?;
-            }
-        }
-    }
-
-    for pending in pending {
-        let slice = &spill[pending.start..pending.start + pending.len];
-        let raw = RawBytes::from_slice(slice);
-        out[pending.out_index] = match pending.kind {
-            PendingKind::Text => ValueRefRaw::Text(raw),
-            PendingKind::Blob => ValueRefRaw::Blob(raw),
-        };
+        let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
+        push_checked(out, raw, "values")?;
     }
 
     Ok(())
@@ -1645,18 +1570,7 @@ fn decode_record_column_overflow(
         }
 
         if idx == target {
-            let decoded = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
-            let raw = match decoded {
-                DecodedValue::Ready(raw) => raw,
-                DecodedValue::Spill { start, len, kind } => {
-                    let slice = &spill[start..start + len];
-                    let raw = RawBytes::from_slice(slice);
-                    match kind {
-                        PendingKind::Text => ValueRefRaw::Text(raw),
-                        PendingKind::Blob => ValueRefRaw::Blob(raw),
-                    }
-                }
-            };
+            let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
             return Ok(Some(raw));
         } else {
             skip_value_at_cursor(serial, &mut value_cursor)?;
@@ -1718,42 +1632,39 @@ fn decode_value_ref_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Resul
     Ok(value)
 }
 
-enum DecodedValue {
-    Ready(ValueRefRaw),
-    Spill { start: usize, len: usize, kind: PendingKind },
-}
-
 fn decode_value_ref_at_cursor(
     serial_type: u64,
     cursor: &mut OverflowCursor<'_>,
     spill: &mut Vec<u8>,
-) -> Result<DecodedValue> {
+) -> Result<ValueRefRaw> {
     let value = match serial_type {
-        0 => DecodedValue::Ready(ValueRefRaw::Null),
-        1 => DecodedValue::Ready(ValueRefRaw::Integer(cursor.read_signed_be(1)?)),
-        2 => DecodedValue::Ready(ValueRefRaw::Integer(cursor.read_signed_be(2)?)),
-        3 => DecodedValue::Ready(ValueRefRaw::Integer(cursor.read_signed_be(3)?)),
-        4 => DecodedValue::Ready(ValueRefRaw::Integer(cursor.read_signed_be(4)?)),
-        5 => DecodedValue::Ready(ValueRefRaw::Integer(cursor.read_signed_be(6)?)),
-        6 => DecodedValue::Ready(ValueRefRaw::Integer(cursor.read_signed_be(8)?)),
-        7 => DecodedValue::Ready(ValueRefRaw::Real(f64::from_bits(cursor.read_u64_be()?))),
-        8 => DecodedValue::Ready(ValueRefRaw::Integer(0)),
-        9 => DecodedValue::Ready(ValueRefRaw::Integer(1)),
+        0 => ValueRefRaw::Null,
+        1 => ValueRefRaw::Integer(cursor.read_signed_be(1)?),
+        2 => ValueRefRaw::Integer(cursor.read_signed_be(2)?),
+        3 => ValueRefRaw::Integer(cursor.read_signed_be(3)?),
+        4 => ValueRefRaw::Integer(cursor.read_signed_be(4)?),
+        5 => ValueRefRaw::Integer(cursor.read_signed_be(6)?),
+        6 => ValueRefRaw::Integer(cursor.read_signed_be(8)?),
+        7 => ValueRefRaw::Real(f64::from_bits(cursor.read_u64_be()?)),
+        8 => ValueRefRaw::Integer(0),
+        9 => ValueRefRaw::Integer(1),
         serial if serial >= 12 && serial % 2 == 0 => {
             let len = ((serial - 12) / 2) as usize;
             match cursor.read_value_bytes(len, spill)? {
-                ValueBytes::Inline(raw) => DecodedValue::Ready(ValueRefRaw::Blob(raw)),
+                ValueBytes::Inline(raw) => ValueRefRaw::Blob(raw),
                 ValueBytes::Spill { start, len } => {
-                    DecodedValue::Spill { start, len, kind: PendingKind::Blob }
+                    let slice = &spill[start..start + len];
+                    ValueRefRaw::Blob(RawBytes::from_slice(slice))
                 }
             }
         }
         serial if serial >= 13 => {
             let len = ((serial - 13) / 2) as usize;
             match cursor.read_value_bytes(len, spill)? {
-                ValueBytes::Inline(raw) => DecodedValue::Ready(ValueRefRaw::Text(raw)),
+                ValueBytes::Inline(raw) => ValueRefRaw::Text(raw),
                 ValueBytes::Spill { start, len } => {
-                    DecodedValue::Spill { start, len, kind: PendingKind::Text }
+                    let slice = &spill[start..start + len];
+                    ValueRefRaw::Text(RawBytes::from_slice(slice))
                 }
             }
         }
