@@ -47,7 +47,7 @@ pub enum ValueLit {
     Null,
     Integer(i64),
     Real(f64),
-    TextBytes(Vec<u8>),
+    Text(Vec<u8>),
 }
 
 pub fn col(i: u16) -> Expr {
@@ -63,7 +63,7 @@ pub fn lit_f64(v: f64) -> Expr {
 }
 
 pub fn lit_bytes(v: impl Into<Vec<u8>>) -> Expr {
-    Expr::Lit(ValueLit::TextBytes(v.into()))
+    Expr::Lit(ValueLit::Text(v.into()))
 }
 
 pub fn lit_null() -> Expr {
@@ -166,7 +166,7 @@ impl ScanScratch {
         }
     }
 
-    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>, &mut Vec<PageId>) {
+    pub(crate) fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>, &mut Vec<PageId>) {
         (&mut self.decoded, &mut self.overflow_buf, &mut self.btree_stack)
     }
 }
@@ -228,7 +228,7 @@ impl<'row> Row<'row> {
 
     pub fn get_text(&self, i: usize) -> table::Result<&'row str> {
         match self.get(i) {
-            Some(ValueRef::TextBytes(bytes)) => Ok(std::str::from_utf8(bytes)?),
+            Some(ValueRef::Text(bytes)) => Ok(std::str::from_utf8(bytes)?),
             Some(other) => {
                 Err(table::Error::TypeMismatch { col: i, expected: "TEXT", got: value_kind(other) })
             }
@@ -238,7 +238,7 @@ impl<'row> Row<'row> {
 
     pub fn get_bytes(&self, i: usize) -> table::Result<&'row [u8]> {
         match self.get(i) {
-            Some(ValueRef::TextBytes(bytes)) => Ok(bytes),
+            Some(ValueRef::Text(bytes)) => Ok(bytes),
             Some(ValueRef::Blob(bytes)) => Ok(bytes),
             Some(other) => Err(table::Error::TypeMismatch {
                 col: i,
@@ -255,13 +255,14 @@ type FilterFn<'db> = Box<dyn for<'row> FnMut(&Row<'row>) -> table::Result<bool> 
 pub struct Scan<'db> {
     pager: &'db Pager,
     root: PageId,
+    col_count_hint: Option<usize>,
     projection: Option<Vec<u16>>,
     filter_expr: Option<Expr>,
     filter_fn: Option<FilterFn<'db>>,
     limit: Option<usize>,
 }
 
-pub struct CompiledScan<'db> {
+pub struct PreparedScan<'db> {
     pager: &'db Pager,
     root: PageId,
     plan: Plan,
@@ -271,9 +272,36 @@ pub struct CompiledScan<'db> {
     col_count: Option<usize>,
 }
 
+#[deprecated(note = "use PreparedScan")]
+pub type CompiledScan<'db> = PreparedScan<'db>;
+
 impl<'db> Scan<'db> {
     pub fn table(pager: &'db Pager, root: PageId) -> Self {
-        Self { pager, root, projection: None, filter_expr: None, filter_fn: None, limit: None }
+        Self {
+            pager,
+            root,
+            col_count_hint: None,
+            projection: None,
+            filter_expr: None,
+            filter_fn: None,
+            limit: None,
+        }
+    }
+
+    pub(crate) fn from_root_with_hint(
+        pager: &'db Pager,
+        root: PageId,
+        col_count_hint: Option<usize>,
+    ) -> Self {
+        Self {
+            pager,
+            root,
+            col_count_hint,
+            projection: None,
+            filter_expr: None,
+            filter_fn: None,
+            limit: None,
+        }
     }
 
     pub fn project<const N: usize>(mut self, cols: [u16; N]) -> Self {
@@ -310,33 +338,40 @@ impl<'db> Scan<'db> {
         self
     }
 
-    pub fn compile(self) -> table::Result<CompiledScan<'db>> {
-        let Scan { pager, root, projection, filter_expr, filter_fn, limit } = self;
+    pub fn compile(self) -> table::Result<PreparedScan<'db>> {
+        let Scan { pager, root, col_count_hint, projection, filter_expr, filter_fn, limit } = self;
 
         let mut pred_cols = Vec::new();
         if let Some(expr) = &filter_expr {
             expr.collect_cols(&mut pred_cols);
         }
 
-        let plan = build_plan(projection.as_ref(), &pred_cols, filter_fn.is_some());
+        let plan = build_plan(projection.as_ref(), &pred_cols, false);
         let compiled_expr = filter_expr
             .as_ref()
             .map(|expr| compile_expr(expr, plan.needed_cols.as_deref()))
             .transpose()?;
 
-        Ok(CompiledScan { pager, root, plan, compiled_expr, filter_fn, limit, col_count: None })
+        let col_count = col_count_hint;
+        if let Some(count) = col_count
+            && let Some(err) = validate_columns(&plan.referenced_cols, count)
+        {
+            return Err(err);
+        }
+
+        Ok(PreparedScan { pager, root, plan, compiled_expr, filter_fn, limit, col_count })
     }
 
     pub fn for_each<F>(self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
     where
         F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
     {
-        let mut compiled = self.compile()?;
-        compiled.for_each(scratch, &mut cb)
+        let mut prepared = self.compile()?;
+        prepared.for_each(scratch, &mut cb)
     }
 }
 
-impl<'db> CompiledScan<'db> {
+impl<'db> PreparedScan<'db> {
     pub(crate) fn pager(&self) -> &'db Pager {
         self.pager
     }
@@ -372,7 +407,13 @@ impl<'db> CompiledScan<'db> {
         let needed_cols = self.plan.needed_cols.as_deref();
         let count = table::decode_record_project_into(payload, needed_cols, decoded, spill)?;
 
-        if self.col_count.is_none() {
+        if let Some(expected) = self.col_count {
+            if expected != count {
+                return Err(table::Error::Corrupted(
+                    "row column count does not match table schema",
+                ));
+            }
+        } else {
             if let Some(err) = validate_columns(&self.plan.referenced_cols, count) {
                 return Err(err);
             }
@@ -390,8 +431,8 @@ impl<'db> CompiledScan<'db> {
             }
 
             if let Some(filter_fn) = self.filter_fn.as_mut() {
-                let row_full = Row { values, proj_map: None };
-                if !filter_fn(&row_full)? {
+                let row = Row { values, proj_map: self.plan.proj_map.as_deref() };
+                if !filter_fn(&row)? {
                     return Ok(None);
                 }
             }
@@ -634,7 +675,7 @@ fn value_kind(value: ValueRef<'_>) -> &'static str {
         ValueRef::Null => "NULL",
         ValueRef::Integer(_) => "INTEGER",
         ValueRef::Real(_) => "REAL",
-        ValueRef::TextBytes(_) => "TEXT",
+        ValueRef::Text(_) => "TEXT",
         ValueRef::Blob(_) => "BLOB",
     }
 }
@@ -801,7 +842,7 @@ impl ValueLit {
             ValueLit::Null => ValueRef::Null,
             ValueLit::Integer(value) => ValueRef::Integer(*value),
             ValueLit::Real(value) => ValueRef::Real(*value),
-            ValueLit::TextBytes(bytes) => ValueRef::TextBytes(bytes.as_slice()),
+            ValueLit::Text(bytes) => ValueRef::Text(bytes.as_slice()),
         }
     }
 }
@@ -813,7 +854,7 @@ fn compare<'a, 'b>(op: CmpOp, left: ValueRef<'a>, right: ValueRef<'b>) -> Truth 
         (ValueRef::Integer(l), ValueRef::Real(r)) => cmp_f64(op, l as f64, r),
         (ValueRef::Real(l), ValueRef::Integer(r)) => cmp_f64(op, l, r as f64),
         (ValueRef::Real(l), ValueRef::Real(r)) => cmp_f64(op, l, r),
-        (ValueRef::TextBytes(l), ValueRef::TextBytes(r)) => cmp_order(op, l.cmp(r)),
+        (ValueRef::Text(l), ValueRef::Text(r)) => cmp_order(op, l.cmp(r)),
         (ValueRef::Blob(l), ValueRef::Blob(r)) => cmp_order(op, l.cmp(r)),
         _ => Truth::False,
     }
@@ -904,7 +945,7 @@ mod tests {
                     _ => 6,
                 },
                 ValueRef::Real(_) => 7,
-                ValueRef::TextBytes(bytes) => 13 + (bytes.len() as u64) * 2,
+                ValueRef::Text(bytes) => 13 + (bytes.len() as u64) * 2,
                 ValueRef::Blob(bytes) => 12 + (bytes.len() as u64) * 2,
             };
             push_varint(&mut header, serial);
@@ -938,9 +979,7 @@ mod tests {
                     record.extend_from_slice(&bytes[8 - len..]);
                 }
                 ValueRef::Real(v) => record.extend_from_slice(&v.to_bits().to_be_bytes()),
-                ValueRef::TextBytes(bytes) | ValueRef::Blob(bytes) => {
-                    record.extend_from_slice(bytes)
-                }
+                ValueRef::Text(bytes) | ValueRef::Blob(bytes) => record.extend_from_slice(bytes),
             }
         }
 

@@ -8,6 +8,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
     Pager(crate::pager::Error),
@@ -130,7 +131,7 @@ pub enum ValueRef<'row> {
     Null,
     Integer(i64),
     Real(f64),
-    TextBytes(&'row [u8]),
+    Text(&'row [u8]),
     Blob(&'row [u8]),
 }
 
@@ -157,7 +158,7 @@ pub(crate) enum ValueRefRaw {
     Null,
     Integer(i64),
     Real(f64),
-    TextBytes(RawBytes),
+    Text(RawBytes),
     Blob(RawBytes),
 }
 
@@ -213,7 +214,7 @@ impl ValueRefRaw {
             Self::Null => ValueRef::Null,
             Self::Integer(value) => ValueRef::Integer(value),
             Self::Real(value) => ValueRef::Real(value),
-            Self::TextBytes(bytes) => ValueRef::TextBytes(unsafe { bytes.as_slice() }),
+            Self::Text(bytes) => ValueRef::Text(unsafe { bytes.as_slice() }),
             Self::Blob(bytes) => ValueRef::Blob(unsafe { bytes.as_slice() }),
         }
     }
@@ -228,14 +229,14 @@ fn raw_to_ref<'row>(value: ValueRefRaw) -> ValueRef<'row> {
 impl<'row> ValueRef<'row> {
     pub fn as_text(&self) -> Option<&'row str> {
         match self {
-            Self::TextBytes(bytes) => str::from_utf8(bytes).ok(),
+            Self::Text(bytes) => str::from_utf8(bytes).ok(),
             _ => None,
         }
     }
 
     pub fn text_bytes(&self) -> Option<&'row [u8]> {
         match self {
-            Self::TextBytes(bytes) => Some(*bytes),
+            Self::Text(bytes) => Some(*bytes),
             _ => None,
         }
     }
@@ -254,7 +255,7 @@ impl fmt::Display for ValueRef<'_> {
             Self::Null => f.write_str("NULL"),
             Self::Integer(value) => write!(f, "{value}"),
             Self::Real(value) => write!(f, "{value}"),
-            Self::TextBytes(bytes) => match str::from_utf8(bytes) {
+            Self::Text(bytes) => match str::from_utf8(bytes) {
                 Ok(value) => f.write_str(value),
                 Err(_) => f.write_str("<invalid utf8>"),
             },
@@ -294,7 +295,7 @@ impl TryFrom<ValueRef<'_>> for Value {
             ValueRef::Null => Ok(Value::Null),
             ValueRef::Integer(value) => Ok(Value::Integer(value)),
             ValueRef::Real(value) => Ok(Value::Real(value)),
-            ValueRef::TextBytes(bytes) => Ok(Value::Text(str::from_utf8(bytes)?.to_owned())),
+            ValueRef::Text(bytes) => Ok(Value::Text(str::from_utf8(bytes)?.to_owned())),
             ValueRef::Blob(bytes) => Ok(Value::Blob(bytes.to_owned())),
         }
     }
@@ -1341,7 +1342,7 @@ fn decode_record_project_into_overflow(
             let slice = &spill[pending.start..pending.start + pending.len];
             let raw = RawBytes::from_slice(slice);
             out[pending.out_index] = match pending.kind {
-                PendingKind::Text => ValueRefRaw::TextBytes(raw),
+                PendingKind::Text => ValueRefRaw::Text(raw),
                 PendingKind::Blob => ValueRefRaw::Blob(raw),
             };
         }
@@ -1370,7 +1371,7 @@ fn decode_record_project_into_overflow(
             let slice = &spill[pending.start..pending.start + pending.len];
             let raw = RawBytes::from_slice(slice);
             out[pending.out_index] = match pending.kind {
-                PendingKind::Text => ValueRefRaw::TextBytes(raw),
+                PendingKind::Text => ValueRefRaw::Text(raw),
                 PendingKind::Blob => ValueRefRaw::Blob(raw),
             };
         }
@@ -1576,7 +1577,7 @@ fn decode_record_into_overflow(
         let slice = &spill[pending.start..pending.start + pending.len];
         let raw = RawBytes::from_slice(slice);
         out[pending.out_index] = match pending.kind {
-            PendingKind::Text => ValueRefRaw::TextBytes(raw),
+            PendingKind::Text => ValueRefRaw::Text(raw),
             PendingKind::Blob => ValueRefRaw::Blob(raw),
         };
     }
@@ -1616,7 +1617,7 @@ fn decode_record_column_overflow(
                     let slice = &spill[start..start + len];
                     let raw = RawBytes::from_slice(slice);
                     match kind {
-                        PendingKind::Text => ValueRefRaw::TextBytes(raw),
+                        PendingKind::Text => ValueRefRaw::Text(raw),
                         PendingKind::Blob => ValueRefRaw::Blob(raw),
                     }
                 }
@@ -1674,7 +1675,7 @@ fn decode_value_ref_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Resul
         }
         serial if serial >= 13 => {
             let len = ((serial - 13) / 2) as usize;
-            ValueRefRaw::TextBytes(RawBytes::from_slice(read_exact_bytes_at(bytes, pos, len)?))
+            ValueRefRaw::Text(RawBytes::from_slice(read_exact_bytes_at(bytes, pos, len)?))
         }
         other => return Err(Error::UnsupportedSerialType(other)),
     };
@@ -1715,7 +1716,7 @@ fn decode_value_ref_at_cursor(
         serial if serial >= 13 => {
             let len = ((serial - 13) / 2) as usize;
             match cursor.read_value_bytes(len, spill)? {
-                ValueBytes::Inline(raw) => DecodedValue::Ready(ValueRefRaw::TextBytes(raw)),
+                ValueBytes::Inline(raw) => DecodedValue::Ready(ValueRefRaw::Text(raw)),
                 ValueBytes::Spill { start, len } => {
                     DecodedValue::Spill { start, len, kind: PendingKind::Text }
                 }

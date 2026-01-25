@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use miniql::index::{IndexCursor, IndexScratch};
-use miniql::join::{Join, JoinKey, JoinScratch, JoinStrategy, JoinType};
-use miniql::pager::{PageId, Pager};
-use miniql::query::Scan;
+use miniql::join::{Join, JoinKey, JoinScratch, JoinStrategy};
+use miniql::pager::Pager;
 use miniql::table::{self, TableRow, ValueRef};
+use miniql::{Db, PageId};
 
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
@@ -13,6 +13,10 @@ fn fixture_path(name: &str) -> PathBuf {
 fn open_pager(name: &str) -> Pager {
     let file = std::fs::File::open(fixture_path(name)).expect("open fixture database");
     Pager::new(file).expect("create pager")
+}
+
+fn open_db(name: &str) -> Db {
+    Db::open(fixture_path(name)).expect("open fixture database")
 }
 
 fn schema_root(rows: &[TableRow], kind: &str, name: &str) -> Option<u32> {
@@ -84,22 +88,28 @@ fn lookup_rowid_payload_matches_scan() {
 #[test]
 fn inner_join_users_orders_indexed() {
     let pager = open_pager("join.db");
+    let db = open_db("join.db");
     let (users_root, orders_root, index_root) = join_roots(&pager);
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();
 
-    Join::new(JoinType::Inner, Scan::table(&pager, users_root), Scan::table(&pager, orders_root))
+    let users = db.table_root(users_root);
+    let orders = db.table_root(orders_root);
+    let mut join = Join::inner(users.scan(), orders.scan())
         .on(JoinKey::RowId, JoinKey::Col(0))
         .project_left([0])
         .project_right([1])
         .strategy(JoinStrategy::IndexNestedLoop { index_root, index_key_col: 0 })
-        .for_each(&mut scratch, |jr| {
-            let name = jr.left.get_text(0)?.to_string();
-            let amount = jr.right.get_i64(0)?;
-            seen.push((jr.left_rowid, name, jr.right_rowid, amount));
-            Ok(())
-        })
-        .expect("join");
+        .compile()
+        .expect("compile join");
+
+    join.for_each(&mut scratch, |jr| {
+        let name = jr.left.get_text(0)?.to_string();
+        let amount = jr.right.get_i64(0)?;
+        seen.push((jr.left_rowid, name, jr.right_rowid, amount));
+        Ok(())
+    })
+    .expect("join");
 
     assert_eq!(
         seen,
@@ -115,23 +125,29 @@ fn inner_join_users_orders_indexed() {
 #[test]
 fn auto_discovers_index_for_join() {
     let pager = open_pager("join.db");
+    let db = open_db("join.db");
     let (users_root, orders_root, _index_root) = join_roots(&pager);
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();
 
-    Join::new(JoinType::Inner, Scan::table(&pager, users_root), Scan::table(&pager, orders_root))
+    let users = db.table_root(users_root);
+    let orders = db.table_root(orders_root);
+    let mut join = Join::inner(users.scan(), orders.scan())
         .on(JoinKey::RowId, JoinKey::Col(0))
         .project_left([0])
         .project_right([1])
         .strategy(JoinStrategy::Auto)
         .hash_mem_limit(0)
-        .for_each(&mut scratch, |jr| {
-            let name = jr.left.get_text(0)?.to_string();
-            let amount = jr.right.get_i64(0)?;
-            seen.push((jr.left_rowid, name, jr.right_rowid, amount));
-            Ok(())
-        })
-        .expect("auto join");
+        .compile()
+        .expect("compile join");
+
+    join.for_each(&mut scratch, |jr| {
+        let name = jr.left.get_text(0)?.to_string();
+        let amount = jr.right.get_i64(0)?;
+        seen.push((jr.left_rowid, name, jr.right_rowid, amount));
+        Ok(())
+    })
+    .expect("auto join");
 
     assert_eq!(
         seen,
@@ -147,20 +163,26 @@ fn auto_discovers_index_for_join() {
 #[test]
 fn null_join_keys_do_not_match() {
     let pager = open_pager("join.db");
+    let db = open_db("join.db");
     let (users_root, orders_root, _index_root) = join_roots(&pager);
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut count = 0usize;
 
-    Join::new(JoinType::Inner, Scan::table(&pager, orders_root), Scan::table(&pager, users_root))
+    let orders = db.table_root(orders_root);
+    let users = db.table_root(users_root);
+    let mut join = Join::inner(orders.scan(), users.scan())
         .on(JoinKey::Col(0), JoinKey::RowId)
         .project_left([0])
         .project_right([0])
         .strategy(JoinStrategy::HashJoin)
-        .for_each(&mut scratch, |_jr| {
-            count += 1;
-            Ok(())
-        })
-        .expect("hash join");
+        .compile()
+        .expect("compile join");
+
+    join.for_each(&mut scratch, |_jr| {
+        count += 1;
+        Ok(())
+    })
+    .expect("hash join");
 
     assert_eq!(count, 4);
 }
@@ -168,23 +190,29 @@ fn null_join_keys_do_not_match() {
 #[test]
 fn left_join_emits_null_right_rows() {
     let pager = open_pager("join.db");
+    let db = open_db("join.db");
     let (users_root, orders_root, _index_root) = join_roots(&pager);
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();
 
-    Join::new(JoinType::Left, Scan::table(&pager, orders_root), Scan::table(&pager, users_root))
+    let orders = db.table_root(orders_root);
+    let users = db.table_root(users_root);
+    let mut join = Join::left(orders.scan(), users.scan())
         .on(JoinKey::Col(0), JoinKey::RowId)
         .project_left([0, 1])
         .project_right([1])
         .strategy(JoinStrategy::HashJoin)
-        .for_each(&mut scratch, |jr| {
-            let user_id = jr.left.get(0).and_then(|v| v.as_integer());
-            let amount = jr.left.get_i64(1)?;
-            let right_is_null = matches!(jr.right.get(0), Some(ValueRef::Null));
-            seen.push((jr.left_rowid, user_id, amount, right_is_null));
-            Ok(())
-        })
-        .expect("left join");
+        .compile()
+        .expect("compile join");
+
+    join.for_each(&mut scratch, |jr| {
+        let user_id = jr.left.get(0).and_then(|v| v.as_integer());
+        let amount = jr.left.get_i64(1)?;
+        let right_is_null = matches!(jr.right.get(0), Some(ValueRef::Null));
+        seen.push((jr.left_rowid, user_id, amount, right_is_null));
+        Ok(())
+    })
+    .expect("left join");
 
     let null_row = seen.iter().find(|(rowid, _, _, _)| *rowid == 13).expect("rowid 13 present");
     assert_eq!(null_row.1, None);
@@ -195,6 +223,7 @@ fn left_join_emits_null_right_rows() {
 #[test]
 fn auto_discovers_unique_autoindex() {
     let pager = open_pager("join_unique.db");
+    let db = open_db("join_unique.db");
     let rows = table::read_table(&pager, PageId::ROOT).expect("read sqlite_schema");
     let users_root = schema_root(&rows, "table", "users_unique").expect("users_unique root");
     let orders_root = schema_root(&rows, "table", "orders_unique").expect("orders_unique root");
@@ -202,17 +231,18 @@ fn auto_discovers_unique_autoindex() {
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();
 
-    Join::new(
-        JoinType::Inner,
-        Scan::table(&pager, PageId::new(orders_root)),
-        Scan::table(&pager, PageId::new(users_root)),
-    )
-    .on(JoinKey::Col(1), JoinKey::Col(1))
-    .project_left([1])
-    .project_right([2])
-    .strategy(JoinStrategy::Auto)
-    .hash_mem_limit(0)
-    .for_each(&mut scratch, |jr| {
+    let orders = db.table_root(PageId::new(orders_root));
+    let users = db.table_root(PageId::new(users_root));
+    let mut join = Join::inner(orders.scan(), users.scan())
+        .on(JoinKey::Col(1), JoinKey::Col(1))
+        .project_left([1])
+        .project_right([2])
+        .strategy(JoinStrategy::Auto)
+        .hash_mem_limit(0)
+        .compile()
+        .expect("compile join");
+
+    join.for_each(&mut scratch, |jr| {
         let user_name = jr.left.get_text(0)?.to_string();
         let full_name = jr.right.get_text(0)?.to_string();
         seen.push((jr.left_rowid, user_name, full_name));
@@ -234,6 +264,7 @@ fn auto_discovers_unique_autoindex() {
 #[test]
 fn auto_discovers_composite_primary_key_autoindex() {
     let pager = open_pager("join_pk.db");
+    let db = open_db("join_pk.db");
     let rows = table::read_table(&pager, PageId::ROOT).expect("read sqlite_schema");
     let pk_root = schema_root(&rows, "table", "composite_pk").expect("composite_pk root");
     let orders_root = schema_root(&rows, "table", "pk_orders").expect("pk_orders root");
@@ -241,17 +272,18 @@ fn auto_discovers_composite_primary_key_autoindex() {
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();
 
-    Join::new(
-        JoinType::Inner,
-        Scan::table(&pager, PageId::new(orders_root)),
-        Scan::table(&pager, PageId::new(pk_root)),
-    )
-    .on(JoinKey::Col(1), JoinKey::Col(0))
-    .project_left([1])
-    .project_right([2])
-    .strategy(JoinStrategy::Auto)
-    .hash_mem_limit(0)
-    .for_each(&mut scratch, |jr| {
+    let orders = db.table_root(PageId::new(orders_root));
+    let pk = db.table_root(PageId::new(pk_root));
+    let mut join = Join::inner(orders.scan(), pk.scan())
+        .on(JoinKey::Col(1), JoinKey::Col(0))
+        .project_left([1])
+        .project_right([2])
+        .strategy(JoinStrategy::Auto)
+        .hash_mem_limit(0)
+        .compile()
+        .expect("compile join");
+
+    join.for_each(&mut scratch, |jr| {
         let a = jr.left.get_i64(0)?;
         let payload = jr.right.get_text(0)?.to_string();
         seen.push((jr.left_rowid, a, payload));

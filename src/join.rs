@@ -4,11 +4,13 @@ use rustc_hash::FxHashMap;
 
 use crate::index::{self, IndexCursor, IndexScratch};
 use crate::pager::{PageId, Pager};
-use crate::query::{CompiledScan, Row, Scan, ScanScratch};
+use crate::query::{PreparedScan, Row, Scan, ScanScratch};
+use crate::schema::{TableSchema, parse_index_columns, parse_table_schema};
 use crate::table::{self, Value, ValueRef, ValueRefRaw};
 
 pub type Result<T> = table::Result<T>;
 
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum JoinError {
     UnsupportedJoinKeyType,
@@ -40,18 +42,21 @@ impl std::fmt::Display for JoinError {
 
 impl std::error::Error for JoinError {}
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum JoinType {
     Inner,
     Left,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum JoinKey {
     Col(u16),
     RowId,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum JoinStrategy {
     Auto,
@@ -76,6 +81,24 @@ pub struct Join<'db> {
 // NULL.
 const NULL_ROWID: i64 = 0;
 
+pub struct PreparedJoin<'db> {
+    join_type: JoinType,
+    left: PreparedScan<'db>,
+    right: PreparedScan<'db>,
+    left_meta: SideMeta,
+    right_meta: SideMeta,
+    plan: JoinPlan,
+    hash_mem_limit: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum JoinPlan {
+    IndexNestedLoop { index_root: PageId, index_key_col: u16 },
+    HashJoin,
+    NestedLoopScan,
+    RowIdNestedLoop,
+}
+
 impl<'db> Join<'db> {
     pub fn new(join_type: JoinType, left: Scan<'db>, right: Scan<'db>) -> Self {
         Self {
@@ -89,6 +112,14 @@ impl<'db> Join<'db> {
             project_left: None,
             project_right: None,
         }
+    }
+
+    pub fn inner(left: Scan<'db>, right: Scan<'db>) -> Self {
+        Self::new(JoinType::Inner, left, right)
+    }
+
+    pub fn left(left: Scan<'db>, right: Scan<'db>) -> Self {
+        Self::new(JoinType::Left, left, right)
     }
 
     pub fn on(mut self, left: JoinKey, right: JoinKey) -> Self {
@@ -117,14 +148,11 @@ impl<'db> Join<'db> {
         self
     }
 
-    pub fn for_each<F>(self, scratch: &mut JoinScratch, mut cb: F) -> Result<()>
-    where
-        F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
-    {
+    pub fn compile(self) -> Result<PreparedJoin<'db>> {
         let left_key = self.left_key.ok_or(JoinError::MissingJoinCondition)?;
         let right_key = self.right_key.ok_or(JoinError::MissingJoinCondition)?;
 
-        let ((mut left_scan, left_meta), (mut right_scan, right_meta)) = build_sides(
+        let ((left_scan, left_meta), (right_scan, right_meta)) = build_sides(
             self.left,
             self.right,
             left_key,
@@ -133,6 +161,57 @@ impl<'db> Join<'db> {
             self.project_right,
         )?;
 
+        let plan = match self.strategy {
+            JoinStrategy::IndexNestedLoop { index_root, index_key_col } => {
+                if !matches!(right_key, JoinKey::Col(_)) {
+                    return Err(JoinError::UnsupportedJoinKeyType.into());
+                }
+                JoinPlan::IndexNestedLoop { index_root, index_key_col }
+            }
+            JoinStrategy::HashJoin => JoinPlan::HashJoin,
+            JoinStrategy::NestedLoopScan => JoinPlan::NestedLoopScan,
+            JoinStrategy::Auto => {
+                if matches!(right_key, JoinKey::RowId) {
+                    JoinPlan::RowIdNestedLoop
+                } else if let JoinKey::Col(col) = right_key {
+                    if let Some((index_root, index_key_col)) =
+                        discover_index_for_join(right_scan.pager(), right_scan.root(), col)?
+                    {
+                        JoinPlan::IndexNestedLoop { index_root, index_key_col }
+                    } else {
+                        JoinPlan::HashJoin
+                    }
+                } else {
+                    JoinPlan::HashJoin
+                }
+            }
+        };
+
+        Ok(PreparedJoin {
+            join_type: self.join_type,
+            left: left_scan,
+            right: right_scan,
+            left_meta,
+            right_meta,
+            plan,
+            hash_mem_limit: self.hash_mem_limit,
+        })
+    }
+
+    pub fn for_each<F>(self, scratch: &mut JoinScratch, mut cb: F) -> Result<()>
+    where
+        F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
+    {
+        let mut prepared = self.compile()?;
+        prepared.for_each(scratch, &mut cb)
+    }
+}
+
+impl<'db> PreparedJoin<'db> {
+    pub fn for_each<F>(&mut self, scratch: &mut JoinScratch, mut cb: F) -> Result<()>
+    where
+        F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
+    {
         let (
             left_scan_scratch,
             right_scan_scratch,
@@ -144,8 +223,8 @@ impl<'db> Join<'db> {
 
         let right_null_len = if matches!(self.join_type, JoinType::Left) {
             Some(resolve_right_null_len(
-                &mut right_scan,
-                &right_meta,
+                &mut self.right,
+                &self.right_meta,
                 right_decoded,
                 right_overflow,
             )?)
@@ -153,32 +232,27 @@ impl<'db> Join<'db> {
             None
         };
 
-        match self.strategy {
-            JoinStrategy::IndexNestedLoop { index_root, index_key_col } => {
-                if !matches!(right_key, JoinKey::Col(_)) {
-                    return Err(JoinError::UnsupportedJoinKeyType.into());
-                }
-                index_nested_loop(
-                    &mut left_scan,
-                    &left_meta,
-                    &mut right_scan,
-                    &right_meta,
-                    index_root,
-                    index_key_col,
-                    left_scan_scratch,
-                    right_decoded,
-                    right_overflow,
-                    index_scratch,
-                    right_nulls,
-                    right_null_len,
-                    &mut cb,
-                )
-            }
-            JoinStrategy::HashJoin => hash_join(
-                &mut left_scan,
-                &left_meta,
-                &mut right_scan,
-                &right_meta,
+        match self.plan {
+            JoinPlan::IndexNestedLoop { index_root, index_key_col } => index_nested_loop(
+                &mut self.left,
+                &self.left_meta,
+                &mut self.right,
+                &self.right_meta,
+                index_root,
+                index_key_col,
+                left_scan_scratch,
+                right_decoded,
+                right_overflow,
+                index_scratch,
+                right_nulls,
+                right_null_len,
+                &mut cb,
+            ),
+            JoinPlan::HashJoin => hash_join(
+                &mut self.left,
+                &self.left_meta,
+                &mut self.right,
+                &self.right_meta,
                 self.hash_mem_limit,
                 left_scan_scratch,
                 right_scan_scratch,
@@ -188,83 +262,29 @@ impl<'db> Join<'db> {
                 right_null_len,
                 &mut cb,
             ),
-            JoinStrategy::NestedLoopScan => nested_loop_scan(
-                &mut left_scan,
-                &left_meta,
-                &mut right_scan,
-                &right_meta,
+            JoinPlan::NestedLoopScan => nested_loop_scan(
+                &mut self.left,
+                &self.left_meta,
+                &mut self.right,
+                &self.right_meta,
                 left_scan_scratch,
                 right_scan_scratch,
                 right_nulls,
                 right_null_len,
                 &mut cb,
             ),
-            JoinStrategy::Auto => {
-                if matches!(right_key, JoinKey::RowId) {
-                    rowid_nested_loop(
-                        &mut left_scan,
-                        &left_meta,
-                        &mut right_scan,
-                        &right_meta,
-                        left_scan_scratch,
-                        right_decoded,
-                        right_overflow,
-                        right_nulls,
-                        right_null_len,
-                        &mut cb,
-                    )
-                } else if let JoinKey::Col(col) = right_key {
-                    if let Some((index_root, index_key_col)) =
-                        discover_index_for_join(right_scan.pager(), right_scan.root(), col)?
-                    {
-                        index_nested_loop(
-                            &mut left_scan,
-                            &left_meta,
-                            &mut right_scan,
-                            &right_meta,
-                            index_root,
-                            index_key_col,
-                            left_scan_scratch,
-                            right_decoded,
-                            right_overflow,
-                            index_scratch,
-                            right_nulls,
-                            right_null_len,
-                            &mut cb,
-                        )
-                    } else {
-                        hash_join(
-                            &mut left_scan,
-                            &left_meta,
-                            &mut right_scan,
-                            &right_meta,
-                            self.hash_mem_limit,
-                            left_scan_scratch,
-                            right_scan_scratch,
-                            right_decoded,
-                            right_overflow,
-                            right_nulls,
-                            right_null_len,
-                            &mut cb,
-                        )
-                    }
-                } else {
-                    hash_join(
-                        &mut left_scan,
-                        &left_meta,
-                        &mut right_scan,
-                        &right_meta,
-                        self.hash_mem_limit,
-                        left_scan_scratch,
-                        right_scan_scratch,
-                        right_decoded,
-                        right_overflow,
-                        right_nulls,
-                        right_null_len,
-                        &mut cb,
-                    )
-                }
-            }
+            JoinPlan::RowIdNestedLoop => rowid_nested_loop(
+                &mut self.left,
+                &self.left_meta,
+                &mut self.right,
+                &self.right_meta,
+                left_scan_scratch,
+                right_decoded,
+                right_overflow,
+                right_nulls,
+                right_null_len,
+                &mut cb,
+            ),
         }
     }
 }
@@ -376,7 +396,7 @@ fn build_sides<'db>(
     right_key: JoinKey,
     project_left: Option<Vec<u16>>,
     project_right: Option<Vec<u16>>,
-) -> Result<((CompiledScan<'db>, SideMeta), (CompiledScan<'db>, SideMeta))> {
+) -> Result<((PreparedScan<'db>, SideMeta), (PreparedScan<'db>, SideMeta))> {
     let left_state = build_side(left, left_key, project_left)?;
     let right_state = build_side(right, right_key, project_right)?;
     Ok((left_state, right_state))
@@ -386,7 +406,7 @@ fn build_side<'db>(
     scan: Scan<'db>,
     join_key: JoinKey,
     output_override: Option<Vec<u16>>,
-) -> Result<(CompiledScan<'db>, SideMeta)> {
+) -> Result<(PreparedScan<'db>, SideMeta)> {
     let output_cols = output_override.or_else(|| scan.projection().map(|cols| cols.to_vec()));
     let mut scan_proj = output_cols.clone();
     if let (Some(cols), JoinKey::Col(col)) = (scan_proj.as_mut(), join_key)
@@ -423,9 +443,9 @@ fn build_side<'db>(
 
 #[allow(clippy::too_many_arguments)]
 fn index_nested_loop<F>(
-    left_scan: &mut CompiledScan<'_>,
+    left_scan: &mut PreparedScan<'_>,
     left_meta: &SideMeta,
-    right_scan: &mut CompiledScan<'_>,
+    right_scan: &mut PreparedScan<'_>,
     right_meta: &SideMeta,
     index_root: PageId,
     index_key_col: u16,
@@ -498,9 +518,9 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn rowid_nested_loop<F>(
-    left_scan: &mut CompiledScan<'_>,
+    left_scan: &mut PreparedScan<'_>,
     left_meta: &SideMeta,
-    right_scan: &mut CompiledScan<'_>,
+    right_scan: &mut PreparedScan<'_>,
     right_meta: &SideMeta,
     left_scratch: &mut ScanScratch,
     right_decoded: &mut Vec<ValueRefRaw>,
@@ -585,9 +605,9 @@ impl RowIdList {
 
 #[allow(clippy::too_many_arguments)]
 fn hash_join<F>(
-    left_scan: &mut CompiledScan<'_>,
+    left_scan: &mut PreparedScan<'_>,
     left_meta: &SideMeta,
-    right_scan: &mut CompiledScan<'_>,
+    right_scan: &mut PreparedScan<'_>,
     right_meta: &SideMeta,
     mem_limit: Option<usize>,
     left_scratch: &mut ScanScratch,
@@ -733,9 +753,9 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn nested_loop_scan<F>(
-    left_scan: &mut CompiledScan<'_>,
+    left_scan: &mut PreparedScan<'_>,
     left_meta: &SideMeta,
-    right_scan: &mut CompiledScan<'_>,
+    right_scan: &mut PreparedScan<'_>,
     right_meta: &SideMeta,
     left_scratch: &mut ScanScratch,
     right_scratch: &mut ScanScratch,
@@ -799,7 +819,7 @@ fn join_keys_equal(left: ValueRef<'_>, right: ValueRef<'_>) -> bool {
         (ValueRef::Integer(l), ValueRef::Real(r)) => (l as f64) == r,
         (ValueRef::Real(l), ValueRef::Integer(r)) => l == (r as f64),
         (ValueRef::Real(l), ValueRef::Real(r)) => l == r,
-        (ValueRef::TextBytes(l), ValueRef::TextBytes(r)) => l == r,
+        (ValueRef::Text(l), ValueRef::Text(r)) => l == r,
         (ValueRef::Blob(l), ValueRef::Blob(r)) => l == r,
         _ => false,
     }
@@ -817,7 +837,7 @@ fn hash_key_from_value<'row>(value: ValueRef<'row>) -> Result<Option<HashKeyRef<
         ValueRef::Null => None,
         ValueRef::Integer(value) => Some(HashKeyRef::Number((value as f64).to_bits())),
         ValueRef::Real(value) => Some(HashKeyRef::Number(value.to_bits())),
-        ValueRef::TextBytes(bytes) => Some(HashKeyRef::Text(bytes)),
+        ValueRef::Text(bytes) => Some(HashKeyRef::Text(bytes)),
         ValueRef::Blob(bytes) => Some(HashKeyRef::Blob(bytes)),
     })
 }
@@ -900,56 +920,6 @@ fn discover_index_for_join(
     discover_autoindex_for_join(pager, &rows, &table_name, &schema, &join_col_name)
 }
 
-struct TableSchema {
-    columns: Vec<String>,
-    unique_indexes: Vec<Vec<String>>,
-    without_rowid: bool,
-}
-
-struct ColumnConstraintInfo {
-    name: String,
-    unique_index: bool,
-}
-
-fn parse_table_schema(sql: &str) -> TableSchema {
-    let without_rowid = contains_token_sequence(sql, &["WITHOUT", "ROWID"]);
-    let Some(inner) = extract_parenthesized(sql) else {
-        return TableSchema { columns: Vec::new(), unique_indexes: Vec::new(), without_rowid };
-    };
-    let mut columns = Vec::new();
-    let mut unique_indexes = Vec::new();
-    for part in split_top_level(inner) {
-        if is_table_constraint(part) {
-            if let Some(cols) = parse_table_constraint_index_cols(part) {
-                unique_indexes.push(cols);
-            }
-            continue;
-        }
-        if let Some(info) = parse_column_def(part) {
-            columns.push(info.name.clone());
-            if info.unique_index {
-                unique_indexes.push(vec![info.name]);
-            }
-        }
-    }
-    TableSchema { columns, unique_indexes, without_rowid }
-}
-
-fn parse_index_columns(sql: &str) -> Option<Vec<String>> {
-    if sql.to_ascii_uppercase().contains(" WHERE ") {
-        return None;
-    }
-
-    let paren_start = find_on_paren(sql)?;
-    let inner = extract_parenthesized_at(sql, paren_start)?;
-    let mut cols = Vec::new();
-    for part in split_top_level(inner) {
-        let name = parse_identifier(part)?;
-        cols.push(name.to_ascii_lowercase());
-    }
-    Some(cols)
-}
-
 fn discover_autoindex_for_join(
     pager: &Pager,
     rows: &[table::TableRow],
@@ -1029,449 +999,8 @@ fn discover_autoindex_for_join(
     Ok(None)
 }
 
-fn parse_table_constraint_index_cols(part: &str) -> Option<Vec<String>> {
-    let has_primary = contains_token_sequence(part, &["PRIMARY", "KEY"]);
-    let has_unique = contains_token(part, "UNIQUE");
-    if !has_primary && !has_unique {
-        return None;
-    }
-    let inner = extract_parenthesized(part)?;
-    let mut cols = Vec::new();
-    for item in split_top_level(inner) {
-        let name = parse_identifier(item)?;
-        cols.push(name.to_ascii_lowercase());
-    }
-    if cols.is_empty() { None } else { Some(cols) }
-}
-
-fn is_table_constraint(part: &str) -> bool {
-    let word = first_word(part);
-    matches!(
-        word.as_deref(),
-        Some("CONSTRAINT") | Some("PRIMARY") | Some("UNIQUE") | Some("CHECK") | Some("FOREIGN")
-    )
-}
-
-fn first_word(part: &str) -> Option<String> {
-    let bytes = part.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() {
-        return None;
-    }
-    if matches!(bytes[i], b'"' | b'`' | b'[' | b'\'') {
-        return None;
-    }
-    let start = i;
-    while i < bytes.len() && is_ident_char(bytes[i]) {
-        i += 1;
-    }
-    if start == i {
-        return None;
-    }
-    Some(part[start..i].to_ascii_uppercase())
-}
-
-fn parse_column_def(part: &str) -> Option<ColumnConstraintInfo> {
-    let (name, end) = parse_identifier_span(part)?;
-    let name = name.to_ascii_lowercase();
-    let rest = part[end..].trim_start();
-    let (type_name, rest) = parse_optional_type(rest);
-    let has_primary = contains_token_sequence(rest, &["PRIMARY", "KEY"]);
-    let has_unique = contains_token(rest, "UNIQUE");
-    let integer_primary = type_name.as_deref() == Some("INTEGER") && has_primary;
-    let unique_index = (has_primary || has_unique) && !integer_primary;
-    Some(ColumnConstraintInfo { name, unique_index })
-}
-
-fn parse_optional_type(rest: &str) -> (Option<String>, &str) {
-    let Some((token, end)) = parse_identifier_span(rest) else {
-        return (None, rest);
-    };
-    let upper = token.to_ascii_uppercase();
-    if is_constraint_keyword(&upper) {
-        return (None, rest);
-    }
-    (Some(upper), rest[end..].trim_start())
-}
-
-fn is_constraint_keyword(token: &str) -> bool {
-    matches!(
-        token,
-        "CONSTRAINT"
-            | "PRIMARY"
-            | "UNIQUE"
-            | "NOT"
-            | "NULL"
-            | "CHECK"
-            | "DEFAULT"
-            | "COLLATE"
-            | "REFERENCES"
-            | "GENERATED"
-            | "AS"
-            | "STORED"
-            | "VIRTUAL"
-            | "ON"
-            | "AUTOINCREMENT"
-    )
-}
-
-fn parse_identifier(part: &str) -> Option<String> {
-    parse_identifier_span(part).map(|(token, _)| token)
-}
-
-fn parse_identifier_span(part: &str) -> Option<(String, usize)> {
-    let bytes = part.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() {
-        return None;
-    }
-    let first = bytes[i];
-    if first == b'(' {
-        return None;
-    }
-    if first == b'"' || first == b'`' || first == b'[' {
-        let (token, end) = parse_quoted(bytes, i)?;
-        let token = strip_qualifier(&token);
-        return Some((token, end));
-    }
-    let start = i;
-    while i < bytes.len()
-        && !bytes[i].is_ascii_whitespace()
-        && !matches!(bytes[i], b'(' | b',' | b')')
-    {
-        i += 1;
-    }
-    if start == i {
-        return None;
-    }
-    let token = &part[start..i];
-    let token = strip_qualifier(token);
-    Some((token.to_owned(), i))
-}
-
-fn parse_quoted(bytes: &[u8], start: usize) -> Option<(String, usize)> {
-    let quote = bytes[start];
-    let end_quote = if quote == b'[' { b']' } else { quote };
-    let mut i = start + 1;
-    let mut out = Vec::new();
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == end_quote {
-            if end_quote == b'"' && i + 1 < bytes.len() && bytes[i + 1] == end_quote {
-                out.push(end_quote);
-                i += 2;
-                continue;
-            }
-            return Some((String::from_utf8_lossy(&out).into_owned(), i + 1));
-        }
-        out.push(b);
-        i += 1;
-    }
-    None
-}
-
-fn strip_qualifier(name: &str) -> String {
-    match name.rsplit_once('.') {
-        Some((_prefix, suffix)) => suffix.to_owned(),
-        None => name.to_owned(),
-    }
-}
-
-fn split_top_level(input: &str) -> Vec<&str> {
-    let bytes = input.as_bytes();
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0u32;
-    let mut i = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    let mut in_bracket = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_single {
-            if b == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_double {
-            if b == b'"' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    i += 2;
-                    continue;
-                }
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_backtick {
-            if b == b'`' {
-                in_backtick = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_bracket {
-            if b == b']' {
-                in_bracket = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        match b {
-            b'\'' => in_single = true,
-            b'"' => in_double = true,
-            b'`' => in_backtick = true,
-            b'[' => in_bracket = true,
-            b'(' => depth += 1,
-            b')' => {
-                depth = depth.saturating_sub(1);
-            }
-            b',' if depth == 0 => {
-                parts.push(input[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    if start < input.len() {
-        parts.push(input[start..].trim());
-    }
-    parts
-}
-
-fn contains_token(input: &str, token: &str) -> bool {
-    contains_token_sequence(input, &[token])
-}
-
-fn contains_token_sequence(input: &str, seq: &[&str]) -> bool {
-    if seq.is_empty() {
-        return true;
-    }
-    let tokens = tokens_upper(input);
-    if tokens.len() < seq.len() {
-        return false;
-    }
-    for i in 0..=tokens.len() - seq.len() {
-        if seq.iter().enumerate().all(|(j, s)| tokens[i + j] == *s) {
-            return true;
-        }
-    }
-    false
-}
-
-fn tokens_upper(input: &str) -> Vec<String> {
-    let bytes = input.as_bytes();
-    let mut tokens = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if is_ident_start(bytes[i]) {
-            let start = i;
-            i += 1;
-            while i < bytes.len() && is_ident_char(bytes[i]) {
-                i += 1;
-            }
-            tokens.push(input[start..i].to_ascii_uppercase());
-            continue;
-        }
-        i += 1;
-    }
-    tokens
-}
-
-fn extract_parenthesized(sql: &str) -> Option<&str> {
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'(' {
-            return extract_parenthesized_at(sql, i);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn extract_parenthesized_at(sql: &str, start: usize) -> Option<&str> {
-    let bytes = sql.as_bytes();
-    if start >= bytes.len() || bytes[start] != b'(' {
-        return None;
-    }
-    let mut depth = 0u32;
-    let mut i = start;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    let mut in_bracket = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_single {
-            if b == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_double {
-            if b == b'"' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    i += 2;
-                    continue;
-                }
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_backtick {
-            if b == b'`' {
-                in_backtick = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_bracket {
-            if b == b']' {
-                in_bracket = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        match b {
-            b'\'' => in_single = true,
-            b'"' => in_double = true,
-            b'`' => in_backtick = true,
-            b'[' => in_bracket = true,
-            b'(' => {
-                depth += 1;
-                if depth == 1 {
-                    i += 1;
-                    continue;
-                }
-            }
-            b')' => {
-                if depth == 1 {
-                    return Some(&sql[start + 1..i]);
-                }
-                depth = depth.saturating_sub(1);
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-fn find_on_paren(sql: &str) -> Option<usize> {
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    let mut in_bracket = false;
-    let mut seen_on = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_single {
-            if b == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_double {
-            if b == b'"' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    i += 2;
-                    continue;
-                }
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_backtick {
-            if b == b'`' {
-                in_backtick = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_bracket {
-            if b == b']' {
-                in_bracket = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        match b {
-            b'\'' => in_single = true,
-            b'"' => in_double = true,
-            b'`' => in_backtick = true,
-            b'[' => in_bracket = true,
-            b'(' if seen_on => return Some(i),
-            _ => {}
-        }
-
-        if !seen_on && is_ident_start(b) {
-            let start = i;
-            i += 1;
-            while i < bytes.len() && is_ident_char(bytes[i]) {
-                i += 1;
-            }
-            if sql[start..i].eq_ignore_ascii_case("ON") {
-                let prev = start.checked_sub(1).and_then(|p| bytes.get(p).copied());
-                let next = bytes.get(i).copied();
-                if prev.is_none_or(|c| !is_ident_char(c)) && next.is_none_or(|c| !is_ident_char(c))
-                {
-                    seen_on = true;
-                }
-            }
-            continue;
-        }
-
-        i += 1;
-    }
-    None
-}
-
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
-}
-
-fn is_ident_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 fn resolve_right_null_len(
-    right_scan: &mut CompiledScan<'_>,
+    right_scan: &mut PreparedScan<'_>,
     right_meta: &SideMeta,
     right_decoded: &mut Vec<ValueRefRaw>,
     right_overflow: &mut Vec<u8>,

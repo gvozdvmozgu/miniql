@@ -372,7 +372,7 @@ fn compare_total(left: ValueRef<'_>, right: ValueRef<'_>) -> Ordering {
     let rank = |value: ValueRef<'_>| match value {
         ValueRef::Null => 0u8,
         ValueRef::Integer(_) | ValueRef::Real(_) => 1u8,
-        ValueRef::TextBytes(_) => 2u8,
+        ValueRef::Text(_) => 2u8,
         ValueRef::Blob(_) => 3u8,
     };
 
@@ -388,7 +388,7 @@ fn compare_total(left: ValueRef<'_>, right: ValueRef<'_>) -> Ordering {
         (ValueRef::Integer(l), ValueRef::Real(r)) => cmp_f64_total(l as f64, r),
         (ValueRef::Real(l), ValueRef::Integer(r)) => cmp_f64_total(l, r as f64),
         (ValueRef::Real(l), ValueRef::Real(r)) => cmp_f64_total(l, r),
-        (ValueRef::TextBytes(l), ValueRef::TextBytes(r)) => l.cmp(r),
+        (ValueRef::Text(l), ValueRef::Text(r)) => l.cmp(r),
         (ValueRef::Blob(l), ValueRef::Blob(r)) => l.cmp(r),
         _ => Ordering::Equal,
     }

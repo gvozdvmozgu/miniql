@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::File;
-use std::num::NonZero;
+use std::num::NonZeroU32;
 
 use memmap2::Mmap;
 
@@ -175,24 +175,24 @@ impl<'a> PageRef<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PageId(NonZero<u32>);
+pub struct PageId(NonZeroU32);
 
 impl PageId {
     pub const ROOT: PageId = unsafe { PageId::new_unchecked(1) };
 
     pub fn new(id: u32) -> Self {
-        Self(NonZero::new(id).unwrap())
+        Self(NonZeroU32::new(id).unwrap())
     }
 
     pub fn try_new(id: u32) -> Option<Self> {
-        NonZero::new(id).map(Self)
+        NonZeroU32::new(id).map(Self)
     }
 
     /// # Safety
     ///
     /// The value must not be zero.
     pub const unsafe fn new_unchecked(id: u32) -> Self {
-        unsafe { Self(NonZero::new_unchecked(id)) }
+        unsafe { Self(NonZeroU32::new_unchecked(id)) }
     }
 
     pub fn into_inner(self) -> u32 {
@@ -200,6 +200,7 @@ impl PageId {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
