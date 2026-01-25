@@ -830,39 +830,37 @@ pub(crate) fn decode_record_project_into(
 ) -> Result<usize> {
     out.clear();
 
-    let mut header_decoder = Decoder::new(payload);
-    let before = header_decoder.remaining();
-    let header_len = read_varint_checked(&mut header_decoder, "record header truncated")? as usize;
-    let header_len_len = before - header_decoder.remaining();
-
-    if header_len < header_len_len || header_len > payload.len() {
+    let mut header_pos = 0usize;
+    let header_len = read_varint_at(payload, &mut header_pos, "record header truncated")? as usize;
+    if header_len < header_pos || header_len > payload.len() {
         return Err(Error::Corrupted("invalid record header length"));
     }
 
-    let mut serial_decoder = Decoder::new(&payload[header_len_len..header_len]);
-    let mut value_decoder = Decoder::new(&payload[header_len..]);
+    let serial_bytes = &payload[header_pos..header_len];
+    let mut serial_pos = 0usize;
+    let mut value_pos = header_len;
 
     if let Some(needed_cols) = needed_cols {
         let mut needed_iter = needed_cols.iter().copied();
         let mut next_needed = needed_iter.next();
         let mut column_count = 0usize;
-        while serial_decoder.remaining() > 0 {
-            let serial = read_varint_checked(&mut serial_decoder, "record header truncated")?;
+        while serial_pos < serial_bytes.len() {
+            let serial = read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?;
             let col_idx = column_count as u16;
             if Some(col_idx) == next_needed {
-                out.push(decode_value_ref(serial, &mut value_decoder)?);
+                out.push(decode_value_ref_at(serial, payload, &mut value_pos)?);
                 next_needed = needed_iter.next();
             } else {
-                skip_value(serial, &mut value_decoder)?;
+                skip_value_at(serial, payload, &mut value_pos)?;
             }
             column_count += 1;
         }
         Ok(column_count)
     } else {
         let mut column_count = 0usize;
-        while serial_decoder.remaining() > 0 {
-            let serial = read_varint_checked(&mut serial_decoder, "record header truncated")?;
-            out.push(decode_value_ref(serial, &mut value_decoder)?);
+        while serial_pos < serial_bytes.len() {
+            let serial = read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?;
+            out.push(decode_value_ref_at(serial, payload, &mut value_pos)?);
             column_count += 1;
         }
         Ok(column_count)
@@ -872,29 +870,32 @@ pub(crate) fn decode_record_project_into(
 fn decode_record_into(payload: &[u8], out: &mut Vec<ValueRefRaw>) -> Result<()> {
     out.clear();
 
-    let mut header_decoder = Decoder::new(payload);
-    let before = header_decoder.remaining();
-    let header_len = read_varint_checked(&mut header_decoder, "record header truncated")? as usize;
-    let header_len_len = before - header_decoder.remaining();
-
-    if header_len < header_len_len || header_len > payload.len() {
+    let mut header_pos = 0usize;
+    let header_len = read_varint_at(payload, &mut header_pos, "record header truncated")? as usize;
+    if header_len < header_pos || header_len > payload.len() {
         return Err(Error::Corrupted("invalid record header length"));
     }
 
-    let mut serial_decoder = Decoder::new(&payload[header_len_len..header_len]);
-    let mut value_decoder = Decoder::new(&payload[header_len..]);
-    while serial_decoder.remaining() > 0 {
-        let serial = read_varint_checked(&mut serial_decoder, "record header truncated")?;
-        out.push(decode_value_ref(serial, &mut value_decoder)?);
+    let serial_bytes = &payload[header_pos..header_len];
+    let mut serial_pos = 0usize;
+    let mut value_pos = header_len;
+    while serial_pos < serial_bytes.len() {
+        let serial = read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?;
+        out.push(decode_value_ref_at(serial, payload, &mut value_pos)?);
     }
 
     Ok(())
 }
 
-fn skip_value<'row>(serial_type: u64, decoder: &mut Decoder<'row>) -> Result<()> {
+fn skip_value_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Result<()> {
     let len = serial_type_len(serial_type)?;
     if len > 0 {
-        let _ = read_exact_bytes(decoder, len)?;
+        let end =
+            pos.checked_add(len).ok_or(Error::Corrupted("record payload shorter than declared"))?;
+        if end > bytes.len() {
+            return Err(Error::Corrupted("record payload shorter than declared"));
+        }
+        *pos = end;
     }
     Ok(())
 }
@@ -914,25 +915,25 @@ fn serial_type_len(serial_type: u64) -> Result<usize> {
     }
 }
 
-fn decode_value_ref<'row>(serial_type: u64, decoder: &mut Decoder<'row>) -> Result<ValueRefRaw> {
+fn decode_value_ref_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Result<ValueRefRaw> {
     let value = match serial_type {
         0 => ValueRefRaw::Null,
-        1 => ValueRefRaw::Integer(read_signed_be(decoder, 1)?),
-        2 => ValueRefRaw::Integer(read_signed_be(decoder, 2)?),
-        3 => ValueRefRaw::Integer(read_signed_be(decoder, 3)?),
-        4 => ValueRefRaw::Integer(read_signed_be(decoder, 4)?),
-        5 => ValueRefRaw::Integer(read_signed_be(decoder, 6)?),
-        6 => ValueRefRaw::Integer(read_signed_be(decoder, 8)?),
-        7 => ValueRefRaw::Real(f64::from_bits(read_u64_be(decoder)?)),
+        1 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 1)?),
+        2 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 2)?),
+        3 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 3)?),
+        4 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 4)?),
+        5 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 6)?),
+        6 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 8)?),
+        7 => ValueRefRaw::Real(f64::from_bits(read_u64_be_at(bytes, pos)?)),
         8 => ValueRefRaw::Integer(0),
         9 => ValueRefRaw::Integer(1),
         serial if serial >= 12 && serial % 2 == 0 => {
             let len = ((serial - 12) / 2) as usize;
-            ValueRefRaw::Blob(RawBytes::from_slice(read_exact_bytes(decoder, len)?))
+            ValueRefRaw::Blob(RawBytes::from_slice(read_exact_bytes_at(bytes, pos, len)?))
         }
         serial if serial >= 13 => {
             let len = ((serial - 13) / 2) as usize;
-            ValueRefRaw::TextBytes(RawBytes::from_slice(read_exact_bytes(decoder, len)?))
+            ValueRefRaw::TextBytes(RawBytes::from_slice(read_exact_bytes_at(bytes, pos, len)?))
         }
         other => return Err(Error::UnsupportedSerialType(other)),
     };
@@ -940,21 +941,21 @@ fn decode_value_ref<'row>(serial_type: u64, decoder: &mut Decoder<'row>) -> Resu
     Ok(value)
 }
 
-fn read_signed_be(decoder: &mut Decoder<'_>, bytes: usize) -> Result<i64> {
-    debug_assert!(bytes <= 8);
+fn read_signed_be_at(bytes: &[u8], pos: &mut usize, len: usize) -> Result<i64> {
+    debug_assert!(len <= 8);
 
     let mut buf = [0u8; 8];
-    let offset = 8 - bytes;
-    buf[offset..].copy_from_slice(read_exact_bytes(decoder, bytes)?);
+    let offset = 8 - len;
+    buf[offset..].copy_from_slice(read_exact_bytes_at(bytes, pos, len)?);
 
     let value = u64::from_be_bytes(buf);
-    let shift = (8 - bytes) * 8;
+    let shift = (8 - len) * 8;
     Ok(((value << shift) as i64) >> shift)
 }
 
-fn read_u64_be(decoder: &mut Decoder<'_>) -> Result<u64> {
+fn read_u64_be_at(bytes: &[u8], pos: &mut usize) -> Result<u64> {
     let mut buf = [0u8; 8];
-    buf.copy_from_slice(read_exact_bytes(decoder, 8)?);
+    buf.copy_from_slice(read_exact_bytes_at(bytes, pos, 8)?);
     Ok(u64::from_be_bytes(buf))
 }
 
@@ -998,8 +999,15 @@ fn read_varint_at(bytes: &[u8], pos: &mut usize, msg: &'static str) -> Result<u6
     Ok((result << 8) | u64::from(byte))
 }
 
-fn read_exact_bytes<'row>(decoder: &mut Decoder<'row>, len: usize) -> Result<&'row [u8]> {
-    decoder.try_read_bytes(len).ok_or(Error::Corrupted("record payload shorter than declared"))
+fn read_exact_bytes_at<'row>(bytes: &'row [u8], pos: &mut usize, len: usize) -> Result<&'row [u8]> {
+    let end =
+        pos.checked_add(len).ok_or(Error::Corrupted("record payload shorter than declared"))?;
+    if end > bytes.len() {
+        return Err(Error::Corrupted("record payload shorter than declared"));
+    }
+    let slice = &bytes[*pos..end];
+    *pos = end;
+    Ok(slice)
 }
 
 #[derive(Clone, Copy, Debug)]
