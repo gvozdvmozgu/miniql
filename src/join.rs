@@ -606,10 +606,17 @@ where
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NumericKey {
+    Integer(i64),
+    Real(f64),
+}
+
 #[derive(Debug, Clone)]
 struct RightRow {
     rowid: i64,
     payload: Box<[u8]>,
+    numeric_key: Option<NumericKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -771,8 +778,15 @@ where
     let pager = right_scan.pager();
     let right_root = right_scan.root();
     let (values, bytes, serials, stack) = right_scratch.split_mut();
+    let mut seen = 0usize;
+    let limit = right_scan.limit();
 
     table::scan_table_cells_with_scratch_and_stack_until(pager, right_root, stack, |cell| {
+        if let Some(limit) = limit
+            && seen >= limit
+        {
+            return Ok(Some(()));
+        }
         let rowid = cell.rowid();
         let payload = cell.payload();
         let Some(row) =
@@ -780,13 +794,18 @@ where
         else {
             return Ok(None::<()>);
         };
-        let Some(key_ref) = join_key_ref(right_meta, rowid, &row)? else {
+        seen += 1;
+        let Some(key_value) = right_meta.join_key(rowid, &row)? else {
             return Ok(None::<()>);
         };
+        let Some(key_ref) = hash_key_from_value(key_value)? else {
+            return Ok(None::<()>);
+        };
+        let numeric_key = numeric_key_from_value(key_value);
 
         let payload_bytes = payload.to_vec()?;
         mem.charge(payload_bytes.len())?;
-        let right_row = RightRow { rowid, payload: payload_bytes.into_boxed_slice() };
+        let right_row = RightRow { rowid, payload: payload_bytes.into_boxed_slice(), numeric_key };
 
         match key_ref {
             HashKeyRef::Number(bits) => match numeric.entry(bits) {
@@ -826,7 +845,10 @@ where
 
     left_scan.for_each(left_scratch, |left_rowid, left_row| {
         let left_out = left_meta.output_row(left_row.values_raw());
-        let Some(key_ref) = join_key_ref(left_meta, left_rowid, &left_row)? else {
+        let Some(left_key_value) = left_meta.join_key(left_rowid, &left_row)? else {
+            return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
+        };
+        let Some(key_ref) = hash_key_from_value(left_key_value)? else {
             return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
         };
         let rows = match key_ref {
@@ -839,26 +861,37 @@ where
             let mut matched = false;
             match rows {
                 RightRowList::One(row) => {
-                    let payload = table::PayloadRef::Inline(&row.payload);
-                    if let Some(right_row) = right_scan.eval_payload_with_filters(
-                        payload,
-                        right_values,
-                        right_bytes,
-                        right_serials,
-                        false,
-                    )? {
-                        let right_out = right_meta.output_row(right_row.values_raw());
-                        cb(JoinedRow {
-                            left_rowid,
-                            right_rowid: row.rowid,
-                            left: left_out,
-                            right: right_out,
-                        })?;
-                        matched = true;
+                    if let Some(numeric_key) = row.numeric_key
+                        && !numeric_key_equals(left_key_value, numeric_key)
+                    {
+                        // Hash collision on numeric key: ignore.
+                    } else {
+                        let payload = table::PayloadRef::Inline(&row.payload);
+                        if let Some(right_row) = right_scan.eval_payload_with_filters(
+                            payload,
+                            right_values,
+                            right_bytes,
+                            right_serials,
+                            false,
+                        )? {
+                            let right_out = right_meta.output_row(right_row.values_raw());
+                            cb(JoinedRow {
+                                left_rowid,
+                                right_rowid: row.rowid,
+                                left: left_out,
+                                right: right_out,
+                            })?;
+                            matched = true;
+                        }
                     }
                 }
                 RightRowList::Many(rows) => {
                     for row in rows.iter() {
+                        if let Some(numeric_key) = row.numeric_key
+                            && !numeric_key_equals(left_key_value, numeric_key)
+                        {
+                            continue;
+                        }
                         let payload = table::PayloadRef::Inline(&row.payload);
                         if let Some(right_row) = right_scan.eval_payload_with_filters(
                             payload,
@@ -954,17 +987,6 @@ where
     Ok(())
 }
 
-fn join_key_ref<'row>(
-    side: &SideMeta,
-    rowid: i64,
-    row: &Row<'row>,
-) -> Result<Option<HashKeyRef<'row>>> {
-    let Some(value) = side.join_key(rowid, row)? else {
-        return Ok(None);
-    };
-    hash_key_from_value(value)
-}
-
 fn join_keys_equal(left: ValueRef<'_>, right: ValueRef<'_>) -> bool {
     match (left, right) {
         (ValueRef::Null, _) | (_, ValueRef::Null) => false,
@@ -975,6 +997,21 @@ fn join_keys_equal(left: ValueRef<'_>, right: ValueRef<'_>) -> bool {
         (ValueRef::Text(l), ValueRef::Text(r)) => l == r,
         (ValueRef::Blob(l), ValueRef::Blob(r)) => l == r,
         _ => false,
+    }
+}
+
+fn numeric_key_from_value(value: ValueRef<'_>) -> Option<NumericKey> {
+    match value {
+        ValueRef::Integer(value) => Some(NumericKey::Integer(value)),
+        ValueRef::Real(value) => Some(NumericKey::Real(value)),
+        _ => None,
+    }
+}
+
+fn numeric_key_equals(left: ValueRef<'_>, right: NumericKey) -> bool {
+    match right {
+        NumericKey::Integer(value) => join_keys_equal(left, ValueRef::Integer(value)),
+        NumericKey::Real(value) => join_keys_equal(left, ValueRef::Real(value)),
     }
 }
 
@@ -989,7 +1026,10 @@ fn hash_key_from_value<'row>(value: ValueRef<'row>) -> Result<Option<HashKeyRef<
     Ok(match value {
         ValueRef::Null => None,
         ValueRef::Integer(value) => Some(HashKeyRef::Number((value as f64).to_bits())),
-        ValueRef::Real(value) => Some(HashKeyRef::Number(value.to_bits())),
+        ValueRef::Real(value) => {
+            let value = if value == 0.0 { 0.0 } else { value };
+            Some(HashKeyRef::Number(value.to_bits()))
+        }
         ValueRef::Text(bytes) => Some(HashKeyRef::Text(bytes)),
         ValueRef::Blob(bytes) => Some(HashKeyRef::Blob(bytes)),
     })
@@ -1063,10 +1103,11 @@ fn discover_index_for_join(
             continue;
         };
 
-        for (idx, col) in index_cols.iter().enumerate() {
-            if col.eq_ignore_ascii_case(&join_col_name) {
-                return Ok(Some((PageId::new(rootpage), idx as u16)));
-            }
+        if let Some((idx, _col)) =
+            index_cols.iter().enumerate().find(|(_, col)| col.eq_ignore_ascii_case(&join_col_name))
+            && idx == 0
+        {
+            return Ok(Some((PageId::new(rootpage), idx as u16)));
         }
     }
 
@@ -1113,7 +1154,9 @@ fn discover_autoindex_for_join(
         let Some(pos) = cols.iter().position(|c| c.eq_ignore_ascii_case(join_col_name)) else {
             continue;
         };
-        constraints.push((cols, pos));
+        if pos == 0 {
+            constraints.push((cols, pos));
+        }
     }
 
     if constraints.is_empty() {

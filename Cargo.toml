@@ -42,6 +42,8 @@ edition.workspace = true
 
 [dev-dependencies]
 codspeed-criterion-compat = "4"
+rusqlite = { version = "0.38", default-features = true }
+tempfile = "3"
 
 [dependencies]
 bumpalo = "3.19"

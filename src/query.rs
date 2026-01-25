@@ -419,6 +419,10 @@ impl<'db> PreparedScan<'db> {
         self.column_count_hint.get().copied()
     }
 
+    pub(crate) fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
     pub(crate) fn eval_payload<'row>(
         &'row mut self,
         payload: table::PayloadRef<'row>,

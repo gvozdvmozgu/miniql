@@ -189,6 +189,11 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
             return Err(Error::IndexKeyNotComparable.into());
         };
         let key = unsafe { value.as_value_ref() };
+        if matches!(key, ValueRef::Real(value) if value.is_nan())
+            || matches!(target, ValueRef::Real(value) if value.is_nan())
+        {
+            return Ok(false);
+        }
         if matches!(key, ValueRef::Null) || matches!(target, ValueRef::Null) {
             return Ok(false);
         }
