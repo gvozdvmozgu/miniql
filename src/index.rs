@@ -478,7 +478,7 @@ fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &IndexHeader) -> Result<&'a [u8]
     Ok(&bytes[header.cell_ptrs_start..cell_ptrs_end])
 }
 
-#[inline]
+#[inline(always)]
 fn cell_ptr_at(cell_ptrs: &[u8], idx: usize) -> Result<u16> {
     let offset =
         idx.checked_mul(2).ok_or(table::Error::Corrupted("cell pointer array overflow"))?;

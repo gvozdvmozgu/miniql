@@ -532,6 +532,20 @@ pub fn lookup_rowid_cell<'row>(
     }
 }
 
+pub(crate) fn scan_table_cells_with_scratch_and_stack<F>(
+    pager: &Pager,
+    page_id: PageId,
+    stack: &mut Vec<PageId>,
+    mut f: F,
+) -> Result<()>
+where
+    F: for<'row> FnMut(CellRef<'row>) -> Result<()>,
+{
+    stack.clear();
+    stack.push(page_id);
+    scan_table_page_cells_with_stack(pager, stack, &mut f)
+}
+
 pub(crate) fn scan_table_cells_with_scratch_and_stack_until<F, T>(
     pager: &Pager,
     page_id: PageId,
@@ -556,21 +570,16 @@ where
     F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
 {
     let mut stack = scratch.take_stack();
-    let result = scan_table_cells_with_scratch_and_stack_until::<_, ()>(
-        pager,
-        page_id,
-        &mut stack,
-        |cell| {
-            scratch.prepare_row();
-            let (values, bytes, serials) = scratch.split_mut();
-            let _ = decode_record_project_into(cell.payload(), None, values, bytes, serials)?;
-            let row = RowView { values: scratch.values_slice() };
-            f(cell.rowid(), row)?;
-            Ok(None)
-        },
-    );
+    let result = scan_table_cells_with_scratch_and_stack(pager, page_id, &mut stack, |cell| {
+        scratch.prepare_row();
+        let (values, bytes, serials) = scratch.split_mut();
+        let _ = decode_record_project_into(cell.payload(), None, values, bytes, serials)?;
+        let row = RowView { values: scratch.values_slice() };
+        f(cell.rowid(), row)?;
+        Ok(())
+    });
     scratch.return_stack(stack);
-    result.map(|_| ())
+    result
 }
 
 fn scan_table_page_cells<'pager, F>(pager: &'pager Pager, page_id: PageId, f: &mut F) -> Result<()>
@@ -1698,7 +1707,7 @@ fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &BTreeHeader) -> Result<&'a [u8]
     Ok(&bytes[header.cell_ptrs_start..cell_ptrs_end])
 }
 
-#[inline]
+#[inline(always)]
 fn cell_ptr_at(cell_ptrs: &[u8], idx: usize) -> Result<u16> {
     let offset = idx.checked_mul(2).ok_or(Error::Corrupted("cell pointer array overflow"))?;
     if offset + 1 >= cell_ptrs.len() {
