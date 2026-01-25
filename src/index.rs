@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::join::JoinError;
 use crate::pager::{PageId, PageRef, Pager};
-use crate::table::{self, ValueRef, ValueRefRaw};
+use crate::table::{self, ValueRef, ValueSlot};
 
 pub type Result<T> = table::Result<T>;
 
@@ -11,8 +11,9 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub struct IndexScratch {
     stack: Vec<StackEntry>,
-    overflow_buf: Vec<u8>,
-    decoded: Vec<ValueRefRaw>,
+    bytes: Vec<u8>,
+    serials: Vec<u64>,
+    decoded: Vec<ValueSlot>,
 }
 
 impl IndexScratch {
@@ -23,7 +24,8 @@ impl IndexScratch {
     pub fn with_capacity(values: usize, overflow: usize) -> Self {
         Self {
             stack: Vec::new(),
-            overflow_buf: Vec::with_capacity(overflow),
+            bytes: Vec::with_capacity(overflow),
+            serials: Vec::with_capacity(values),
             decoded: Vec::with_capacity(values),
         }
     }
@@ -106,7 +108,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                         let key = decode_key_from_payload(
                             self.key_col,
                             payload,
-                            &mut self.scratch.overflow_buf,
+                            &mut self.scratch.bytes,
                         )?;
                         let cmp = compare_total(target, key);
 
@@ -218,8 +220,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
             let mid = (lo + hi) / 2;
             let offset = u16::from_be_bytes([cell_ptrs[mid * 2], cell_ptrs[mid * 2 + 1]]);
             let payload = read_index_leaf_payload(self.pager, page, offset)?;
-            let key =
-                decode_key_from_payload(self.key_col, payload, &mut self.scratch.overflow_buf)?;
+            let key = decode_key_from_payload(self.key_col, payload, &mut self.scratch.bytes)?;
             let cmp = compare_total(target, key);
             if cmp == Ordering::Greater {
                 lo = mid + 1;
@@ -253,7 +254,8 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
             payload,
             None,
             &mut self.scratch.decoded,
-            &mut self.scratch.overflow_buf,
+            &mut self.scratch.bytes,
+            &mut self.scratch.serials,
         )?;
         self.cached_cell = Some((leaf.page_id, leaf.cell_index));
         Ok(())
@@ -318,7 +320,8 @@ pub(crate) fn index_key_len(
 ) -> Result<Option<usize>> {
     scratch.stack.clear();
     scratch.decoded.clear();
-    scratch.overflow_buf.clear();
+    scratch.bytes.clear();
+    scratch.serials.clear();
 
     let mut page_id = root;
     let max_pages = pager.page_count().max(1);
@@ -351,7 +354,8 @@ pub(crate) fn index_key_len(
                     payload,
                     None,
                     &mut scratch.decoded,
-                    &mut scratch.overflow_buf,
+                    &mut scratch.bytes,
+                    &mut scratch.serials,
                 )?;
                 if count == 0 {
                     return Err(table::Error::Corrupted("index record has no columns"));
@@ -406,9 +410,9 @@ fn cmp_f64_total(left: f64, right: f64) -> Ordering {
 fn decode_key_from_payload<'row>(
     key_col: u16,
     payload: table::RecordPayload<'row>,
-    spill: &'row mut Vec<u8>,
+    bytes: &'row mut Vec<u8>,
 ) -> Result<ValueRef<'row>> {
-    let Some(raw) = table::decode_record_column(payload, key_col, spill)? else {
+    let Some(raw) = table::decode_record_column(payload, key_col, bytes)? else {
         return Err(JoinError::IndexKeyNotComparable.into());
     };
     Ok(unsafe { raw.as_value_ref() })

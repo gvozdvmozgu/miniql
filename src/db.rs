@@ -151,7 +151,7 @@ impl<'db> CellScan<'db> {
     where
         F: for<'row> FnMut(i64, table::RecordPayload<'row>) -> table::Result<()>,
     {
-        let (_, _, stack) = scratch.split_mut();
+        let (_, _, _, stack) = scratch.split_mut();
         table::scan_table_cells_with_scratch_and_stack_until::<_, ()>(
             self.pager,
             self.root,

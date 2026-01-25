@@ -159,12 +159,37 @@ impl RawBytes {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ValueRefRaw {
+pub(crate) enum BytesSpan {
+    Mmap(RawBytes),
+    Scratch(RawBytes),
+}
+
+impl BytesSpan {
+    #[inline]
+    fn mmap(bytes: &[u8]) -> Self {
+        Self::Mmap(RawBytes::from_slice(bytes))
+    }
+
+    #[inline]
+    fn scratch(bytes: &[u8]) -> Self {
+        Self::Scratch(RawBytes::from_slice(bytes))
+    }
+
+    #[inline]
+    unsafe fn as_slice<'row>(self) -> &'row [u8] {
+        match self {
+            Self::Mmap(raw) | Self::Scratch(raw) => unsafe { raw.as_slice() },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ValueSlot {
     Null,
     Integer(i64),
     Real(f64),
-    Text(RawBytes),
-    Blob(RawBytes),
+    Text(BytesSpan),
+    Blob(BytesSpan),
 }
 
 #[derive(Clone, Copy)]
@@ -212,7 +237,7 @@ impl<'row> RecordPayload<'row> {
     }
 }
 
-impl ValueRefRaw {
+impl ValueSlot {
     #[inline]
     pub(crate) unsafe fn as_value_ref<'row>(self) -> ValueRef<'row> {
         match self {
@@ -225,7 +250,7 @@ impl ValueRefRaw {
     }
 }
 
-fn raw_to_ref<'row>(value: ValueRefRaw) -> ValueRef<'row> {
+fn slot_to_ref<'row>(value: ValueSlot) -> ValueRef<'row> {
     // SAFETY: raw values point into the current row payload/overflow buffer and
     // are only materialized for the duration of the row callback.
     unsafe { value.as_value_ref() }
@@ -271,7 +296,7 @@ impl fmt::Display for ValueRef<'_> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct RowView<'row> {
-    values: &'row [ValueRefRaw],
+    values: &'row [ValueSlot],
 }
 
 impl<'row> RowView<'row> {
@@ -284,11 +309,11 @@ impl<'row> RowView<'row> {
     }
 
     pub fn get(&self, i: usize) -> Option<ValueRef<'row>> {
-        self.values.get(i).copied().map(raw_to_ref)
+        self.values.get(i).copied().map(slot_to_ref)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = ValueRef<'row>> + '_ {
-        self.values.iter().copied().map(raw_to_ref)
+        self.values.iter().copied().map(slot_to_ref)
     }
 }
 
@@ -314,8 +339,9 @@ pub struct TableRow {
 
 #[derive(Debug, Default)]
 pub struct RowScratch {
-    values: Vec<ValueRefRaw>,
-    overflow_buf: Vec<u8>,
+    values: Vec<ValueSlot>,
+    bytes: Vec<u8>,
+    serials: Vec<u64>,
     btree_stack: Vec<PageId>,
 }
 
@@ -327,7 +353,8 @@ impl RowScratch {
     pub fn with_capacity(values: usize, overflow: usize) -> Self {
         Self {
             values: Vec::with_capacity(values),
-            overflow_buf: Vec::with_capacity(overflow),
+            bytes: Vec::with_capacity(overflow),
+            serials: Vec::with_capacity(values),
             btree_stack: Vec::new(),
         }
     }
@@ -342,14 +369,15 @@ impl RowScratch {
 
     fn prepare_row(&mut self) {
         self.values.clear();
-        self.overflow_buf.clear();
+        self.bytes.clear();
+        self.serials.clear();
     }
 
-    fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>) {
-        (&mut self.values, &mut self.overflow_buf)
+    fn split_mut(&mut self) -> (&mut Vec<ValueSlot>, &mut Vec<u8>, &mut Vec<u64>) {
+        (&mut self.values, &mut self.bytes, &mut self.serials)
     }
 
-    fn values_slice(&self) -> &[ValueRefRaw] {
+    fn values_slice(&self) -> &[ValueSlot] {
         self.values.as_slice()
     }
 }
@@ -831,7 +859,7 @@ fn read_table_cell_into(
     scratch: &mut RowScratch,
 ) -> Result<i64> {
     scratch.prepare_row();
-    let (values, spill) = scratch.split_mut();
+    let (values, bytes, serials) = scratch.split_mut();
     let usable = page.usable_bytes();
     if offset as usize >= usable.len() {
         return Err(Error::Corrupted("cell offset out of bounds"));
@@ -885,7 +913,7 @@ fn read_table_cell_into(
 
     let payload =
         OverflowPayload::new(pager, payload_length, &usable[start..end_local], overflow_page);
-    decode_record_into_overflow(&payload, values, spill)?;
+    decode_record_into_overflow(&payload, values, bytes, serials)?;
     Ok(rowid)
 }
 
@@ -1093,12 +1121,6 @@ pub(crate) fn assemble_overflow_payload(
     Ok(())
 }
 
-#[derive(Debug)]
-enum ValueBytes {
-    Inline(RawBytes),
-    Spill { start: usize, len: usize },
-}
-
 fn push_checked<T>(out: &mut Vec<T>, value: T, kind: &'static str) -> Result<()> {
     if out.len() == out.capacity() {
         let needed = out.len().saturating_add(1);
@@ -1108,10 +1130,10 @@ fn push_checked<T>(out: &mut Vec<T>, value: T, kind: &'static str) -> Result<()>
     Ok(())
 }
 
-fn ensure_spill_capacity(spill: &Vec<u8>, additional: usize) -> Result<()> {
-    let needed = spill.len().saturating_add(additional);
-    if needed > spill.capacity() {
-        return Err(Error::ScratchTooSmall { kind: "spill", needed, capacity: spill.capacity() });
+fn ensure_bytes_capacity(bytes: &Vec<u8>, additional: usize) -> Result<()> {
+    let needed = bytes.len().saturating_add(additional);
+    if needed > bytes.capacity() {
+        return Err(Error::ScratchTooSmall { kind: "bytes", needed, capacity: bytes.capacity() });
     }
     Ok(())
 }
@@ -1253,9 +1275,9 @@ impl<'row> OverflowCursor<'row> {
         Ok(u64::from_be_bytes(buf))
     }
 
-    fn read_value_bytes(&mut self, len: usize, spill: &mut Vec<u8>) -> Result<ValueBytes> {
+    fn take_span(&mut self, len: usize, bytes: &mut Vec<u8>) -> Result<BytesSpan> {
         if len == 0 {
-            return Ok(ValueBytes::Inline(RawBytes::from_slice(&[])));
+            return Ok(BytesSpan::mmap(&[]));
         }
 
         self.ensure_segment("record payload shorter than declared")?;
@@ -1264,11 +1286,11 @@ impl<'row> OverflowCursor<'row> {
             let offset = self.pos - self.segment_start;
             let slice = &self.segment[offset..offset + len];
             self.pos += len;
-            return Ok(ValueBytes::Inline(RawBytes::from_slice(slice)));
+            return Ok(BytesSpan::mmap(slice));
         }
 
-        ensure_spill_capacity(spill, len)?;
-        let start = spill.len();
+        ensure_bytes_capacity(bytes, len)?;
+        let start = bytes.len();
         let mut remaining = len;
         while remaining > 0 {
             self.ensure_segment("record payload shorter than declared")?;
@@ -1278,12 +1300,13 @@ impl<'row> OverflowCursor<'row> {
             }
             let take = remaining.min(available);
             let offset = self.pos - self.segment_start;
-            spill.extend_from_slice(&self.segment[offset..offset + take]);
+            bytes.extend_from_slice(&self.segment[offset..offset + take]);
             self.pos += take;
             remaining -= take;
         }
 
-        Ok(ValueBytes::Spill { start, len })
+        let slice = &bytes[start..start + len];
+        Ok(BytesSpan::scratch(slice))
     }
 
     fn skip(&mut self, mut len: usize) -> Result<()> {
@@ -1304,11 +1327,13 @@ impl<'row> OverflowCursor<'row> {
 fn decode_record_project_into_overflow(
     payload: &OverflowPayload<'_>,
     needed_cols: Option<&[u16]>,
-    out: &mut Vec<ValueRefRaw>,
-    spill: &mut Vec<u8>,
+    out: &mut Vec<ValueSlot>,
+    bytes: &mut Vec<u8>,
+    serials: &mut Vec<u64>,
 ) -> Result<usize> {
     out.clear();
-    spill.clear();
+    bytes.clear();
+    serials.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
     let header_len = serial_cursor.read_varint("record header truncated")? as usize;
@@ -1317,54 +1342,49 @@ fn decode_record_project_into_overflow(
         return Err(Error::Corrupted("invalid record header length"));
     }
 
+    while serial_cursor.position() < header_len {
+        let serial = serial_cursor.read_varint("record header truncated")?;
+        if serial_cursor.position() > header_len {
+            return Err(Error::Corrupted("record header truncated"));
+        }
+        push_checked(serials, serial, "serials")?;
+    }
+
     let mut value_cursor = OverflowCursor::new(payload, header_len)?;
     if let Some(needed_cols) = needed_cols {
         let mut needed_iter = needed_cols.iter().copied();
         let mut next_needed = needed_iter.next();
-        let mut column_count = 0usize;
-        while serial_cursor.position() < header_len {
-            let serial = serial_cursor.read_varint("record header truncated")?;
-            if serial_cursor.position() > header_len {
-                return Err(Error::Corrupted("record header truncated"));
-            }
-            let col_idx = column_count as u16;
+        for (idx, serial) in serials.iter().copied().enumerate() {
+            let col_idx = idx as u16;
             if Some(col_idx) == next_needed {
-                let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
+                let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, bytes)?;
                 push_checked(out, raw, "values")?;
                 next_needed = needed_iter.next();
             } else {
                 skip_value_at_cursor(serial, &mut value_cursor)?;
             }
-            column_count += 1;
         }
-
-        Ok(column_count)
     } else {
-        let mut column_count = 0usize;
-        while serial_cursor.position() < header_len {
-            let serial = serial_cursor.read_varint("record header truncated")?;
-            if serial_cursor.position() > header_len {
-                return Err(Error::Corrupted("record header truncated"));
-            }
-            let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
+        for serial in serials.iter().copied() {
+            let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, bytes)?;
             push_checked(out, raw, "values")?;
-            column_count += 1;
         }
-
-        Ok(column_count)
     }
+
+    Ok(serials.len())
 }
 
 pub(crate) fn decode_record_project_into(
     payload: RecordPayload<'_>,
     needed_cols: Option<&[u16]>,
-    out: &mut Vec<ValueRefRaw>,
-    spill: &mut Vec<u8>,
+    out: &mut Vec<ValueSlot>,
+    bytes: &mut Vec<u8>,
+    serials: &mut Vec<u64>,
 ) -> Result<usize> {
     match payload {
         RecordPayload::Inline(bytes) => decode_record_project_into_bytes(bytes, needed_cols, out),
         RecordPayload::Overflow(payload) => {
-            decode_record_project_into_overflow(&payload, needed_cols, out, spill)
+            decode_record_project_into_overflow(&payload, needed_cols, out, bytes, serials)
         }
     }
 }
@@ -1372,7 +1392,7 @@ pub(crate) fn decode_record_project_into(
 fn decode_record_project_into_bytes(
     payload: &[u8],
     needed_cols: Option<&[u16]>,
-    out: &mut Vec<ValueRefRaw>,
+    out: &mut Vec<ValueSlot>,
 ) -> Result<usize> {
     out.clear();
 
@@ -1436,15 +1456,15 @@ fn decode_record_project_into_bytes(
 pub(crate) fn decode_record_column(
     payload: RecordPayload<'_>,
     col: u16,
-    spill: &mut Vec<u8>,
-) -> Result<Option<ValueRefRaw>> {
+    bytes: &mut Vec<u8>,
+) -> Result<Option<ValueSlot>> {
     match payload {
         RecordPayload::Inline(bytes) => decode_record_column_bytes(bytes, col),
-        RecordPayload::Overflow(payload) => decode_record_column_overflow(&payload, col, spill),
+        RecordPayload::Overflow(payload) => decode_record_column_overflow(&payload, col, bytes),
     }
 }
 
-fn decode_record_column_bytes(payload: &[u8], col: u16) -> Result<Option<ValueRefRaw>> {
+fn decode_record_column_bytes(payload: &[u8], col: u16) -> Result<Option<ValueSlot>> {
     let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
     let mut header_pos = 0usize;
     let header_len = if first < 0x80 {
@@ -1484,7 +1504,7 @@ fn decode_record_column_bytes(payload: &[u8], col: u16) -> Result<Option<ValueRe
     Ok(None)
 }
 
-fn decode_record_into_bytes(payload: &[u8], out: &mut Vec<ValueRefRaw>) -> Result<()> {
+fn decode_record_into_bytes(payload: &[u8], out: &mut Vec<ValueSlot>) -> Result<()> {
     out.clear();
 
     let mut header_pos = 0usize;
@@ -1519,11 +1539,13 @@ fn decode_record_into_bytes(payload: &[u8], out: &mut Vec<ValueRefRaw>) -> Resul
 
 fn decode_record_into_overflow(
     payload: &OverflowPayload<'_>,
-    out: &mut Vec<ValueRefRaw>,
-    spill: &mut Vec<u8>,
+    out: &mut Vec<ValueSlot>,
+    bytes: &mut Vec<u8>,
+    serials: &mut Vec<u64>,
 ) -> Result<()> {
     out.clear();
-    spill.clear();
+    bytes.clear();
+    serials.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
     let header_len = serial_cursor.read_varint("record header truncated")? as usize;
@@ -1532,13 +1554,17 @@ fn decode_record_into_overflow(
         return Err(Error::Corrupted("invalid record header length"));
     }
 
-    let mut value_cursor = OverflowCursor::new(payload, header_len)?;
     while serial_cursor.position() < header_len {
         let serial = serial_cursor.read_varint("record header truncated")?;
         if serial_cursor.position() > header_len {
             return Err(Error::Corrupted("record header truncated"));
         }
-        let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
+        push_checked(serials, serial, "serials")?;
+    }
+
+    let mut value_cursor = OverflowCursor::new(payload, header_len)?;
+    for serial in serials.iter().copied() {
+        let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, bytes)?;
         push_checked(out, raw, "values")?;
     }
 
@@ -1548,9 +1574,9 @@ fn decode_record_into_overflow(
 fn decode_record_column_overflow(
     payload: &OverflowPayload<'_>,
     col: u16,
-    spill: &mut Vec<u8>,
-) -> Result<Option<ValueRefRaw>> {
-    spill.clear();
+    bytes: &mut Vec<u8>,
+) -> Result<Option<ValueSlot>> {
+    bytes.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
     let header_len = serial_cursor.read_varint("record header truncated")? as usize;
@@ -1570,7 +1596,7 @@ fn decode_record_column_overflow(
         }
 
         if idx == target {
-            let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, spill)?;
+            let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, bytes)?;
             return Ok(Some(raw));
         } else {
             skip_value_at_cursor(serial, &mut value_cursor)?;
@@ -1606,25 +1632,25 @@ fn serial_type_len(serial_type: u64) -> Result<usize> {
     }
 }
 
-fn decode_value_ref_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Result<ValueRefRaw> {
+fn decode_value_ref_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Result<ValueSlot> {
     let value = match serial_type {
-        0 => ValueRefRaw::Null,
-        1 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 1)?),
-        2 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 2)?),
-        3 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 3)?),
-        4 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 4)?),
-        5 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 6)?),
-        6 => ValueRefRaw::Integer(read_signed_be_at(bytes, pos, 8)?),
-        7 => ValueRefRaw::Real(f64::from_bits(read_u64_be_at(bytes, pos)?)),
-        8 => ValueRefRaw::Integer(0),
-        9 => ValueRefRaw::Integer(1),
+        0 => ValueSlot::Null,
+        1 => ValueSlot::Integer(read_signed_be_at(bytes, pos, 1)?),
+        2 => ValueSlot::Integer(read_signed_be_at(bytes, pos, 2)?),
+        3 => ValueSlot::Integer(read_signed_be_at(bytes, pos, 3)?),
+        4 => ValueSlot::Integer(read_signed_be_at(bytes, pos, 4)?),
+        5 => ValueSlot::Integer(read_signed_be_at(bytes, pos, 6)?),
+        6 => ValueSlot::Integer(read_signed_be_at(bytes, pos, 8)?),
+        7 => ValueSlot::Real(f64::from_bits(read_u64_be_at(bytes, pos)?)),
+        8 => ValueSlot::Integer(0),
+        9 => ValueSlot::Integer(1),
         serial if serial >= 12 && serial % 2 == 0 => {
             let len = ((serial - 12) / 2) as usize;
-            ValueRefRaw::Blob(RawBytes::from_slice(read_exact_bytes_at(bytes, pos, len)?))
+            ValueSlot::Blob(BytesSpan::mmap(read_exact_bytes_at(bytes, pos, len)?))
         }
         serial if serial >= 13 => {
             let len = ((serial - 13) / 2) as usize;
-            ValueRefRaw::Text(RawBytes::from_slice(read_exact_bytes_at(bytes, pos, len)?))
+            ValueSlot::Text(BytesSpan::mmap(read_exact_bytes_at(bytes, pos, len)?))
         }
         other => return Err(Error::UnsupportedSerialType(other)),
     };
@@ -1635,38 +1661,26 @@ fn decode_value_ref_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Resul
 fn decode_value_ref_at_cursor(
     serial_type: u64,
     cursor: &mut OverflowCursor<'_>,
-    spill: &mut Vec<u8>,
-) -> Result<ValueRefRaw> {
+    bytes: &mut Vec<u8>,
+) -> Result<ValueSlot> {
     let value = match serial_type {
-        0 => ValueRefRaw::Null,
-        1 => ValueRefRaw::Integer(cursor.read_signed_be(1)?),
-        2 => ValueRefRaw::Integer(cursor.read_signed_be(2)?),
-        3 => ValueRefRaw::Integer(cursor.read_signed_be(3)?),
-        4 => ValueRefRaw::Integer(cursor.read_signed_be(4)?),
-        5 => ValueRefRaw::Integer(cursor.read_signed_be(6)?),
-        6 => ValueRefRaw::Integer(cursor.read_signed_be(8)?),
-        7 => ValueRefRaw::Real(f64::from_bits(cursor.read_u64_be()?)),
-        8 => ValueRefRaw::Integer(0),
-        9 => ValueRefRaw::Integer(1),
+        0 => ValueSlot::Null,
+        1 => ValueSlot::Integer(cursor.read_signed_be(1)?),
+        2 => ValueSlot::Integer(cursor.read_signed_be(2)?),
+        3 => ValueSlot::Integer(cursor.read_signed_be(3)?),
+        4 => ValueSlot::Integer(cursor.read_signed_be(4)?),
+        5 => ValueSlot::Integer(cursor.read_signed_be(6)?),
+        6 => ValueSlot::Integer(cursor.read_signed_be(8)?),
+        7 => ValueSlot::Real(f64::from_bits(cursor.read_u64_be()?)),
+        8 => ValueSlot::Integer(0),
+        9 => ValueSlot::Integer(1),
         serial if serial >= 12 && serial % 2 == 0 => {
             let len = ((serial - 12) / 2) as usize;
-            match cursor.read_value_bytes(len, spill)? {
-                ValueBytes::Inline(raw) => ValueRefRaw::Blob(raw),
-                ValueBytes::Spill { start, len } => {
-                    let slice = &spill[start..start + len];
-                    ValueRefRaw::Blob(RawBytes::from_slice(slice))
-                }
-            }
+            ValueSlot::Blob(cursor.take_span(len, bytes)?)
         }
         serial if serial >= 13 => {
             let len = ((serial - 13) / 2) as usize;
-            match cursor.read_value_bytes(len, spill)? {
-                ValueBytes::Inline(raw) => ValueRefRaw::Text(raw),
-                ValueBytes::Spill { start, len } => {
-                    let slice = &spill[start..start + len];
-                    ValueRefRaw::Text(RawBytes::from_slice(slice))
-                }
-            }
+            ValueSlot::Text(cursor.take_span(len, bytes)?)
         }
         other => return Err(Error::UnsupportedSerialType(other)),
     };

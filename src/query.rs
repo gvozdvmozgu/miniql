@@ -1,5 +1,5 @@
 use crate::pager::{PageId, Pager};
-use crate::table::{self, ValueRef, ValueRefRaw};
+use crate::table::{self, ValueRef, ValueSlot};
 
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -148,9 +148,10 @@ impl std::ops::Not for Expr {
 
 #[derive(Debug, Default)]
 pub struct ScanScratch {
-    decoded: Vec<ValueRefRaw>,
-    overflow_buf: Vec<u8>,
-    btree_stack: Vec<PageId>,
+    stack: Vec<PageId>,
+    values: Vec<ValueSlot>,
+    bytes: Vec<u8>,
+    serials: Vec<u64>,
 }
 
 impl ScanScratch {
@@ -160,29 +161,32 @@ impl ScanScratch {
 
     pub fn with_capacity(values: usize, overflow: usize) -> Self {
         Self {
-            decoded: Vec::with_capacity(values),
-            overflow_buf: Vec::with_capacity(overflow),
-            btree_stack: Vec::new(),
+            stack: Vec::new(),
+            values: Vec::with_capacity(values),
+            bytes: Vec::with_capacity(overflow),
+            serials: Vec::with_capacity(values),
         }
     }
 
-    pub(crate) fn split_mut(&mut self) -> (&mut Vec<ValueRefRaw>, &mut Vec<u8>, &mut Vec<PageId>) {
-        (&mut self.decoded, &mut self.overflow_buf, &mut self.btree_stack)
+    pub(crate) fn split_mut(
+        &mut self,
+    ) -> (&mut Vec<ValueSlot>, &mut Vec<u8>, &mut Vec<u64>, &mut Vec<PageId>) {
+        (&mut self.values, &mut self.bytes, &mut self.serials, &mut self.stack)
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct Row<'row> {
-    values: &'row [ValueRefRaw],
+    values: &'row [ValueSlot],
     proj_map: Option<&'row [usize]>,
 }
 
 impl<'row> Row<'row> {
-    pub(crate) fn from_raw(values: &'row [ValueRefRaw], proj_map: Option<&'row [usize]>) -> Self {
+    pub(crate) fn from_raw(values: &'row [ValueSlot], proj_map: Option<&'row [usize]>) -> Self {
         Self { values, proj_map }
     }
 
-    pub(crate) fn values_raw(&self) -> &'row [ValueRefRaw] {
+    pub(crate) fn values_raw(&self) -> &'row [ValueSlot] {
         self.values
     }
 
@@ -391,21 +395,24 @@ impl<'db> PreparedScan<'db> {
     pub(crate) fn eval_payload<'row>(
         &'row mut self,
         payload: table::RecordPayload<'row>,
-        decoded: &'row mut Vec<ValueRefRaw>,
-        spill: &'row mut Vec<u8>,
+        values: &'row mut Vec<ValueSlot>,
+        bytes: &'row mut Vec<u8>,
+        serials: &'row mut Vec<u64>,
     ) -> table::Result<Option<Row<'row>>> {
-        self.eval_payload_with_filters(payload, decoded, spill, true)
+        self.eval_payload_with_filters(payload, values, bytes, serials, true)
     }
 
     pub(crate) fn eval_payload_with_filters<'row>(
         &'row mut self,
         payload: table::RecordPayload<'row>,
-        decoded: &'row mut Vec<ValueRefRaw>,
-        spill: &'row mut Vec<u8>,
+        values: &'row mut Vec<ValueSlot>,
+        bytes: &'row mut Vec<u8>,
+        serials: &'row mut Vec<u64>,
         apply_filters: bool,
     ) -> table::Result<Option<Row<'row>>> {
         let needed_cols = self.plan.needed_cols.as_deref();
-        let count = table::decode_record_project_into(payload, needed_cols, decoded, spill)?;
+        let count =
+            table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
 
         if let Some(expected) = self.col_count {
             if expected != count {
@@ -420,7 +427,7 @@ impl<'db> PreparedScan<'db> {
             self.col_count = Some(count);
         }
 
-        let values = decoded.as_slice();
+        let values = values.as_slice();
         let row_eval = RowEval { values, column_count: count };
 
         if apply_filters {
@@ -455,14 +462,14 @@ impl<'db> PreparedScan<'db> {
         let limit = self.limit;
         let mut seen = 0usize;
 
-        let (decoded, overflow_buf, btree_stack) = scratch.split_mut();
+        let (values, bytes, serials, btree_stack) = scratch.split_mut();
 
         table::scan_table_cells_with_scratch_and_stack_until(
             pager,
             root,
             btree_stack,
             |rowid, payload| {
-                let Some(row) = self.eval_payload(payload, decoded, overflow_buf)? else {
+                let Some(row) = self.eval_payload(payload, values, bytes, serials)? else {
                     return Ok(None);
                 };
 
@@ -664,7 +671,7 @@ fn validate_columns(referenced: &[u16], column_count: usize) -> Option<table::Er
     None
 }
 
-fn raw_to_ref<'row>(value: ValueRefRaw) -> ValueRef<'row> {
+fn raw_to_ref<'row>(value: ValueSlot) -> ValueRef<'row> {
     // SAFETY: raw values point into the current row payload/overflow buffer and
     // are only materialized for the duration of the row callback.
     unsafe { value.as_value_ref() }
@@ -726,7 +733,7 @@ enum CmpOp {
 }
 
 struct RowEval<'row> {
-    values: &'row [ValueRefRaw],
+    values: &'row [ValueSlot],
     column_count: usize,
 }
 
@@ -921,12 +928,14 @@ mod tests {
             build_record(&[ValueRef::Integer(1), ValueRef::Integer(2), ValueRef::Integer(3)]);
         let needed = vec![0u16, 2u16];
         let mut decoded = Vec::with_capacity(needed.len());
-        let mut spill = Vec::new();
+        let mut bytes = Vec::new();
+        let mut serials = Vec::with_capacity(needed.len());
         let _ = table::decode_record_project_into(
             table::RecordPayload::Inline(&payload),
             Some(&needed),
             &mut decoded,
-            &mut spill,
+            &mut bytes,
+            &mut serials,
         )
         .expect("decode");
         assert_eq!(decoded.len(), 2);
