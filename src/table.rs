@@ -225,6 +225,8 @@ pub enum PayloadRef<'row> {
 pub struct CellRef<'row> {
     rowid: i64,
     payload: PayloadRef<'row>,
+    page_id: PageId,
+    cell_offset: u16,
 }
 
 impl<'row> CellRef<'row> {
@@ -238,6 +240,18 @@ impl<'row> CellRef<'row> {
     /// Return the payload reference for this cell.
     pub fn payload(self) -> PayloadRef<'row> {
         self.payload
+    }
+
+    #[inline]
+    /// Return the page id containing this cell.
+    pub fn page_id(self) -> PageId {
+        self.page_id
+    }
+
+    #[inline]
+    /// Return the cell offset within the page.
+    pub fn cell_offset(self) -> u16 {
+        self.cell_offset
     }
 }
 
@@ -692,7 +706,7 @@ where
             BTreeKind::TableLeaf => {
                 for idx in 0..header.cell_count as usize {
                     let offset = cell_ptr_at(cell_ptrs, idx)?;
-                    let cell = read_table_cell_ref(pager, &page, offset)?;
+                    let cell = read_table_cell_ref(pager, page_id, &page, offset)?;
                     f(cell)?;
                 }
             }
@@ -772,7 +786,7 @@ where
             BTreeKind::TableLeaf => {
                 for idx in 0..header.cell_count as usize {
                     let offset = cell_ptr_at(cell_ptrs, idx)?;
-                    let cell = read_table_cell_ref(pager, &page, offset)?;
+                    let cell = read_table_cell_ref(pager, page_id, &page, offset)?;
                     if let Some(value) = f(cell)? {
                         return Ok(Some(value));
                     }
@@ -809,6 +823,7 @@ where
 
 fn read_table_cell_ref<'row>(
     pager: &'row Pager,
+    page_id: PageId,
     page: &'row PageRef<'_>,
     offset: u16,
 ) -> Result<CellRef<'row>> {
@@ -844,7 +859,12 @@ fn read_table_cell_ref<'row>(
         if end > usable.len() {
             return Err(Error::Corrupted("payload extends past page boundary"));
         }
-        return Ok(CellRef { rowid, payload: PayloadRef::Inline(&usable[start..end]) });
+        return Ok(CellRef {
+            rowid,
+            payload: PayloadRef::Inline(&usable[start..end]),
+            page_id,
+            cell_offset: offset,
+        });
     }
 
     let local_len = local_payload_len(usable_size, payload_length)?;
@@ -863,10 +883,10 @@ fn read_table_cell_ref<'row>(
     }
     let payload =
         OverflowPayload::new(pager, payload_length, &usable[start..end_local], overflow_page);
-    Ok(CellRef { rowid, payload: PayloadRef::Overflow(payload) })
+    Ok(CellRef { rowid, payload: PayloadRef::Overflow(payload), page_id, cell_offset: offset })
 }
 
-fn read_table_cell_ref_from_bytes<'row>(
+pub(crate) fn read_table_cell_ref_from_bytes<'row>(
     pager: &'row Pager,
     page_id: PageId,
     offset: u16,
@@ -906,7 +926,12 @@ fn read_table_cell_ref_from_bytes<'row>(
         if end > usable.len() {
             return Err(Error::Corrupted("payload extends past page boundary"));
         }
-        return Ok(CellRef { rowid, payload: PayloadRef::Inline(&usable[start..end]) });
+        return Ok(CellRef {
+            rowid,
+            payload: PayloadRef::Inline(&usable[start..end]),
+            page_id,
+            cell_offset: offset,
+        });
     }
 
     let local_len = local_payload_len(usable_size, payload_length)?;
@@ -925,7 +950,7 @@ fn read_table_cell_ref_from_bytes<'row>(
     }
     let payload =
         OverflowPayload::new(pager, payload_length, &usable[start..end_local], overflow_page);
-    Ok(CellRef { rowid, payload: PayloadRef::Overflow(payload) })
+    Ok(CellRef { rowid, payload: PayloadRef::Overflow(payload), page_id, cell_offset: offset })
 }
 
 fn read_table_leaf_rowid(page: &PageRef<'_>, offset: u16) -> Result<i64> {

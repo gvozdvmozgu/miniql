@@ -1008,7 +1008,8 @@ enum NumericKey {
 #[derive(Debug, Clone)]
 struct RightRow {
     rowid: i64,
-    payload: Box<[u8]>,
+    page_id: PageId,
+    cell_offset: u16,
     numeric_key: Option<NumericKey>,
 }
 
@@ -1196,9 +1197,12 @@ where
         };
         let numeric_key = numeric_key_from_value(key_value);
 
-        let payload_bytes = payload.to_vec()?;
-        mem.charge(payload_bytes.len())?;
-        let right_row = RightRow { rowid, payload: payload_bytes.into_boxed_slice(), numeric_key };
+        let right_row = RightRow {
+            rowid,
+            page_id: cell.page_id(),
+            cell_offset: cell.cell_offset(),
+            numeric_key,
+        };
 
         match key_ref {
             HashKeyRef::Number(bits) => match numeric.entry(bits) {
@@ -1259,7 +1263,12 @@ where
                     {
                         // Hash collision on numeric key: ignore.
                     } else {
-                        let payload = table::PayloadRef::Inline(&row.payload);
+                        let cell = table::read_table_cell_ref_from_bytes(
+                            pager,
+                            row.page_id,
+                            row.cell_offset,
+                        )?;
+                        let payload = cell.payload();
                         if let Some(right_row) = right_scan.eval_payload_with_filters(
                             payload,
                             right_values,
@@ -1285,7 +1294,12 @@ where
                         {
                             continue;
                         }
-                        let payload = table::PayloadRef::Inline(&row.payload);
+                        let cell = table::read_table_cell_ref_from_bytes(
+                            pager,
+                            row.page_id,
+                            row.cell_offset,
+                        )?;
+                        let payload = cell.payload();
                         if let Some(right_row) = right_scan.eval_payload_with_filters(
                             payload,
                             right_values,

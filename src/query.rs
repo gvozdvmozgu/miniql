@@ -2,8 +2,11 @@ use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use bumpalo::Bump;
+use smallvec::SmallVec;
+
 use crate::pager::{PageId, Pager};
-use crate::table::{self, ValueRef, ValueSlot};
+use crate::table::{self, BytesSpan, RawBytes, ValueRef, ValueSlot};
 
 /// Filter expression tree used by `Scan::filter`.
 #[derive(Debug, Clone)]
@@ -680,6 +683,7 @@ impl<'db> PreparedScan<'db> {
 
         let (values, bytes, serials, btree_stack) = scratch.split_mut();
         let mut order_bytes = Vec::new();
+        let key_arena = Bump::new();
         let mut seq = 0u64;
 
         let mut heap = BinaryHeap::new();
@@ -687,22 +691,25 @@ impl<'db> PreparedScan<'db> {
 
         table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
             let rowid = cell.rowid();
-            let Some(_row) = self.eval_payload(cell.payload(), values, bytes, serials)? else {
+            let page_id = cell.page_id();
+            let cell_offset = cell.cell_offset();
+            let payload = cell.payload();
+            let Some(_row) = self.eval_payload(payload, values, bytes, serials)? else {
                 return Ok(());
             };
 
-            let payload = cell.payload().to_vec()?;
-            let inline = table::PayloadRef::Inline(payload.as_slice());
-            let mut keys = Vec::with_capacity(order_by.len());
+            let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
             for order in order_by {
-                let Some(value) = table::decode_record_column(inline, order.col, &mut order_bytes)?
+                let Some(value) =
+                    table::decode_record_column(payload, order.col, &mut order_bytes)?
                 else {
                     return Err(table::Error::Corrupted("ORDER BY column missing"));
                 };
+                let value = stabilize_sort_key_value(value, order_bytes.as_slice(), &key_arena);
                 keys.push(SortKey { value, dir: order.dir });
             }
 
-            let entry = SortEntry { rowid, payload, keys, seq };
+            let entry = SortEntry { rowid, page_id, cell_offset, keys, seq };
             seq = seq.wrapping_add(1);
 
             if let Some(limit) = limit {
@@ -725,9 +732,10 @@ impl<'db> PreparedScan<'db> {
         rows.sort();
 
         for entry in rows {
-            let payload = table::PayloadRef::Inline(entry.payload.as_slice());
+            let cell =
+                table::read_table_cell_ref_from_bytes(pager, entry.page_id, entry.cell_offset)?;
             if let Some(row) =
-                self.eval_payload_with_filters(payload, values, bytes, serials, false)?
+                self.eval_payload_with_filters(cell.payload(), values, bytes, serials, false)?
             {
                 cb(entry.rowid, row)?;
             }
@@ -746,8 +754,9 @@ struct SortKey {
 #[derive(Clone)]
 struct SortEntry {
     rowid: i64,
-    payload: Vec<u8>,
-    keys: Vec<SortKey>,
+    page_id: PageId,
+    cell_offset: u16,
+    keys: SmallVec<[SortKey; 4]>,
     seq: u64,
 }
 
@@ -783,6 +792,38 @@ impl PartialOrd for SortEntry {
 impl Ord for SortEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         self.cmp_keys(other)
+    }
+}
+
+fn stabilize_sort_key_value(value: ValueSlot, scratch_bytes: &[u8], arena: &Bump) -> ValueSlot {
+    match value {
+        ValueSlot::Text(span) => match span {
+            BytesSpan::Scratch(_) => {
+                let bytes =
+                    match unsafe { ValueSlot::Text(span).as_value_ref_with_scratch(scratch_bytes) }
+                    {
+                        ValueRef::Text(bytes) => bytes,
+                        _ => &[],
+                    };
+                let stored = arena.alloc_slice_copy(bytes);
+                ValueSlot::Text(BytesSpan::Scratch(RawBytes::from_slice(stored)))
+            }
+            _ => ValueSlot::Text(span),
+        },
+        ValueSlot::Blob(span) => match span {
+            BytesSpan::Scratch(_) => {
+                let bytes =
+                    match unsafe { ValueSlot::Blob(span).as_value_ref_with_scratch(scratch_bytes) }
+                    {
+                        ValueRef::Blob(bytes) => bytes,
+                        _ => &[],
+                    };
+                let stored = arena.alloc_slice_copy(bytes);
+                ValueSlot::Blob(BytesSpan::Scratch(RawBytes::from_slice(stored)))
+            }
+            _ => ValueSlot::Blob(span),
+        },
+        other => other,
     }
 }
 

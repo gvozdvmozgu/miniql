@@ -50,6 +50,7 @@ bumpalo = "3.19"
 hashbrown = "0.16"
 memmap2 = "0.9"
 rustc-hash = "2.1"
+smallvec = { version = "1", features = ["union"] }
 
 [[bench]]
 name = "read_table"
