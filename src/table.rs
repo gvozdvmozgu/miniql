@@ -1213,8 +1213,18 @@ impl<'row> OverflowCursor<'row> {
     }
 
     fn read_bytes_into(&mut self, out: &mut [u8], msg: &'static str) -> Result<()> {
-        for byte in out.iter_mut() {
-            *byte = self.read_byte(msg)?;
+        let mut written = 0usize;
+        while written < out.len() {
+            self.ensure_segment(msg)?;
+            let available = self.segment_end() - self.pos;
+            if available == 0 {
+                continue;
+            }
+            let take = (out.len() - written).min(available);
+            let offset = self.pos - self.segment_start;
+            out[written..written + take].copy_from_slice(&self.segment[offset..offset + take]);
+            self.pos += take;
+            written += take;
         }
         Ok(())
     }
