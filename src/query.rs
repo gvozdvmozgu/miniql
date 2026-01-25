@@ -355,20 +355,22 @@ impl<'db> CompiledScan<'db> {
 
     pub(crate) fn eval_payload<'row>(
         &'row mut self,
-        payload: &'row [u8],
+        payload: table::RecordPayload<'row>,
         decoded: &'row mut Vec<ValueRefRaw>,
+        spill: &'row mut Vec<u8>,
     ) -> table::Result<Option<Row<'row>>> {
-        self.eval_payload_with_filters(payload, decoded, true)
+        self.eval_payload_with_filters(payload, decoded, spill, true)
     }
 
     pub(crate) fn eval_payload_with_filters<'row>(
         &'row mut self,
-        payload: &'row [u8],
+        payload: table::RecordPayload<'row>,
         decoded: &'row mut Vec<ValueRefRaw>,
+        spill: &'row mut Vec<u8>,
         apply_filters: bool,
     ) -> table::Result<Option<Row<'row>>> {
         let needed_cols = self.plan.needed_cols.as_deref();
-        let count = table::decode_record_project_into(payload, needed_cols, decoded)?;
+        let count = table::decode_record_project_into(payload, needed_cols, decoded, spill)?;
 
         if self.col_count.is_none() {
             if let Some(err) = validate_columns(&self.plan.referenced_cols, count) {
@@ -417,10 +419,9 @@ impl<'db> CompiledScan<'db> {
         table::scan_table_cells_with_scratch_and_stack_until(
             pager,
             root,
-            overflow_buf,
             btree_stack,
             |rowid, payload| {
-                let Some(row) = self.eval_payload(payload, decoded)? else {
+                let Some(row) = self.eval_payload(payload, decoded, overflow_buf)? else {
                     return Ok(None);
                 };
 
@@ -878,9 +879,15 @@ mod tests {
         let payload =
             build_record(&[ValueRef::Integer(1), ValueRef::Integer(2), ValueRef::Integer(3)]);
         let mut decoded = Vec::new();
+        let mut spill = Vec::new();
         let needed = vec![0u16, 2u16];
-        let _ = table::decode_record_project_into(&payload, Some(&needed), &mut decoded)
-            .expect("decode");
+        let _ = table::decode_record_project_into(
+            table::RecordPayload::Inline(&payload),
+            Some(&needed),
+            &mut decoded,
+            &mut spill,
+        )
+        .expect("decode");
         assert_eq!(decoded.len(), 2);
     }
 

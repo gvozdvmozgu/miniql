@@ -101,13 +101,13 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                         let mid = (lo + hi) / 2;
                         let offset =
                             u16::from_be_bytes([cell_ptrs[mid * 2], cell_ptrs[mid * 2 + 1]]);
-                        let (_child, payload) = read_index_interior_cell(
-                            self.pager,
-                            &page,
-                            offset,
+                        let (_child, payload) =
+                            read_index_interior_cell(self.pager, &page, offset)?;
+                        let key = decode_key_from_payload(
+                            self.key_col,
+                            payload,
                             &mut self.scratch.overflow_buf,
                         )?;
-                        let key = decode_key_from_payload(self.key_col, payload)?;
                         let cmp = compare_total(target, key);
 
                         if cmp == Ordering::Greater {
@@ -119,12 +119,8 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
 
                     if lo < cell_count {
                         let offset = u16::from_be_bytes([cell_ptrs[lo * 2], cell_ptrs[lo * 2 + 1]]);
-                        let (child, _payload) = read_index_interior_cell(
-                            self.pager,
-                            &page,
-                            offset,
-                            &mut self.scratch.overflow_buf,
-                        )?;
+                        let (child, _payload) =
+                            read_index_interior_cell(self.pager, &page, offset)?;
                         self.scratch.stack.push(StackEntry { page_id, child_slot: lo });
                         page_id = child;
                     } else {
@@ -221,9 +217,9 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         while lo < hi {
             let mid = (lo + hi) / 2;
             let offset = u16::from_be_bytes([cell_ptrs[mid * 2], cell_ptrs[mid * 2 + 1]]);
-            let payload =
-                read_index_leaf_payload(self.pager, page, offset, &mut self.scratch.overflow_buf)?;
-            let key = decode_key_from_payload(self.key_col, payload)?;
+            let payload = read_index_leaf_payload(self.pager, page, offset)?;
+            let key =
+                decode_key_from_payload(self.key_col, payload, &mut self.scratch.overflow_buf)?;
             let cmp = compare_total(target, key);
             if cmp == Ordering::Greater {
                 lo = mid + 1;
@@ -252,9 +248,13 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
             cell_ptrs[leaf.cell_index * 2],
             cell_ptrs[leaf.cell_index * 2 + 1],
         ]);
-        let payload =
-            read_index_leaf_payload(self.pager, page, offset, &mut self.scratch.overflow_buf)?;
-        table::decode_record_project_into(payload, None, &mut self.scratch.decoded)?;
+        let payload = read_index_leaf_payload(self.pager, page, offset)?;
+        table::decode_record_project_into(
+            payload,
+            None,
+            &mut self.scratch.decoded,
+            &mut self.scratch.overflow_buf,
+        )?;
         self.cached_cell = Some((leaf.page_id, leaf.cell_index));
         Ok(())
     }
@@ -271,13 +271,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                     .stack
                     .push(StackEntry { page_id: entry.page_id, child_slot: next_slot });
 
-                let child = child_page_for_slot(
-                    self.pager,
-                    &page,
-                    &header,
-                    next_slot,
-                    &mut self.scratch.overflow_buf,
-                )?;
+                let child = child_page_for_slot(self.pager, &page, &header, next_slot)?;
                 let leaf = self.descend_leftmost(child)?;
                 self.leaf = Some(leaf);
                 self.cached_cell = None;
@@ -310,12 +304,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                 return Err(table::Error::Corrupted("interior index page has no cells"));
             }
             let offset = u16::from_be_bytes([cell_ptrs[0], cell_ptrs[1]]);
-            let (child, _payload) = read_index_interior_cell(
-                self.pager,
-                &page,
-                offset,
-                &mut self.scratch.overflow_buf,
-            )?;
+            let (child, _payload) = read_index_interior_cell(self.pager, &page, offset)?;
             self.scratch.stack.push(StackEntry { page_id, child_slot: 0 });
             page_id = child;
         }
@@ -357,9 +346,13 @@ pub(crate) fn index_key_len(
             IndexKind::Leaf => {
                 let cell_ptrs = cell_ptrs(&page, &header)?;
                 let offset = u16::from_be_bytes([cell_ptrs[0], cell_ptrs[1]]);
-                let payload =
-                    read_index_leaf_payload(pager, &page, offset, &mut scratch.overflow_buf)?;
-                let count = table::decode_record_project_into(payload, None, &mut scratch.decoded)?;
+                let payload = read_index_leaf_payload(pager, &page, offset)?;
+                let count = table::decode_record_project_into(
+                    payload,
+                    None,
+                    &mut scratch.decoded,
+                    &mut scratch.overflow_buf,
+                )?;
                 if count == 0 {
                     return Err(table::Error::Corrupted("index record has no columns"));
                 }
@@ -368,8 +361,7 @@ pub(crate) fn index_key_len(
             IndexKind::Interior => {
                 let cell_ptrs = cell_ptrs(&page, &header)?;
                 let offset = u16::from_be_bytes([cell_ptrs[0], cell_ptrs[1]]);
-                let (child, _payload) =
-                    read_index_interior_cell(pager, &page, offset, &mut scratch.overflow_buf)?;
+                let (child, _payload) = read_index_interior_cell(pager, &page, offset)?;
                 page_id = child;
             }
         }
@@ -411,8 +403,12 @@ fn cmp_f64_total(left: f64, right: f64) -> Ordering {
     }
 }
 
-fn decode_key_from_payload<'row>(key_col: u16, payload: &'row [u8]) -> Result<ValueRef<'row>> {
-    let Some(raw) = table::decode_record_column(payload, key_col)? else {
+fn decode_key_from_payload<'row>(
+    key_col: u16,
+    payload: table::RecordPayload<'row>,
+    spill: &'row mut Vec<u8>,
+) -> Result<ValueRef<'row>> {
+    let Some(raw) = table::decode_record_column(payload, key_col, spill)? else {
         return Err(JoinError::IndexKeyNotComparable.into());
     };
     Ok(unsafe { raw.as_value_ref() })
@@ -494,30 +490,27 @@ fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &IndexHeader) -> Result<&'a [u8]
 }
 
 fn read_index_leaf_payload<'row>(
-    pager: &Pager,
+    pager: &'row Pager,
     page: &'row PageRef<'_>,
     offset: u16,
-    overflow_buf: &'row mut Vec<u8>,
-) -> Result<&'row [u8]> {
-    read_index_payload(pager, page, offset, overflow_buf, false).map(|(_, payload)| payload)
+) -> Result<table::RecordPayload<'row>> {
+    read_index_payload(pager, page, offset, false).map(|(_, payload)| payload)
 }
 
 fn read_index_interior_cell<'row>(
-    pager: &Pager,
+    pager: &'row Pager,
     page: &'row PageRef<'_>,
     offset: u16,
-    overflow_buf: &'row mut Vec<u8>,
-) -> Result<(PageId, &'row [u8])> {
-    read_index_payload(pager, page, offset, overflow_buf, true)
+) -> Result<(PageId, table::RecordPayload<'row>)> {
+    read_index_payload(pager, page, offset, true)
 }
 
 fn read_index_payload<'row>(
-    pager: &Pager,
+    pager: &'row Pager,
     page: &'row PageRef<'_>,
     offset: u16,
-    overflow_buf: &'row mut Vec<u8>,
     has_child: bool,
-) -> Result<(PageId, &'row [u8])> {
+) -> Result<(PageId, table::RecordPayload<'row>)> {
     let usable = page.usable_bytes();
     let mut pos = offset as usize;
     if pos >= usable.len() {
@@ -552,7 +545,7 @@ fn read_index_payload<'row>(
         if end > usable.len() {
             return Err(table::Error::Corrupted("payload extends past page boundary"));
         }
-        return Ok((child, &usable[start..end]));
+        return Ok((child, table::RecordPayload::Inline(&usable[start..end])));
     }
 
     let local_len = table::local_payload_len(usable_size, payload_length)?;
@@ -560,8 +553,6 @@ fn read_index_payload<'row>(
     if end_local > usable.len() {
         return Err(table::Error::Corrupted("payload extends past page boundary"));
     }
-
-    overflow_buf.clear();
 
     let overflow_end = end_local + 4;
     if overflow_end > usable.len() {
@@ -571,16 +562,13 @@ fn read_index_payload<'row>(
     if overflow_page == 0 {
         return Err(table::Error::OverflowChainTruncated);
     }
-    table::assemble_overflow_payload(
+    let payload = table::OverflowPayload::new(
         pager,
         payload_length,
-        local_len,
-        overflow_page,
         &usable[start..end_local],
-        overflow_buf,
-    )?;
-    let payload = overflow_buf.as_slice();
-    Ok((child, payload))
+        overflow_page,
+    );
+    Ok((child, table::RecordPayload::Overflow(payload)))
 }
 
 fn child_page_for_slot(
@@ -588,12 +576,11 @@ fn child_page_for_slot(
     page: &PageRef<'_>,
     header: &IndexHeader,
     child_slot: usize,
-    overflow_buf: &mut Vec<u8>,
 ) -> Result<PageId> {
     if child_slot < header.cell_count as usize {
         let cell_ptrs = cell_ptrs(page, header)?;
         let offset = u16::from_be_bytes([cell_ptrs[child_slot * 2], cell_ptrs[child_slot * 2 + 1]]);
-        let (child, _payload) = read_index_interior_cell(pager, page, offset, overflow_buf)?;
+        let (child, _payload) = read_index_interior_cell(pager, page, offset)?;
         Ok(child)
     } else {
         let right_most = header

@@ -466,9 +466,9 @@ where
 
         while cursor.key_eq(left_key_value)? {
             let right_rowid = cursor.current_rowid()?;
-            if let Some(payload) =
-                table::lookup_rowid_payload(pager, right_root, right_rowid, right_overflow)?
-                && let Some(right_row) = right_scan.eval_payload(payload, right_decoded)?
+            if let Some(payload) = table::lookup_rowid_payload(pager, right_root, right_rowid)?
+                && let Some(right_row) =
+                    right_scan.eval_payload(payload, right_decoded, right_overflow)?
             {
                 let right_out = right_meta.output_row(right_row.values_raw());
                 cb(JoinedRow { left_rowid, right_rowid, left: left_out, right: right_out })?;
@@ -524,9 +524,9 @@ where
         let ValueRef::Integer(target_rowid) = left_key_value else {
             return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
         };
-        if let Some(payload) =
-            table::lookup_rowid_payload(pager, right_root, target_rowid, right_overflow)?
-            && let Some(right_row) = right_scan.eval_payload(payload, right_decoded)?
+        if let Some(payload) = table::lookup_rowid_payload(pager, right_root, target_rowid)?
+            && let Some(right_row) =
+                right_scan.eval_payload(payload, right_decoded, right_overflow)?
         {
             let right_out = right_meta.output_row(right_row.values_raw());
             cb(JoinedRow {
@@ -665,9 +665,13 @@ where
                 RowIdList::One(v) => {
                     let right_rowid = *v;
                     if let Some(payload) =
-                        table::lookup_rowid_payload(pager, right_root, right_rowid, right_overflow)?
-                        && let Some(right_row) =
-                            right_scan.eval_payload_with_filters(payload, right_decoded, false)?
+                        table::lookup_rowid_payload(pager, right_root, right_rowid)?
+                        && let Some(right_row) = right_scan.eval_payload_with_filters(
+                            payload,
+                            right_decoded,
+                            right_overflow,
+                            false,
+                        )?
                     {
                         let right_out = right_meta.output_row(right_row.values_raw());
                         cb(JoinedRow {
@@ -681,13 +685,14 @@ where
                 }
                 RowIdList::Many(vs) => {
                     for &right_rowid in vs.iter() {
-                        if let Some(payload) = table::lookup_rowid_payload(
-                            pager,
-                            right_root,
-                            right_rowid,
-                            right_overflow,
-                        )? && let Some(right_row) =
-                            right_scan.eval_payload_with_filters(payload, right_decoded, false)?
+                        if let Some(payload) =
+                            table::lookup_rowid_payload(pager, right_root, right_rowid)?
+                            && let Some(right_row) = right_scan.eval_payload_with_filters(
+                                payload,
+                                right_decoded,
+                                right_overflow,
+                                false,
+                            )?
                         {
                             let right_out = right_meta.output_row(right_row.values_raw());
                             cb(JoinedRow {
@@ -1487,10 +1492,10 @@ fn resolve_right_null_len(
     let count = table::scan_table_cells_with_scratch_and_stack_until(
         pager,
         root,
-        right_overflow,
         &mut stack,
         |_, payload| {
-            let count = table::decode_record_project_into(payload, None, right_decoded)?;
+            let count =
+                table::decode_record_project_into(payload, None, right_decoded, right_overflow)?;
             Ok(Some(count))
         },
     )?;

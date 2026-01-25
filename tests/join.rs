@@ -64,19 +64,20 @@ fn lookup_rowid_payload_matches_scan() {
     let (users_root, _orders_root, _index_root) = join_roots(&pager);
 
     let mut payloads = Vec::new();
-    let mut overflow = Vec::new();
-    table::scan_table_cells_with_scratch(&pager, users_root, &mut overflow, |rowid, payload| {
-        payloads.push((rowid, payload.to_vec()));
+    table::scan_table_cells_with_scratch(&pager, users_root, |rowid, payload| {
+        let bytes = payload.to_vec()?;
+        payloads.push((rowid, bytes));
         Ok(())
     })
     .expect("scan users table");
 
     for (rowid, payload) in payloads {
-        let mut overflow = Vec::new();
-        let found = table::lookup_rowid_payload(&pager, users_root, rowid, &mut overflow)
+        let found = table::lookup_rowid_payload(&pager, users_root, rowid)
             .expect("lookup rowid")
-            .expect("row exists");
-        assert_eq!(found, payload.as_slice());
+            .expect("row exists")
+            .to_vec()
+            .expect("materialize payload");
+        assert_eq!(found, payload);
     }
 }
 
