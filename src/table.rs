@@ -826,8 +826,60 @@ fn read_table_cell_into(
 ) -> Result<i64> {
     scratch.prepare_row();
     let (values, spill) = scratch.split_mut();
-    let (rowid, payload) = read_table_cell_payload(pager, page, offset)?;
-    decode_record_into(payload, values, spill)?;
+    let usable = page.usable_bytes();
+    if offset as usize >= usable.len() {
+        return Err(Error::Corrupted("cell offset out of bounds"));
+    }
+
+    let mut pos = offset as usize;
+    let remaining = usable.len().saturating_sub(pos);
+    let (payload_length, rowid) = if remaining >= 18 {
+        // SAFETY: remaining >= 18 guarantees two varints (max 9 bytes each) are
+        // in-bounds.
+        let payload_length = unsafe { read_varint_unchecked_at(usable, &mut pos) };
+        let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) } as i64;
+        (payload_length, rowid)
+    } else {
+        let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
+        let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+        (payload_length, rowid)
+    };
+    let payload_length =
+        usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
+    if payload_length > MAX_PAYLOAD_BYTES {
+        return Err(Error::PayloadTooLarge(payload_length));
+    }
+
+    let start = pos;
+    let usable_size = page.usable_size();
+    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted("usable size underflow"))?;
+    if payload_length <= x {
+        let end = start + payload_length;
+        if end > usable.len() {
+            return Err(Error::Corrupted("payload extends past page boundary"));
+        }
+        decode_record_into_bytes(&usable[start..end], values)?;
+        return Ok(rowid);
+    }
+
+    let local_len = local_payload_len(usable_size, payload_length)?;
+    let end_local = start + local_len;
+    if end_local > usable.len() {
+        return Err(Error::Corrupted("payload extends past page boundary"));
+    }
+
+    let overflow_end = end_local + 4;
+    if overflow_end > usable.len() {
+        return Err(Error::Corrupted("overflow pointer out of bounds"));
+    }
+    let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
+    if overflow_page == 0 {
+        return Err(Error::OverflowChainTruncated);
+    }
+
+    let payload =
+        OverflowPayload::new(pager, payload_length, &usable[start..end_local], overflow_page);
+    decode_record_into_overflow(&payload, values, spill)?;
     Ok(rowid)
 }
 
@@ -1324,9 +1376,7 @@ pub(crate) fn decode_record_project_into(
     spill: &mut Vec<u8>,
 ) -> Result<usize> {
     match payload {
-        RecordPayload::Inline(bytes) => {
-            decode_record_project_into_bytes(bytes, needed_cols, out)
-        }
+        RecordPayload::Inline(bytes) => decode_record_project_into_bytes(bytes, needed_cols, out),
         RecordPayload::Overflow(payload) => {
             decode_record_project_into_overflow(&payload, needed_cols, out, spill)
         }
@@ -1444,17 +1494,6 @@ fn decode_record_column_bytes(payload: &[u8], col: u16) -> Result<Option<ValueRe
         idx += 1;
     }
     Ok(None)
-}
-
-fn decode_record_into(
-    payload: RecordPayload<'_>,
-    out: &mut Vec<ValueRefRaw>,
-    spill: &mut Vec<u8>,
-) -> Result<()> {
-    match payload {
-        RecordPayload::Inline(bytes) => decode_record_into_bytes(bytes, out),
-        RecordPayload::Overflow(payload) => decode_record_into_overflow(&payload, out, spill),
-    }
 }
 
 fn decode_record_into_bytes(payload: &[u8], out: &mut Vec<ValueRefRaw>) -> Result<()> {
