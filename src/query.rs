@@ -1,3 +1,5 @@
+use std::cell::OnceCell;
+
 use crate::pager::{PageId, Pager};
 use crate::table::{self, ValueRef, ValueSlot};
 
@@ -269,11 +271,13 @@ pub struct Scan<'db> {
 pub struct PreparedScan<'db> {
     pager: &'db Pager,
     root: PageId,
-    plan: Plan,
+    needed_cols: Option<Box<[u16]>>,
+    proj_map: Option<Box<[usize]>>,
+    referenced_cols: Box<[u16]>,
     compiled_expr: Option<CompiledExpr>,
     filter_fn: Option<FilterFn<'db>>,
     limit: Option<usize>,
-    col_count: Option<usize>,
+    column_count_hint: OnceCell<usize>,
 }
 
 #[deprecated(note = "use PreparedScan")]
@@ -319,13 +323,20 @@ impl<'db> Scan<'db> {
         self
     }
 
-    pub fn filter_fn<F>(mut self, f: F) -> Self
+    pub fn filter_fn_slow<F>(mut self, f: F) -> Self
     where
         F: for<'row> FnMut(&Row<'row>) -> table::Result<bool> + 'db,
     {
         self.filter_expr = None;
         self.filter_fn = Some(Box::new(f));
         self
+    }
+
+    pub fn filter_fn<F>(self, f: F) -> Self
+    where
+        F: for<'row> FnMut(&Row<'row>) -> table::Result<bool> + 'db,
+    {
+        self.filter_fn_slow(f)
     }
 
     pub fn limit(mut self, n: usize) -> Self {
@@ -350,20 +361,36 @@ impl<'db> Scan<'db> {
             expr.collect_cols(&mut pred_cols);
         }
 
-        let plan = build_plan(projection.as_ref(), &pred_cols, false);
+        let decode_all = filter_fn.is_some();
+        let plan = build_plan(projection.as_ref(), &pred_cols, decode_all);
         let compiled_expr = filter_expr
             .as_ref()
             .map(|expr| compile_expr(expr, plan.needed_cols.as_deref()))
             .transpose()?;
 
-        let col_count = col_count_hint;
-        if let Some(count) = col_count
+        if let Some(count) = col_count_hint
             && let Some(err) = validate_columns(&plan.referenced_cols, count)
         {
             return Err(err);
         }
 
-        Ok(PreparedScan { pager, root, plan, compiled_expr, filter_fn, limit, col_count })
+        let Plan { needed_cols, proj_map, referenced_cols } = plan;
+        let column_count_hint = OnceCell::new();
+        if let Some(count) = col_count_hint {
+            let _ = column_count_hint.set(count);
+        }
+
+        Ok(PreparedScan {
+            pager,
+            root,
+            needed_cols: needed_cols.map(|cols| cols.into_boxed_slice()),
+            proj_map: proj_map.map(|cols| cols.into_boxed_slice()),
+            referenced_cols: referenced_cols.into_boxed_slice(),
+            compiled_expr,
+            filter_fn,
+            limit,
+            column_count_hint,
+        })
     }
 
     pub fn for_each<F>(self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
@@ -385,11 +412,11 @@ impl<'db> PreparedScan<'db> {
     }
 
     pub(crate) fn proj_map(&self) -> Option<&[usize]> {
-        self.plan.proj_map.as_deref()
+        self.proj_map.as_deref()
     }
 
     pub(crate) fn column_count_hint(&self) -> Option<usize> {
-        self.col_count
+        self.column_count_hint.get().copied()
     }
 
     pub(crate) fn eval_payload<'row>(
@@ -410,42 +437,42 @@ impl<'db> PreparedScan<'db> {
         serials: &'row mut Vec<u64>,
         apply_filters: bool,
     ) -> table::Result<Option<Row<'row>>> {
-        let needed_cols = self.plan.needed_cols.as_deref();
+        let needed_cols = self.needed_cols.as_deref();
         let count =
             table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
 
-        if let Some(expected) = self.col_count {
+        if let Some(expected) = self.column_count_hint.get().copied() {
             if expected != count {
                 return Err(table::Error::Corrupted(
                     "row column count does not match table schema",
                 ));
             }
         } else {
-            if let Some(err) = validate_columns(&self.plan.referenced_cols, count) {
+            if let Some(err) = validate_columns(&self.referenced_cols, count) {
                 return Err(err);
             }
-            self.col_count = Some(count);
+            let _ = self.column_count_hint.set(count);
         }
 
         let values = values.as_slice();
-        let row_eval = RowEval { values, column_count: count };
+        let scratch_bytes = bytes.as_slice();
 
         if apply_filters {
             if let Some(expr) = self.compiled_expr.as_ref()
-                && eval_compiled_expr(expr, &row_eval)? != Truth::True
+                && eval_compiled_expr(expr, values, scratch_bytes)? != Truth::True
             {
                 return Ok(None);
             }
 
             if let Some(filter_fn) = self.filter_fn.as_mut() {
-                let row = Row { values, proj_map: self.plan.proj_map.as_deref() };
+                let row = Row { values, proj_map: None };
                 if !filter_fn(&row)? {
                     return Ok(None);
                 }
             }
         }
 
-        let row = Row { values, proj_map: self.plan.proj_map.as_deref() };
+        let row = Row { values, proj_map: self.proj_map.as_deref() };
         Ok(Some(row))
     }
 
@@ -673,6 +700,12 @@ fn raw_to_ref<'row>(value: ValueSlot) -> ValueRef<'row> {
     unsafe { value.as_value_ref() }
 }
 
+fn raw_to_ref_with_scratch<'row>(value: ValueSlot, scratch_bytes: &'row [u8]) -> ValueRef<'row> {
+    // SAFETY: raw values point into the current row payload/overflow buffer and
+    // are only materialized for the duration of the row callback.
+    unsafe { value.as_value_ref_with_scratch(scratch_bytes) }
+}
+
 fn value_kind(value: ValueRef<'_>) -> &'static str {
     match value {
         ValueRef::Null => "NULL",
@@ -728,73 +761,82 @@ enum CmpOp {
     Ge,
 }
 
-struct RowEval<'row> {
-    values: &'row [ValueSlot],
-    column_count: usize,
-}
-
 enum Operand<'row, 'expr> {
     Value(ValueRef<'row>),
     Literal(ValueRef<'expr>),
     Null,
 }
 
-impl<'row> RowEval<'row> {
+struct EvalContext<'row> {
+    values: &'row [ValueSlot],
+    scratch_bytes: &'row [u8],
+}
+
+impl<'row> EvalContext<'row> {
     fn value_by_idx(&self, idx: usize, col: u16) -> table::Result<ValueRef<'row>> {
         self.values
             .get(idx)
             .copied()
-            .map(raw_to_ref)
-            .ok_or(table::Error::InvalidColumnIndex { col, column_count: self.column_count })
+            .map(|raw| raw_to_ref_with_scratch(raw, self.scratch_bytes))
+            .ok_or(table::Error::InvalidColumnIndex { col, column_count: self.values.len() })
     }
 }
 
-fn eval_compiled_expr(expr: &CompiledExpr, row: &RowEval<'_>) -> table::Result<Truth> {
+fn eval_compiled_expr(
+    expr: &CompiledExpr,
+    values: &[ValueSlot],
+    scratch_bytes: &[u8],
+) -> table::Result<Truth> {
+    let ctx = EvalContext { values, scratch_bytes };
+    eval_compiled_expr_inner(expr, &ctx)
+}
+
+fn eval_compiled_expr_inner(expr: &CompiledExpr, ctx: &EvalContext<'_>) -> table::Result<Truth> {
     match expr {
         CompiledExpr::CmpColLit { idx, op, lit } => {
-            let raw = unsafe { *row.values.get_unchecked(*idx) };
-            let left = raw_to_ref(raw);
+            let raw = unsafe { *ctx.values.get_unchecked(*idx) };
+            let left = raw_to_ref_with_scratch(raw, ctx.scratch_bytes);
             let right = lit.as_value_ref();
             Ok(compare(*op, left, right))
         }
         CompiledExpr::Col { .. } | CompiledExpr::Lit(_) => Ok(Truth::Null),
-        CompiledExpr::Eq(lhs, rhs) => eval_cmp(CmpOp::Eq, lhs, rhs, row),
-        CompiledExpr::Ne(lhs, rhs) => eval_cmp(CmpOp::Ne, lhs, rhs, row),
-        CompiledExpr::Lt(lhs, rhs) => eval_cmp(CmpOp::Lt, lhs, rhs, row),
-        CompiledExpr::Le(lhs, rhs) => eval_cmp(CmpOp::Le, lhs, rhs, row),
-        CompiledExpr::Gt(lhs, rhs) => eval_cmp(CmpOp::Gt, lhs, rhs, row),
-        CompiledExpr::Ge(lhs, rhs) => eval_cmp(CmpOp::Ge, lhs, rhs, row),
+        CompiledExpr::Eq(lhs, rhs) => eval_cmp(CmpOp::Eq, lhs, rhs, ctx),
+        CompiledExpr::Ne(lhs, rhs) => eval_cmp(CmpOp::Ne, lhs, rhs, ctx),
+        CompiledExpr::Lt(lhs, rhs) => eval_cmp(CmpOp::Lt, lhs, rhs, ctx),
+        CompiledExpr::Le(lhs, rhs) => eval_cmp(CmpOp::Le, lhs, rhs, ctx),
+        CompiledExpr::Gt(lhs, rhs) => eval_cmp(CmpOp::Gt, lhs, rhs, ctx),
+        CompiledExpr::Ge(lhs, rhs) => eval_cmp(CmpOp::Ge, lhs, rhs, ctx),
         CompiledExpr::And(lhs, rhs) => {
-            let left = eval_compiled_expr(lhs, row)?;
+            let left = eval_compiled_expr_inner(lhs, ctx)?;
             if left == Truth::False {
                 return Ok(Truth::False);
             }
-            let right = eval_compiled_expr(rhs, row)?;
+            let right = eval_compiled_expr_inner(rhs, ctx)?;
             Ok(truth_and(left, right))
         }
         CompiledExpr::Or(lhs, rhs) => {
-            let left = eval_compiled_expr(lhs, row)?;
+            let left = eval_compiled_expr_inner(lhs, ctx)?;
             if left == Truth::True {
                 return Ok(Truth::True);
             }
-            let right = eval_compiled_expr(rhs, row)?;
+            let right = eval_compiled_expr_inner(rhs, ctx)?;
             Ok(truth_or(left, right))
         }
-        CompiledExpr::Not(inner) => Ok(truth_not(eval_compiled_expr(inner, row)?)),
-        CompiledExpr::IsNull(inner) => eval_is_null(inner, row),
-        CompiledExpr::IsNotNull(inner) => eval_is_not_null(inner, row),
+        CompiledExpr::Not(inner) => Ok(truth_not(eval_compiled_expr_inner(inner, ctx)?)),
+        CompiledExpr::IsNull(inner) => eval_is_null(inner, ctx),
+        CompiledExpr::IsNotNull(inner) => eval_is_not_null(inner, ctx),
     }
 }
 
-fn eval_is_null(inner: &CompiledExpr, row: &RowEval<'_>) -> table::Result<Truth> {
+fn eval_is_null(inner: &CompiledExpr, ctx: &EvalContext<'_>) -> table::Result<Truth> {
     match inner {
-        CompiledExpr::Col { col, idx } => match row.value_by_idx(*idx, *col)? {
+        CompiledExpr::Col { col, idx } => match ctx.value_by_idx(*idx, *col)? {
             ValueRef::Null => Ok(Truth::True),
             _ => Ok(Truth::False),
         },
         CompiledExpr::Lit(ValueLit::Null) => Ok(Truth::True),
         CompiledExpr::Lit(_) => Ok(Truth::False),
-        _ => Ok(if matches!(eval_compiled_expr(inner, row)?, Truth::Null) {
+        _ => Ok(if matches!(eval_compiled_expr_inner(inner, ctx)?, Truth::Null) {
             Truth::True
         } else {
             Truth::False
@@ -802,8 +844,8 @@ fn eval_is_null(inner: &CompiledExpr, row: &RowEval<'_>) -> table::Result<Truth>
     }
 }
 
-fn eval_is_not_null(inner: &CompiledExpr, row: &RowEval<'_>) -> table::Result<Truth> {
-    match eval_is_null(inner, row)? {
+fn eval_is_not_null(inner: &CompiledExpr, ctx: &EvalContext<'_>) -> table::Result<Truth> {
+    match eval_is_null(inner, ctx)? {
         Truth::True => Ok(Truth::False),
         Truth::False => Ok(Truth::True),
         Truth::Null => Ok(Truth::Null),
@@ -814,10 +856,10 @@ fn eval_cmp(
     op: CmpOp,
     lhs: &CompiledExpr,
     rhs: &CompiledExpr,
-    row: &RowEval<'_>,
+    ctx: &EvalContext<'_>,
 ) -> table::Result<Truth> {
-    let left = eval_operand(lhs, row)?;
-    let right = eval_operand(rhs, row)?;
+    let left = eval_operand(lhs, ctx)?;
+    let right = eval_operand(rhs, ctx)?;
 
     Ok(match (left, right) {
         (Operand::Null, _) | (_, Operand::Null) => Truth::Null,
@@ -830,10 +872,10 @@ fn eval_cmp(
 
 fn eval_operand<'row, 'expr>(
     expr: &'expr CompiledExpr,
-    row: &RowEval<'row>,
+    ctx: &EvalContext<'row>,
 ) -> table::Result<Operand<'row, 'expr>> {
     match expr {
-        CompiledExpr::Col { col, idx } => row.value_by_idx(*idx, *col).map(Operand::Value),
+        CompiledExpr::Col { col, idx } => ctx.value_by_idx(*idx, *col).map(Operand::Value),
         CompiledExpr::Lit(lit) => Ok(Operand::Literal(lit.as_value_ref())),
         _ => Ok(Operand::Null),
     }

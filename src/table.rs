@@ -181,6 +181,21 @@ impl BytesSpan {
             Self::Mmap(raw) | Self::Scratch(raw) => unsafe { raw.as_slice() },
         }
     }
+
+    #[inline]
+    unsafe fn as_slice_with_scratch(self, scratch_bytes: &[u8]) -> &[u8] {
+        match self {
+            Self::Mmap(raw) => unsafe { raw.as_slice() },
+            Self::Scratch(raw) => {
+                let base = scratch_bytes.as_ptr() as usize;
+                let ptr = raw.ptr as usize;
+                let end = ptr.saturating_add(raw.len);
+                let limit = base.saturating_add(scratch_bytes.len());
+                debug_assert!(ptr >= base && end <= limit);
+                unsafe { raw.as_slice() }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -264,6 +279,24 @@ impl ValueSlot {
             Self::Real(value) => ValueRef::Real(value),
             Self::Text(bytes) => ValueRef::Text(unsafe { bytes.as_slice() }),
             Self::Blob(bytes) => ValueRef::Blob(unsafe { bytes.as_slice() }),
+        }
+    }
+
+    #[inline]
+    pub(crate) unsafe fn as_value_ref_with_scratch<'row>(
+        self,
+        scratch_bytes: &'row [u8],
+    ) -> ValueRef<'row> {
+        match self {
+            Self::Null => ValueRef::Null,
+            Self::Integer(value) => ValueRef::Integer(value),
+            Self::Real(value) => ValueRef::Real(value),
+            Self::Text(bytes) => {
+                ValueRef::Text(unsafe { bytes.as_slice_with_scratch(scratch_bytes) })
+            }
+            Self::Blob(bytes) => {
+                ValueRef::Blob(unsafe { bytes.as_slice_with_scratch(scratch_bytes) })
+            }
         }
     }
 }
