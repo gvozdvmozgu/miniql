@@ -96,7 +96,7 @@ fn bench_read_overflow_table_ref_hot(c: &mut Criterion) {
     let db_path = fixture_path("overflow.db");
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
-    let mut scratch = RowScratch::with_capacity(4, 8192);
+    let mut scratch = RowScratch::with_capacity(4, 10008);
     c.bench_function("read_overflow_table_ref_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
