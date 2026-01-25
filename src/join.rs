@@ -607,29 +607,39 @@ where
 }
 
 #[derive(Debug, Clone)]
-enum RowIdList {
-    One(i64),
-    Many(Vec<i64>),
+struct RightRow {
+    rowid: i64,
+    payload: Box<[u8]>,
 }
 
-impl RowIdList {
+#[derive(Debug, Clone)]
+enum RightRowList {
+    One(RightRow),
+    Many(Vec<RightRow>),
+}
+
+impl RightRowList {
     #[inline(always)]
-    fn new(v: i64) -> Self {
-        RowIdList::One(v)
+    fn new(row: RightRow) -> Self {
+        RightRowList::One(row)
     }
 
     #[inline(always)]
-    fn push(&mut self, v: i64) -> (usize, usize) {
+    fn push(&mut self, row: RightRow) -> (usize, usize) {
         match self {
-            RowIdList::One(first) => {
-                let vec = vec![*first, v];
+            RightRowList::One(_) => {
+                let first = match std::mem::replace(self, RightRowList::Many(Vec::new())) {
+                    RightRowList::One(first) => first,
+                    _ => unreachable!("RightRowList variant swap failed"),
+                };
+                let vec = vec![first, row];
                 let new = vec.capacity();
-                *self = RowIdList::Many(vec);
+                *self = RightRowList::Many(vec);
                 (0, new)
             }
-            RowIdList::Many(vec) => {
+            RightRowList::Many(vec) => {
                 let old = vec.capacity();
-                vec.push(v);
+                vec.push(row);
                 (old, vec.capacity())
             }
         }
@@ -687,9 +697,9 @@ impl Hash for BytesKey {
 }
 
 struct HashState {
-    numeric: FxHashMap<u64, RowIdList>,
-    text: HbHashMap<BytesKey, RowIdList, FxBuildHasher>,
-    blob: HbHashMap<BytesKey, RowIdList, FxBuildHasher>,
+    numeric: FxHashMap<u64, RightRowList>,
+    text: HbHashMap<BytesKey, RightRowList, FxBuildHasher>,
+    blob: HbHashMap<BytesKey, RightRowList, FxBuildHasher>,
     arena: Bump,
 }
 
@@ -758,99 +768,109 @@ where
     let text = &mut hash_state.text;
     let blob = &mut hash_state.blob;
 
-    right_scan.for_each(right_scratch, |rowid, row| {
-        let Some(key_ref) = join_key_ref(right_meta, rowid, &row)? else {
-            return Ok(());
+    let pager = right_scan.pager();
+    let right_root = right_scan.root();
+    let (values, bytes, serials, stack) = right_scratch.split_mut();
+
+    table::scan_table_cells_with_scratch_and_stack_until(pager, right_root, stack, |cell| {
+        let rowid = cell.rowid();
+        let payload = cell.payload();
+        let Some(row) =
+            right_scan.eval_payload_with_filters(payload, values, bytes, serials, true)?
+        else {
+            return Ok(None::<()>);
         };
+        let Some(key_ref) = join_key_ref(right_meta, rowid, &row)? else {
+            return Ok(None::<()>);
+        };
+
+        let payload_bytes = payload.to_vec()?;
+        mem.charge(payload_bytes.len())?;
+        let right_row = RightRow { rowid, payload: payload_bytes.into_boxed_slice() };
+
         match key_ref {
             HashKeyRef::Number(bits) => match numeric.entry(bits) {
                 Entry::Occupied(mut e) => {
-                    let (old, new) = e.get_mut().push(rowid);
-                    mem.charge_capacity_growth(old, new)?;
+                    let (old, new) = e.get_mut().push(right_row);
+                    mem.charge_capacity_growth(old, new, std::mem::size_of::<RightRow>())?;
                 }
                 Entry::Vacant(e) => {
                     mem.charge(std::mem::size_of::<u64>())?;
-                    e.insert(RowIdList::new(rowid));
+                    e.insert(RightRowList::new(right_row));
                 }
             },
             HashKeyRef::Text(bytes) => {
                 if let Some(list) = text.get_mut(bytes) {
-                    let (old, new) = list.push(rowid);
-                    mem.charge_capacity_growth(old, new)?;
+                    let (old, new) = list.push(right_row);
+                    mem.charge_capacity_growth(old, new, std::mem::size_of::<RightRow>())?;
                 } else {
                     mem.charge(bytes.len())?;
                     let key = BytesKey::from_slice_in(arena, bytes);
-                    text.insert(key, RowIdList::new(rowid));
+                    text.insert(key, RightRowList::new(right_row));
                 }
             }
             HashKeyRef::Blob(bytes) => {
                 if let Some(list) = blob.get_mut(bytes) {
-                    let (old, new) = list.push(rowid);
-                    mem.charge_capacity_growth(old, new)?;
+                    let (old, new) = list.push(right_row);
+                    mem.charge_capacity_growth(old, new, std::mem::size_of::<RightRow>())?;
                 } else {
                     mem.charge(bytes.len())?;
                     let key = BytesKey::from_slice_in(arena, bytes);
-                    blob.insert(key, RowIdList::new(rowid));
+                    blob.insert(key, RightRowList::new(right_row));
                 }
             }
         }
-        Ok(())
-    })?;
 
-    let right_root = right_scan.root();
-    let pager = right_scan.pager();
+        Ok(None::<()>)
+    })?;
 
     left_scan.for_each(left_scratch, |left_rowid, left_row| {
         let left_out = left_meta.output_row(left_row.values_raw());
         let Some(key_ref) = join_key_ref(left_meta, left_rowid, &left_row)? else {
             return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
         };
-        let rowids = match key_ref {
+        let rows = match key_ref {
             HashKeyRef::Number(bits) => numeric.get(&bits),
             HashKeyRef::Text(bytes) => text.get(bytes),
             HashKeyRef::Blob(bytes) => blob.get(bytes),
         };
 
-        if let Some(rowids) = rowids {
+        if let Some(rows) = rows {
             let mut matched = false;
-            match rowids {
-                RowIdList::One(v) => {
-                    let right_rowid = *v;
-                    if let Some(cell) = table::lookup_rowid_cell(pager, right_root, right_rowid)?
-                        && let Some(right_row) = right_scan.eval_payload_with_filters(
-                            cell.payload(),
-                            right_values,
-                            right_bytes,
-                            right_serials,
-                            false,
-                        )?
-                    {
+            match rows {
+                RightRowList::One(row) => {
+                    let payload = table::PayloadRef::Inline(&row.payload);
+                    if let Some(right_row) = right_scan.eval_payload_with_filters(
+                        payload,
+                        right_values,
+                        right_bytes,
+                        right_serials,
+                        false,
+                    )? {
                         let right_out = right_meta.output_row(right_row.values_raw());
                         cb(JoinedRow {
                             left_rowid,
-                            right_rowid,
+                            right_rowid: row.rowid,
                             left: left_out,
                             right: right_out,
                         })?;
                         matched = true;
                     }
                 }
-                RowIdList::Many(vs) => {
-                    for &right_rowid in vs.iter() {
-                        if let Some(cell) =
-                            table::lookup_rowid_cell(pager, right_root, right_rowid)?
-                            && let Some(right_row) = right_scan.eval_payload_with_filters(
-                                cell.payload(),
-                                right_values,
-                                right_bytes,
-                                right_serials,
-                                false,
-                            )?
-                        {
+                RightRowList::Many(rows) => {
+                    for row in rows.iter() {
+                        let payload = table::PayloadRef::Inline(&row.payload);
+                        if let Some(right_row) = right_scan.eval_payload_with_filters(
+                            payload,
+                            right_values,
+                            right_bytes,
+                            right_serials,
+                            false,
+                        )? {
                             let right_out = right_meta.output_row(right_row.values_raw());
                             cb(JoinedRow {
                                 left_rowid,
-                                right_rowid,
+                                right_rowid: row.rowid,
                                 left: left_out,
                                 right: right_out,
                             })?;
@@ -1215,9 +1235,14 @@ impl MemTracker {
         Ok(())
     }
 
-    fn charge_capacity_growth(&mut self, old_cap: usize, new_cap: usize) -> Result<()> {
+    fn charge_capacity_growth(
+        &mut self,
+        old_cap: usize,
+        new_cap: usize,
+        elem_size: usize,
+    ) -> Result<()> {
         if new_cap > old_cap {
-            let bytes = (new_cap - old_cap) * std::mem::size_of::<i64>();
+            let bytes = (new_cap - old_cap) * elem_size;
             self.charge(bytes)?;
         }
         Ok(())
