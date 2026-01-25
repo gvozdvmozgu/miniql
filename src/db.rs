@@ -8,6 +8,7 @@ use crate::query::{Scan, ScanScratch};
 use crate::schema::parse_table_schema;
 use crate::table;
 
+/// Read-only handle to a SQLite database file.
 pub struct Db {
     pager: Pager,
     schema: OnceLock<SchemaCache>,
@@ -61,6 +62,17 @@ impl SchemaCache {
 }
 
 impl Db {
+    /// Open a SQLite database file.
+    ///
+    /// ```rust
+    /// use std::path::Path;
+    ///
+    /// use miniql::Db;
+    ///
+    /// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/users.db");
+    /// let db = Db::open(path).unwrap();
+    /// let _ = db.table("users").unwrap();
+    /// ```
     pub fn open(path: impl AsRef<Path>) -> table::Result<Self> {
         let file =
             File::open(path).map_err(|err| table::Error::Pager(crate::pager::Error::Io(err)))?;
@@ -68,6 +80,7 @@ impl Db {
         Ok(Self { pager, schema: OnceLock::new() })
     }
 
+    /// Look up a table by name using `sqlite_schema`.
     pub fn table(&self, name: &str) -> table::Result<Table<'_>> {
         let cache = self.schema_cache()?;
         let info = cache.table(name).ok_or_else(|| table::Error::TableNotFound(name.to_owned()))?;
@@ -79,10 +92,12 @@ impl Db {
         })
     }
 
+    /// Create a table handle from a root page id.
     pub fn table_root(&self, root: PageId) -> Table<'_> {
         Table { db: self, root, name: String::new(), column_count: None }
     }
 
+    /// Create an index handle from a root page id.
     pub fn index_root(&self, root: PageId) -> Index<'_> {
         Index { db: self, root }
     }
@@ -101,6 +116,7 @@ impl Db {
     }
 }
 
+/// Handle to a table b-tree.
 pub struct Table<'db> {
     db: &'db Db,
     root: PageId,
@@ -109,44 +125,53 @@ pub struct Table<'db> {
 }
 
 impl<'db> Table<'db> {
+    /// Return the root page id for this table.
     pub fn root(&self) -> PageId {
         self.root
     }
 
+    /// Create a row scan for this table.
     pub fn scan(&self) -> Scan<'db> {
         Scan::from_root_with_hint(self.db.pager(), self.root, self.column_count)
     }
 
+    /// Create a scan that yields raw table cells.
     pub fn scan_cells(&self) -> CellScan<'db> {
         CellScan { pager: self.db.pager(), root: self.root }
     }
 
+    /// Return the table name if known.
     pub fn name(&self) -> Option<&str> {
         if self.name.is_empty() { None } else { Some(self.name.as_str()) }
     }
 }
 
+/// Handle to an index b-tree.
 pub struct Index<'db> {
     db: &'db Db,
     root: PageId,
 }
 
 impl<'db> Index<'db> {
+    /// Return the root page id for this index.
     pub fn root(&self) -> PageId {
         self.root
     }
 
+    /// Return the parent database handle.
     pub fn table(&self) -> &'db Db {
         self.db
     }
 }
 
+/// Scan that yields raw table cells.
 pub struct CellScan<'db> {
     pager: &'db Pager,
     root: PageId,
 }
 
 impl<'db> CellScan<'db> {
+    /// Visit each cell in a table b-tree.
     pub fn for_each<F>(self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
     where
         F: for<'row> FnMut(table::CellRef<'row>) -> table::Result<()>,

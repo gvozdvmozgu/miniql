@@ -4,11 +4,13 @@ use crate::decoder::Decoder;
 use crate::join::JoinError;
 use crate::pager::{PageId, PageRef, Pager};
 
+/// Result type for table operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_SPILL_CAPACITY: usize = 8 * 1024;
 
+/// Table decoding and validation errors.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
@@ -86,6 +88,7 @@ impl From<JoinError> for Error {
     }
 }
 
+/// Owned value decoded from a row.
 #[derive(Debug, Clone)]
 pub enum Value {
     Null,
@@ -96,6 +99,7 @@ pub enum Value {
 }
 
 impl Value {
+    /// Return the value as UTF-8 text.
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text(text) => Some(text.as_str()),
@@ -103,6 +107,7 @@ impl Value {
         }
     }
 
+    /// Return the value as an integer.
     pub fn as_integer(&self) -> Option<i64> {
         match self {
             Self::Integer(value) => Some(*value),
@@ -131,6 +136,7 @@ impl fmt::Display for Value {
     }
 }
 
+/// Borrowed value reference into a row payload.
 #[derive(Debug, Clone, Copy)]
 pub enum ValueRef<'row> {
     Null,
@@ -207,12 +213,14 @@ pub(crate) enum ValueSlot {
     Blob(BytesSpan),
 }
 
+/// Reference to a record payload.
 #[derive(Clone, Copy)]
 pub enum PayloadRef<'row> {
     Inline(&'row [u8]),
     Overflow(OverflowPayload<'row>),
 }
 
+/// Reference to a table cell (rowid + payload).
 #[derive(Clone, Copy)]
 pub struct CellRef<'row> {
     rowid: i64,
@@ -221,16 +229,19 @@ pub struct CellRef<'row> {
 
 impl<'row> CellRef<'row> {
     #[inline]
+    /// Return the rowid for this cell.
     pub fn rowid(self) -> i64 {
         self.rowid
     }
 
     #[inline]
+    /// Return the payload reference for this cell.
     pub fn payload(self) -> PayloadRef<'row> {
         self.payload
     }
 }
 
+/// Overflow payload descriptor for large rows.
 #[derive(Clone, Copy)]
 pub struct OverflowPayload<'row> {
     pager: &'row Pager,
@@ -251,6 +262,7 @@ impl<'row> OverflowPayload<'row> {
 }
 
 impl<'row> PayloadRef<'row> {
+    /// Materialize the payload into a contiguous buffer.
     pub fn to_vec(&self) -> Result<Vec<u8>> {
         match self {
             PayloadRef::Inline(bytes) => Ok(bytes.to_vec()),
@@ -308,6 +320,7 @@ fn slot_to_ref<'row>(value: ValueSlot) -> ValueRef<'row> {
 }
 
 impl<'row> ValueRef<'row> {
+    /// Return the value as UTF-8 text.
     pub fn as_text(&self) -> Option<&'row str> {
         match self {
             Self::Text(bytes) => str::from_utf8(bytes).ok(),
@@ -315,6 +328,7 @@ impl<'row> ValueRef<'row> {
         }
     }
 
+    /// Return the raw text bytes.
     pub fn text_bytes(&self) -> Option<&'row [u8]> {
         match self {
             Self::Text(bytes) => Some(*bytes),
@@ -322,6 +336,7 @@ impl<'row> ValueRef<'row> {
         }
     }
 
+    /// Return the value as an integer.
     pub fn as_integer(&self) -> Option<i64> {
         match self {
             Self::Integer(value) => Some(*value),
@@ -345,24 +360,29 @@ impl fmt::Display for ValueRef<'_> {
     }
 }
 
+/// Borrowed row view used by low-level scans.
 #[derive(Debug, Clone, Copy)]
 pub struct RowView<'row> {
     values: &'row [ValueSlot],
 }
 
 impl<'row> RowView<'row> {
+    /// Number of columns in the row.
     pub fn len(&self) -> usize {
         self.values.len()
     }
 
+    /// Returns true when there are no columns.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
 
+    /// Return a value reference by column index.
     pub fn get(&self, i: usize) -> Option<ValueRef<'row>> {
         self.values.get(i).copied().map(slot_to_ref)
     }
 
+    /// Iterate over values in the row.
     pub fn iter(&self) -> impl Iterator<Item = ValueRef<'row>> + '_ {
         self.values.iter().copied().map(slot_to_ref)
     }
@@ -382,12 +402,14 @@ impl TryFrom<ValueRef<'_>> for Value {
     }
 }
 
+/// Owned row produced by `read_table`.
 #[derive(Debug, Clone)]
 pub struct TableRow {
     pub rowid: i64,
     pub values: Vec<Value>,
 }
 
+/// Scratch buffers for table scans.
 #[derive(Debug, Default)]
 pub struct RowScratch {
     values: Vec<ValueSlot>,
@@ -397,10 +419,12 @@ pub struct RowScratch {
 }
 
 impl RowScratch {
+    /// Create an empty scratch buffer.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Create a scratch buffer with capacity hints.
     pub fn with_capacity(values: usize, overflow: usize) -> Self {
         Self {
             values: Vec::with_capacity(values),
@@ -433,6 +457,20 @@ impl RowScratch {
     }
 }
 
+/// Read all rows from a table into owned values.
+///
+/// ```rust
+/// use std::path::Path;
+///
+/// use miniql::pager::{PageId, Pager};
+/// use miniql::table;
+///
+/// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/users.db");
+/// let file = std::fs::File::open(path).unwrap();
+/// let pager = Pager::new(file).unwrap();
+/// let rows = table::read_table(&pager, PageId::new(2)).unwrap();
+/// assert_eq!(rows.len(), 2);
+/// ```
 pub fn read_table(pager: &Pager, page_id: PageId) -> Result<Vec<TableRow>> {
     let mut rows = Vec::new();
     let mut scratch = RowScratch::with_capacity(8, DEFAULT_SPILL_CAPACITY);
@@ -447,10 +485,12 @@ pub fn read_table(pager: &Pager, page_id: PageId) -> Result<Vec<TableRow>> {
     Ok(rows)
 }
 
+/// Read all rows from a table (alias for `read_table`).
 pub fn read_table_ref(pager: &Pager, page_id: PageId) -> Result<Vec<TableRow>> {
     read_table(pager, page_id)
 }
 
+/// Scan a table using an existing scratch buffer.
 pub fn scan_table_ref_with_scratch<F>(
     pager: &Pager,
     page_id: PageId,
@@ -463,6 +503,7 @@ where
     scan_table_page_ref(pager, page_id, scratch, &mut f)
 }
 
+/// Scan a table, invoking `f` for each row.
 pub fn scan_table_ref<F>(pager: &Pager, page_id: PageId, f: F) -> Result<()>
 where
     F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
@@ -471,6 +512,7 @@ where
     scan_table_ref_with_scratch(pager, page_id, &mut scratch, f)
 }
 
+/// Scan a table until the callback returns `Some`.
 pub fn scan_table_ref_until<F, T>(pager: &Pager, page_id: PageId, mut f: F) -> Result<Option<T>>
 where
     F: for<'row> FnMut(i64, RowView<'row>) -> Result<Option<T>>,
@@ -479,6 +521,7 @@ where
     scan_table_page_ref_until(pager, page_id, &mut scratch, &mut f)
 }
 
+/// Scan raw table cells with a caller-provided scratch buffer.
 pub fn scan_table_cells_with_scratch<F>(pager: &Pager, page_id: PageId, mut f: F) -> Result<()>
 where
     F: for<'row> FnMut(CellRef<'row>) -> Result<()>,
@@ -486,6 +529,7 @@ where
     scan_table_page_cells(pager, page_id, &mut f)
 }
 
+/// Lookup a cell by rowid within a table b-tree.
 pub fn lookup_rowid_cell<'row>(
     pager: &'row Pager,
     page_id: PageId,

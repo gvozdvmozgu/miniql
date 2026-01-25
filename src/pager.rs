@@ -8,6 +8,7 @@ use crate::decoder::Decoder;
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// Parsed SQLite database header values.
 #[derive(Debug, Clone)]
 pub struct DbHeader {
     pub page_size: usize,
@@ -20,6 +21,7 @@ pub struct DbHeader {
 }
 
 impl DbHeader {
+    /// Parse the 100-byte SQLite database header.
     pub fn parse(header: &[u8]) -> Result<Self> {
         if header.len() < 100 {
             return Err(Error::FileTooSmall);
@@ -77,6 +79,7 @@ impl DbHeader {
     }
 }
 
+/// Memory-mapped pager for a SQLite database file.
 pub struct Pager {
     header: DbHeader,
     mmap: Mmap,
@@ -84,6 +87,7 @@ pub struct Pager {
 }
 
 impl Pager {
+    /// Open a pager from a file handle.
     pub fn new(file: File) -> Result<Self> {
         let mmap = unsafe { Mmap::map(&file) }.map_err(Error::Io)?;
         if mmap.len() < 100 {
@@ -108,18 +112,22 @@ impl Pager {
     }
 
     #[inline]
+    /// Return the parsed database header.
     pub fn header(&self) -> &DbHeader {
         &self.header
     }
 
+    /// Return the header's reported page count.
     pub fn count(&self) -> u32 {
         self.header.page_count_hint
     }
 
+    /// Return the actual page count derived from file size.
     pub fn page_count(&self) -> u32 {
         self.page_count
     }
 
+    /// Return the raw bytes for a page.
     pub fn page_bytes(&self, page_id: PageId) -> Result<&[u8]> {
         let index = (page_id.into_inner() - 1) as usize;
         if index >= self.page_count as usize {
@@ -135,12 +143,14 @@ impl Pager {
         Ok(&self.mmap[start..end])
     }
 
+    /// Return a parsed page reference.
     pub fn page(&self, page_id: PageId) -> Result<PageRef<'_>> {
         let bytes = self.page_bytes(page_id)?;
         Ok(PageRef { bytes, page_id, header: &self.header })
     }
 }
 
+/// Page wrapper with header-aware offsets and decoding helpers.
 pub struct PageRef<'a> {
     bytes: &'a [u8],
     page_id: PageId,
@@ -148,42 +158,52 @@ pub struct PageRef<'a> {
 }
 
 impl<'a> PageRef<'a> {
+    /// Byte offset to the start of page content.
     pub fn offset(&self) -> usize {
         if self.page_id.into_inner() == 1 { 100 } else { 0 }
     }
 
+    /// Usable page size (page size minus reserved bytes).
     pub fn usable_size(&self) -> usize {
         self.header.usable_size
     }
 
+    /// Return the raw bytes for the page.
     pub fn bytes(&self) -> &'a [u8] {
         self.bytes
     }
 
+    /// Return only the usable bytes for the page.
     pub fn usable_bytes(&self) -> &'a [u8] {
         let end = self.header.usable_size.min(self.bytes.len());
         &self.bytes[..end]
     }
 
+    /// Create a decoder over the full page bytes.
     pub fn decoder(&self) -> Decoder<'a> {
         Decoder::new(self.bytes)
     }
 
+    /// Create a decoder starting after the page header.
     pub fn decoder_after_header(&self) -> Decoder<'a> {
         self.decoder().split_at(self.offset())
     }
 }
 
+/// Non-zero SQLite page identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PageId(NonZeroU32);
 
 impl PageId {
+    /// Root page id (1).
     pub const ROOT: PageId = unsafe { PageId::new_unchecked(1) };
 
+    /// Create a page id, panicking if zero.
     pub fn new(id: u32) -> Self {
         Self(NonZeroU32::new(id).unwrap())
     }
 
+    /// Create a page id, returning `None` if zero.
     pub fn try_new(id: u32) -> Option<Self> {
         NonZeroU32::new(id).map(Self)
     }
@@ -195,11 +215,13 @@ impl PageId {
         unsafe { Self(NonZeroU32::new_unchecked(id)) }
     }
 
+    /// Return the underlying page number.
     pub fn into_inner(self) -> u32 {
         self.0.get()
     }
 }
 
+/// Pager and file format errors.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {

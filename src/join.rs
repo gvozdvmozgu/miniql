@@ -13,8 +13,10 @@ use crate::query::{OrderDir, PreparedScan, Row, Scan, ScanScratch};
 use crate::schema::{TableSchema, parse_index_columns, parse_table_schema};
 use crate::table::{self, BytesSpan, RawBytes, Value, ValueRef, ValueSlot};
 
+/// Result type for join operations.
 pub type Result<T> = table::Result<T>;
 
+/// Join-specific errors.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
@@ -49,8 +51,10 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Alias for join errors.
 pub type JoinError = Error;
 
+/// Supported join types.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum JoinType {
@@ -58,6 +62,7 @@ pub enum JoinType {
     Left,
 }
 
+/// Join key selector for left/right sides.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum JoinKey {
@@ -65,6 +70,7 @@ pub enum JoinKey {
     RowId,
 }
 
+/// Join side selector for `ORDER BY`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinSide {
@@ -72,6 +78,7 @@ pub enum JoinSide {
     Right,
 }
 
+/// Column + side + direction for join ordering.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinOrderBy {
@@ -81,47 +88,77 @@ pub struct JoinOrderBy {
 }
 
 impl JoinOrderBy {
+    /// Order by a left-side column.
     pub fn left(col: u16, dir: OrderDir) -> Self {
         Self { side: JoinSide::Left, col, dir }
     }
 
+    /// Order by a right-side column.
     pub fn right(col: u16, dir: OrderDir) -> Self {
         Self { side: JoinSide::Right, col, dir }
     }
 
+    /// Order by a left-side column ascending.
     pub fn left_asc(col: u16) -> Self {
         Self::left(col, OrderDir::Asc)
     }
 
+    /// Order by a left-side column descending.
     pub fn left_desc(col: u16) -> Self {
         Self::left(col, OrderDir::Desc)
     }
 
+    /// Order by a right-side column ascending.
     pub fn right_asc(col: u16) -> Self {
         Self::right(col, OrderDir::Asc)
     }
 
+    /// Order by a right-side column descending.
     pub fn right_desc(col: u16) -> Self {
         Self::right(col, OrderDir::Desc)
     }
 }
 
+/// Shorthand for `JoinOrderBy::left_asc`.
+///
+/// ```rust
+/// use std::path::Path;
+///
+/// use miniql::{Db, Join, JoinKey, JoinScratch, left_asc, right_desc};
+///
+/// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/join.db");
+/// let db = Db::open(path).unwrap();
+/// let left = db.table("users").unwrap();
+/// let right = db.table("orders").unwrap();
+/// let mut scratch = JoinScratch::with_capacity(4, 4, 0);
+/// Join::inner(left.scan(), right.scan())
+///     .on(JoinKey::RowId, JoinKey::Col(0))
+///     .project_left([0])
+///     .project_right([1])
+///     .order_by([left_asc(0), right_desc(0)])
+///     .for_each(&mut scratch, |_| Ok(()))
+///     .unwrap();
+/// ```
 pub fn left_asc(col: u16) -> JoinOrderBy {
     JoinOrderBy::left_asc(col)
 }
 
+/// Shorthand for `JoinOrderBy::left_desc`.
 pub fn left_desc(col: u16) -> JoinOrderBy {
     JoinOrderBy::left_desc(col)
 }
 
+/// Shorthand for `JoinOrderBy::right_asc`.
 pub fn right_asc(col: u16) -> JoinOrderBy {
     JoinOrderBy::right_asc(col)
 }
 
+/// Shorthand for `JoinOrderBy::right_desc`.
 pub fn right_desc(col: u16) -> JoinOrderBy {
     JoinOrderBy::right_desc(col)
 }
 
+/// Join strategy selector.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum JoinStrategy {
@@ -132,6 +169,7 @@ pub enum JoinStrategy {
     NestedLoopScan,
 }
 
+/// Join builder.
 pub struct Join<'db> {
     join_type: JoinType,
     left: Scan<'db>,
@@ -149,6 +187,7 @@ pub struct Join<'db> {
 // NULL.
 const NULL_ROWID: i64 = 0;
 
+/// Compiled join ready for execution.
 pub struct PreparedJoin<'db> {
     left: PreparedScan<'db>,
     right: PreparedScan<'db>,
@@ -169,6 +208,7 @@ enum JoinPlan {
 }
 
 impl<'db> Join<'db> {
+    /// Create a new join builder.
     pub fn new(join_type: JoinType, left: Scan<'db>, right: Scan<'db>) -> Self {
         Self {
             join_type,
@@ -184,40 +224,67 @@ impl<'db> Join<'db> {
         }
     }
 
+    /// Create an inner join builder.
     pub fn inner(left: Scan<'db>, right: Scan<'db>) -> Self {
         Self::new(JoinType::Inner, left, right)
     }
 
+    /// Create a left join builder.
     pub fn left(left: Scan<'db>, right: Scan<'db>) -> Self {
         Self::new(JoinType::Left, left, right)
     }
 
+    /// Set the join key columns.
     pub fn on(mut self, left: JoinKey, right: JoinKey) -> Self {
         self.left_key = Some(left);
         self.right_key = Some(right);
         self
     }
 
+    /// Set the join strategy.
     pub fn strategy(mut self, s: JoinStrategy) -> Self {
         self.strategy = s;
         self
     }
 
+    /// Set the hash join memory limit in bytes.
     pub fn hash_mem_limit(mut self, bytes: usize) -> Self {
         self.hash_mem_limit = Some(bytes);
         self
     }
 
+    /// Project columns from the left side.
     pub fn project_left<const N: usize>(mut self, cols: [u16; N]) -> Self {
         self.project_left = Some(cols.to_vec());
         self
     }
 
+    /// Project columns from the right side.
     pub fn project_right<const N: usize>(mut self, cols: [u16; N]) -> Self {
         self.project_right = Some(cols.to_vec());
         self
     }
 
+    /// Apply `ORDER BY` to join output.
+    ///
+    /// ```rust
+    /// use std::path::Path;
+    ///
+    /// use miniql::{Db, Join, JoinKey, JoinScratch, left_asc, right_desc};
+    ///
+    /// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/join.db");
+    /// let db = Db::open(path).unwrap();
+    /// let left = db.table("users").unwrap();
+    /// let right = db.table("orders").unwrap();
+    /// let mut scratch = JoinScratch::with_capacity(4, 4, 0);
+    /// Join::inner(left.scan(), right.scan())
+    ///     .on(JoinKey::RowId, JoinKey::Col(0))
+    ///     .project_left([0])
+    ///     .project_right([1])
+    ///     .order_by([left_asc(0), right_desc(0)])
+    ///     .for_each(&mut scratch, |_| Ok(()))
+    ///     .unwrap();
+    /// ```
     pub fn order_by<const N: usize>(mut self, cols: [JoinOrderBy; N]) -> Self {
         if N == 0 {
             self.order_by = None;
@@ -227,6 +294,7 @@ impl<'db> Join<'db> {
         self
     }
 
+    /// Compile the join into an executable plan.
     pub fn compile(self) -> Result<PreparedJoin<'db>> {
         let left_key = self.left_key.ok_or(Error::MissingJoinCondition)?;
         let right_key = self.right_key.ok_or(Error::MissingJoinCondition)?;
@@ -301,6 +369,7 @@ impl<'db> Join<'db> {
         })
     }
 
+    /// Execute the join and invoke `cb` for each joined row.
     pub fn for_each<F>(self, scratch: &mut JoinScratch, mut cb: F) -> Result<()>
     where
         F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
@@ -311,6 +380,7 @@ impl<'db> Join<'db> {
 }
 
 impl<'db> PreparedJoin<'db> {
+    /// Execute the prepared join and invoke `cb` for each joined row.
     pub fn for_each<F>(&mut self, scratch: &mut JoinScratch, mut cb: F) -> Result<()>
     where
         F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
@@ -461,6 +531,7 @@ impl<'db> PreparedJoin<'db> {
     }
 }
 
+/// Joined row containing left and right projections.
 pub struct JoinedRow<'row> {
     pub left_rowid: i64,
     pub right_rowid: i64,
@@ -468,6 +539,7 @@ pub struct JoinedRow<'row> {
     pub right: Row<'row>,
 }
 
+/// Scratch buffers for join execution.
 #[derive(Debug)]
 pub struct JoinScratch {
     left_scan: ScanScratch,
@@ -492,6 +564,7 @@ type JoinScratchParts<'a> = (
 );
 
 impl JoinScratch {
+    /// Create an empty join scratch buffer.
     pub fn new() -> Self {
         Self {
             left_scan: ScanScratch::new(),
@@ -505,6 +578,7 @@ impl JoinScratch {
         }
     }
 
+    /// Create a join scratch buffer with capacity hints.
     pub fn with_capacity(left_values: usize, right_values: usize, overflow: usize) -> Self {
         Self {
             left_scan: ScanScratch::with_capacity(left_values, overflow),

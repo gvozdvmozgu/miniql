@@ -4,10 +4,12 @@ use crate::join::Error;
 use crate::pager::{PageId, PageRef, Pager};
 use crate::table::{self, ValueRef};
 
+/// Result type for index operations.
 pub type Result<T> = table::Result<T>;
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
+/// Scratch buffers for index cursor operations.
 #[derive(Debug, Default)]
 pub struct IndexScratch {
     stack: Vec<StackEntry>,
@@ -16,10 +18,12 @@ pub struct IndexScratch {
 }
 
 impl IndexScratch {
+    /// Create an empty scratch buffer.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Create a scratch buffer with capacity hints.
     pub fn with_capacity(values: usize, overflow: usize) -> Self {
         Self {
             stack: Vec::new(),
@@ -59,6 +63,7 @@ impl<'row> IndexCellRef<'row> {
     }
 }
 
+/// Cursor over an index b-tree.
 pub struct IndexCursor<'db, 'scratch> {
     pager: &'db Pager,
     root: PageId,
@@ -68,6 +73,7 @@ pub struct IndexCursor<'db, 'scratch> {
 }
 
 impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
+    /// Create a new cursor for an index root and key column.
     pub fn new(
         pager: &'db Pager,
         root: PageId,
@@ -77,6 +83,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         Self { pager, root, key_col, scratch, leaf: None }
     }
 
+    /// Seek to the first entry with key >= `target`.
     pub fn seek_ge(&mut self, target: ValueRef<'_>) -> Result<bool> {
         self.scratch.stack.clear();
         self.leaf = None;
@@ -152,6 +159,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
     }
 
     #[allow(clippy::should_implement_trait)]
+    /// Advance to the next entry.
     pub fn next(&mut self) -> Result<bool> {
         let Some(leaf) = self.leaf else {
             return Ok(false);
@@ -170,6 +178,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         self.advance_from_leaf_end()
     }
 
+    /// Check whether the current key equals `target`.
     pub fn key_eq(&mut self, target: ValueRef<'_>) -> Result<bool> {
         let Some(leaf) = self.leaf else {
             return Ok(false);
@@ -201,6 +210,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         Ok(compare_total(target, key) == Ordering::Equal)
     }
 
+    /// Return the rowid at the current cursor position.
     pub fn current_rowid(&mut self) -> Result<i64> {
         let Some(leaf) = self.leaf else {
             return Err(table::Error::Corrupted("index cursor not positioned"));

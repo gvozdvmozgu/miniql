@@ -5,6 +5,7 @@ use std::collections::BinaryHeap;
 use crate::pager::{PageId, Pager};
 use crate::table::{self, ValueRef, ValueSlot};
 
+/// Filter expression tree used by `Scan::filter`.
 #[derive(Debug, Clone)]
 pub enum Expr {
     Col(u16),
@@ -46,6 +47,7 @@ enum CompiledExpr {
     IsNotNull(Box<CompiledExpr>),
 }
 
+/// Literal value used in filter expressions.
 #[derive(Debug, Clone)]
 pub enum ValueLit {
     Null,
@@ -54,12 +56,14 @@ pub enum ValueLit {
     Text(Vec<u8>),
 }
 
+/// Ordering direction for `ORDER BY`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderDir {
     Asc,
     Desc,
 }
 
+/// Column + direction for `ORDER BY`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrderBy {
     pub col: u16,
@@ -67,85 +71,129 @@ pub struct OrderBy {
 }
 
 impl OrderBy {
+    /// Order by a column ascending.
     pub fn asc(col: u16) -> Self {
         Self { col, dir: OrderDir::Asc }
     }
 
+    /// Order by a column descending.
     pub fn desc(col: u16) -> Self {
         Self { col, dir: OrderDir::Desc }
     }
 }
 
+/// Shorthand for `OrderBy::asc`.
+///
+/// ```rust
+/// use std::path::Path;
+///
+/// use miniql::{Db, ScanScratch, asc};
+///
+/// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/users.db");
+/// let db = Db::open(path).unwrap();
+/// let table = db.table("users").unwrap();
+/// let mut scratch = ScanScratch::with_capacity(3, 0);
+/// table.scan().order_by([asc(1)]).for_each(&mut scratch, |_, _| Ok(())).unwrap();
+/// ```
 pub fn asc(col: u16) -> OrderBy {
     OrderBy::asc(col)
 }
 
+/// Shorthand for `OrderBy::desc`.
+///
+/// ```rust
+/// use std::path::Path;
+///
+/// use miniql::{Db, ScanScratch, desc};
+///
+/// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/users.db");
+/// let db = Db::open(path).unwrap();
+/// let table = db.table("users").unwrap();
+/// let mut scratch = ScanScratch::with_capacity(3, 0);
+/// table.scan().order_by([desc(2)]).for_each(&mut scratch, |_, _| Ok(())).unwrap();
+/// ```
 pub fn desc(col: u16) -> OrderBy {
     OrderBy::desc(col)
 }
 
+/// Create a column reference expression.
 pub fn col(i: u16) -> Expr {
     Expr::Col(i)
 }
 
+/// Create an integer literal expression.
 pub fn lit_i64(v: i64) -> Expr {
     Expr::Lit(ValueLit::Integer(v))
 }
 
+/// Create a real literal expression.
 pub fn lit_f64(v: f64) -> Expr {
     Expr::Lit(ValueLit::Real(v))
 }
 
+/// Create a text literal expression.
 pub fn lit_bytes(v: impl Into<Vec<u8>>) -> Expr {
     Expr::Lit(ValueLit::Text(v.into()))
 }
 
+/// Create a NULL literal expression.
 pub fn lit_null() -> Expr {
     Expr::Lit(ValueLit::Null)
 }
 
 impl Expr {
+    /// Compare two expressions for equality.
     pub fn eq(self, rhs: Expr) -> Expr {
         Expr::Eq(Box::new(self), Box::new(rhs))
     }
 
+    /// Compare two expressions for inequality.
     pub fn ne(self, rhs: Expr) -> Expr {
         Expr::Ne(Box::new(self), Box::new(rhs))
     }
 
+    /// Compare two expressions with `<`.
     pub fn lt(self, rhs: Expr) -> Expr {
         Expr::Lt(Box::new(self), Box::new(rhs))
     }
 
+    /// Compare two expressions with `<=`.
     pub fn le(self, rhs: Expr) -> Expr {
         Expr::Le(Box::new(self), Box::new(rhs))
     }
 
+    /// Compare two expressions with `>`.
     pub fn gt(self, rhs: Expr) -> Expr {
         Expr::Gt(Box::new(self), Box::new(rhs))
     }
 
+    /// Compare two expressions with `>=`.
     pub fn ge(self, rhs: Expr) -> Expr {
         Expr::Ge(Box::new(self), Box::new(rhs))
     }
 
+    /// Logical AND of two expressions.
     pub fn and(self, rhs: Expr) -> Expr {
         Expr::And(Box::new(self), Box::new(rhs))
     }
 
+    /// Logical OR of two expressions.
     pub fn or(self, rhs: Expr) -> Expr {
         Expr::Or(Box::new(self), Box::new(rhs))
     }
 
     #[allow(clippy::should_implement_trait)]
+    /// Logical NOT of an expression.
     pub fn not(self) -> Expr {
         Expr::Not(Box::new(self))
     }
 
+    /// Check whether the expression evaluates to NULL.
     pub fn is_null(self) -> Expr {
         Expr::IsNull(Box::new(self))
     }
 
+    /// Check whether the expression evaluates to NOT NULL.
     pub fn is_not_null(self) -> Expr {
         Expr::IsNotNull(Box::new(self))
     }
@@ -180,6 +228,7 @@ impl std::ops::Not for Expr {
     }
 }
 
+/// Scratch buffers for scans.
 #[derive(Debug, Default)]
 pub struct ScanScratch {
     stack: Vec<PageId>,
@@ -189,10 +238,12 @@ pub struct ScanScratch {
 }
 
 impl ScanScratch {
+    /// Create an empty scratch buffer.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Create a scratch buffer with capacity hints.
     pub fn with_capacity(values: usize, overflow: usize) -> Self {
         Self {
             stack: Vec::new(),
@@ -209,6 +260,7 @@ impl ScanScratch {
     }
 }
 
+/// Row view returned by scans.
 #[derive(Clone, Copy)]
 pub struct Row<'row> {
     values: &'row [ValueSlot],
@@ -224,14 +276,17 @@ impl<'row> Row<'row> {
         self.values
     }
 
+    /// Number of columns in the projected row.
     pub fn len(&self) -> usize {
         self.proj_map.map_or(self.values.len(), |map| map.len())
     }
 
+    /// Returns true when there are no columns.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Return a value reference by column index.
     pub fn get(&self, i: usize) -> Option<ValueRef<'row>> {
         let idx = match self.proj_map {
             Some(map) => *map.get(i)?,
@@ -240,6 +295,7 @@ impl<'row> Row<'row> {
         self.values.get(idx).copied().map(raw_to_ref)
     }
 
+    /// Return an `i64` value or a type mismatch error.
     pub fn get_i64(&self, i: usize) -> table::Result<i64> {
         match self.get(i) {
             Some(ValueRef::Integer(value)) => Ok(value),
@@ -254,6 +310,7 @@ impl<'row> Row<'row> {
         }
     }
 
+    /// Return an `f64` value or a type mismatch error.
     pub fn get_f64(&self, i: usize) -> table::Result<f64> {
         match self.get(i) {
             Some(ValueRef::Real(value)) => Ok(value),
@@ -264,6 +321,7 @@ impl<'row> Row<'row> {
         }
     }
 
+    /// Return a UTF-8 string or a type mismatch error.
     pub fn get_text(&self, i: usize) -> table::Result<&'row str> {
         match self.get(i) {
             Some(ValueRef::Text(bytes)) => Ok(std::str::from_utf8(bytes)?),
@@ -274,6 +332,7 @@ impl<'row> Row<'row> {
         }
     }
 
+    /// Return text/blob bytes or a type mismatch error.
     pub fn get_bytes(&self, i: usize) -> table::Result<&'row [u8]> {
         match self.get(i) {
             Some(ValueRef::Text(bytes)) => Ok(bytes),
@@ -290,6 +349,7 @@ impl<'row> Row<'row> {
 
 type FilterFn<'db> = Box<dyn for<'row> FnMut(&Row<'row>) -> table::Result<bool> + 'db>;
 
+/// Builder for table scans.
 pub struct Scan<'db> {
     pager: &'db Pager,
     root: PageId,
@@ -301,6 +361,7 @@ pub struct Scan<'db> {
     limit: Option<usize>,
 }
 
+/// Compiled scan ready for execution.
 pub struct PreparedScan<'db> {
     pager: &'db Pager,
     root: PageId,
@@ -314,10 +375,12 @@ pub struct PreparedScan<'db> {
     column_count_hint: OnceCell<usize>,
 }
 
+/// Deprecated alias for `PreparedScan`.
 #[deprecated(note = "use PreparedScan")]
 pub type CompiledScan<'db> = PreparedScan<'db>;
 
 impl<'db> Scan<'db> {
+    /// Create a scan over a table root.
     pub fn table(pager: &'db Pager, root: PageId) -> Self {
         Self {
             pager,
@@ -348,17 +411,20 @@ impl<'db> Scan<'db> {
         }
     }
 
+    /// Project specific columns by index.
     pub fn project<const N: usize>(mut self, cols: [u16; N]) -> Self {
         self.projection = Some(cols.to_vec());
         self
     }
 
+    /// Apply a filter expression.
     pub fn filter(mut self, expr: Expr) -> Self {
         self.filter_expr = Some(expr);
         self.filter_fn = None;
         self
     }
 
+    /// Apply a custom filter function (disables predicate compilation).
     pub fn filter_fn_slow<F>(mut self, f: F) -> Self
     where
         F: for<'row> FnMut(&Row<'row>) -> table::Result<bool> + 'db,
@@ -368,6 +434,7 @@ impl<'db> Scan<'db> {
         self
     }
 
+    /// Apply a custom filter function.
     pub fn filter_fn<F>(self, f: F) -> Self
     where
         F: for<'row> FnMut(&Row<'row>) -> table::Result<bool> + 'db,
@@ -375,6 +442,19 @@ impl<'db> Scan<'db> {
         self.filter_fn_slow(f)
     }
 
+    /// Apply `ORDER BY` to a scan.
+    ///
+    /// ```rust
+    /// use std::path::Path;
+    ///
+    /// use miniql::{Db, ScanScratch, asc, desc};
+    ///
+    /// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/users.db");
+    /// let db = Db::open(path).unwrap();
+    /// let table = db.table("users").unwrap();
+    /// let mut scratch = ScanScratch::with_capacity(3, 0);
+    /// table.scan().order_by([asc(1), desc(2)]).for_each(&mut scratch, |_, _| Ok(())).unwrap();
+    /// ```
     pub fn order_by<const N: usize>(mut self, cols: [OrderBy; N]) -> Self {
         if N == 0 {
             self.order_by = None;
@@ -384,6 +464,7 @@ impl<'db> Scan<'db> {
         self
     }
 
+    /// Limit the number of rows returned.
     pub fn limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
         self
@@ -398,6 +479,7 @@ impl<'db> Scan<'db> {
         self
     }
 
+    /// Compile the scan into an executable plan.
     pub fn compile(self) -> table::Result<PreparedScan<'db>> {
         let Scan {
             pager,
@@ -448,6 +530,7 @@ impl<'db> Scan<'db> {
         })
     }
 
+    /// Execute the scan and invoke `cb` for each row.
     pub fn for_each<F>(self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
     where
         F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
@@ -539,6 +622,7 @@ impl<'db> PreparedScan<'db> {
         Ok(Some(row))
     }
 
+    /// Execute the prepared scan and invoke `cb` for each row.
     pub fn for_each<F>(&mut self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
     where
         F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
