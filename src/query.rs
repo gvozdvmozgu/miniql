@@ -238,6 +238,7 @@ pub struct ScanScratch {
     values: Vec<ValueSlot>,
     bytes: Vec<u8>,
     serials: Vec<u64>,
+    offsets: Vec<u32>,
 }
 
 impl Default for ScanScratch {
@@ -259,13 +260,15 @@ impl ScanScratch {
             values: Vec::with_capacity(values),
             bytes: Vec::with_capacity(overflow),
             serials: Vec::with_capacity(values),
+            offsets: Vec::with_capacity(values),
         }
     }
 
+    #[allow(clippy::type_complexity)]
     pub(crate) fn split_mut(
         &mut self,
-    ) -> (&mut Vec<ValueSlot>, &mut Vec<u8>, &mut Vec<u64>, &mut Vec<PageId>) {
-        (&mut self.values, &mut self.bytes, &mut self.serials, &mut self.stack)
+    ) -> (&mut Vec<ValueSlot>, &mut Vec<u8>, &mut Vec<u64>, &mut Vec<u32>, &mut Vec<PageId>) {
+        (&mut self.values, &mut self.bytes, &mut self.serials, &mut self.offsets, &mut self.stack)
     }
 }
 
@@ -728,7 +731,8 @@ impl<'db> PreparedScan<'db> {
         let pager = self.pager;
         let root = self.root;
 
-        let (values, bytes, serials, btree_stack) = scratch.split_mut();
+        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
+        let _ = offsets; // Reserved for future offset caching
         table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
             let rowid = cell.rowid();
             let Some(row) = self.eval_payload(cell.payload(), values, bytes, serials)? else {
@@ -754,7 +758,8 @@ impl<'db> PreparedScan<'db> {
         let root = self.root;
         let mut seen = 0usize;
 
-        let (values, bytes, serials, btree_stack) = scratch.split_mut();
+        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
+        let _ = offsets; // Reserved for future offset caching
 
         table::scan_table_cells_with_scratch_and_stack_until(pager, root, btree_stack, |cell| {
             let rowid = cell.rowid();
@@ -787,7 +792,8 @@ impl<'db> PreparedScan<'db> {
         let pager = self.pager;
         let root = self.root;
 
-        let (values, bytes, serials, btree_stack) = scratch.split_mut();
+        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
+        let _ = offsets; // Reserved for future offset caching
         let mut order_bytes = Vec::with_capacity(64);
         let key_arena = Bump::new();
         let mut seq = 0u64;
@@ -874,7 +880,8 @@ impl<'db> PreparedScan<'db> {
         let pager = self.pager;
         let root = self.root;
 
-        let (values, bytes, serials, btree_stack) = scratch.split_mut();
+        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
+        let _ = offsets; // Reserved for future offset caching
         let mut order_bytes = Vec::with_capacity(64);
         let key_arena = Bump::new();
         let mut seq = 0u64;

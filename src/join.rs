@@ -1439,7 +1439,8 @@ where
 
     let pager = right_scan.pager();
     let right_root = right_scan.root();
-    let (values, bytes, serials, stack) = right_scratch.split_mut();
+    let (values, bytes, serials, offsets, stack) = right_scratch.split_mut();
+    let _ = offsets; // Reserved for future offset caching
     let mut seen = 0usize;
     let limit = right_scan.limit();
     let has_filters = right_scan.has_filters();

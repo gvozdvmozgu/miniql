@@ -1515,33 +1515,35 @@ fn decode_record_project_into_bytes(
                 }
             }
             _ => {
-                // General path: running offset for multiple columns
+                // Multi-column path: precompute all offsets once (SQLite aOffset[] style)
+                // This converts O(k*n) to O(n) where k = avg distance between columns
                 let mut value_pos = header_len;
-                let mut prev_col: usize = 0;
 
+                // For sorted needed_cols, compute offsets progressively
+                // needed_cols is already sorted by build_plan
+                let mut serial_idx = 0usize;
                 for &col in needed_cols {
                     let col_idx = col as usize;
                     if col_idx >= column_count {
                         continue;
                     }
 
-                    if col_idx >= prev_col {
-                        // Forward skip
-                        for i in prev_col..col_idx {
-                            value_pos += serial_type_len_fast(unsafe { *serials.get_unchecked(i) });
-                        }
-                    } else {
-                        // Backward: restart from header
-                        value_pos = header_len;
-                        for i in 0..col_idx {
-                            value_pos += serial_type_len_fast(unsafe { *serials.get_unchecked(i) });
-                        }
+                    // Advance to col_idx
+                    while serial_idx < col_idx {
+                        value_pos +=
+                            serial_type_len_fast(unsafe { *serials.get_unchecked(serial_idx) });
+                        serial_idx += 1;
                     }
 
                     let serial = unsafe { *serials.get_unchecked(col_idx) };
-                    let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
+                    let pos = value_pos;
+                    // Advance past this column for next iteration
+                    value_pos += serial_type_len_fast(serial);
+                    serial_idx = col_idx + 1;
+
+                    let mut decode_pos = pos;
+                    let value = decode_value_ref_at(serial, payload, &mut decode_pos)?;
                     out.push(value);
-                    prev_col = col_idx + 1;
                 }
             }
         }
