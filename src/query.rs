@@ -201,7 +201,7 @@ impl Expr {
         Expr::IsNotNull(Box::new(self))
     }
 
-    fn collect_cols(&self, out: &mut Vec<u16>) {
+    fn collect_cols(&self, out: &mut SmallVec<[u16; 8]>) {
         match self {
             Expr::Col(idx) => out.push(*idx),
             Expr::Lit(_) => {}
@@ -232,12 +232,18 @@ impl std::ops::Not for Expr {
 }
 
 /// Scratch buffers for scans.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ScanScratch {
     stack: Vec<PageId>,
     values: Vec<ValueSlot>,
     bytes: Vec<u8>,
     serials: Vec<u64>,
+}
+
+impl Default for ScanScratch {
+    fn default() -> Self {
+        Self::with_capacity(0, 0)
+    }
 }
 
 impl ScanScratch {
@@ -481,6 +487,14 @@ impl<'db> Scan<'db> {
         matches!(self.order_by.as_deref(), Some(cols) if !cols.is_empty())
     }
 
+    /// Check if scan output is sorted ascending by a specific column.
+    pub(crate) fn sorted_asc_by_col(&self, col: u16) -> bool {
+        match self.order_by.as_deref() {
+            Some([first, ..]) => first.col == col && matches!(first.dir, OrderDir::Asc),
+            _ => false,
+        }
+    }
+
     pub(crate) fn with_projection_override(mut self, projection: Option<Vec<u16>>) -> Self {
         self.projection = projection;
         self
@@ -499,7 +513,7 @@ impl<'db> Scan<'db> {
             limit,
         } = self;
 
-        let mut pred_cols = Vec::new();
+        let mut pred_cols = SmallVec::<[u16; 8]>::new();
         if let Some(expr) = &filter_expr {
             expr.collect_cols(&mut pred_cols);
         }
@@ -570,6 +584,10 @@ impl<'db> PreparedScan<'db> {
 
     pub(crate) fn limit(&self) -> Option<usize> {
         self.limit
+    }
+
+    pub(crate) fn has_filters(&self) -> bool {
+        self.compiled_expr.is_some() || self.filter_fn.is_some()
     }
 
     pub(crate) fn eval_payload<'row>(
@@ -681,19 +699,16 @@ impl<'db> PreparedScan<'db> {
             return Ok(());
         }
 
-        if let Some(order_by) = self.order_by.take() {
-            if order_by.is_empty() {
-                self.order_by = Some(order_by);
-            } else {
-                let result = match self.limit {
-                    Some(limit) => {
-                        self.for_each_ordered_limited(scratch, order_by.as_ref(), limit, &mut cb)
-                    }
-                    None => self.for_each_ordered_unlimited(scratch, order_by.as_ref(), &mut cb),
-                };
-                self.order_by = Some(order_by);
-                return result;
-            }
+        let has_order = matches!(self.order_by.as_deref(), Some(o) if !o.is_empty());
+        if has_order {
+            // take() needed due to borrow rules; restored after call
+            let order_by = self.order_by.take().unwrap();
+            let result = match self.limit {
+                Some(limit) => self.for_each_ordered_limited(scratch, &order_by, limit, &mut cb),
+                None => self.for_each_ordered_unlimited(scratch, &order_by, &mut cb),
+            };
+            self.order_by = Some(order_by);
+            return result;
         }
 
         match self.limit {
@@ -773,11 +788,11 @@ impl<'db> PreparedScan<'db> {
         let root = self.root;
 
         let (values, bytes, serials, btree_stack) = scratch.split_mut();
-        let mut order_bytes = Vec::new();
+        let mut order_bytes = Vec::with_capacity(64);
         let key_arena = Bump::new();
         let mut seq = 0u64;
 
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(256);
         let apply_filters = self.compiled_expr.is_some() || self.filter_fn.is_some();
 
         if apply_filters {
@@ -860,7 +875,7 @@ impl<'db> PreparedScan<'db> {
         let root = self.root;
 
         let (values, bytes, serials, btree_stack) = scratch.split_mut();
-        let mut order_bytes = Vec::new();
+        let mut order_bytes = Vec::with_capacity(64);
         let key_arena = Bump::new();
         let mut seq = 0u64;
 
@@ -1089,7 +1104,10 @@ fn build_plan(
     decode_all: bool,
 ) -> Plan {
     let decode_all = decode_all || projection.is_none();
-    let mut referenced_cols = pred_cols.to_vec();
+    let proj_len = projection.map_or(0, |p| p.len());
+    let order_len = order_by.map_or(0, |o| o.len());
+    let mut referenced_cols = Vec::with_capacity(pred_cols.len() + proj_len + order_len);
+    referenced_cols.extend_from_slice(pred_cols);
     if let Some(proj) = projection {
         referenced_cols.extend(proj.iter().copied());
     }
@@ -1102,7 +1120,8 @@ fn build_plan(
     let needed_cols = if decode_all {
         None
     } else {
-        let mut needed = pred_cols.to_vec();
+        let mut needed = Vec::with_capacity(pred_cols.len() + proj_len);
+        needed.extend_from_slice(pred_cols);
         if let Some(proj) = projection {
             needed.extend(proj.iter().copied());
         }
@@ -1501,11 +1520,11 @@ mod tests {
     use super::*;
 
     fn collect(expr: &Expr) -> Vec<u16> {
-        let mut cols = Vec::new();
+        let mut cols = SmallVec::<[u16; 8]>::new();
         expr.collect_cols(&mut cols);
         cols.sort_unstable();
         cols.dedup();
-        cols
+        cols.to_vec()
     }
 
     #[test]

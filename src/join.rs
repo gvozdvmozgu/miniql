@@ -313,6 +313,11 @@ impl<'db> Join<'db> {
         let left_order_cols = collect_order_cols(&order_by, JoinSide::Left);
         let right_order_cols = collect_order_cols(&order_by, JoinSide::Right);
         let left_has_order = self.left.has_order_by();
+        // Check if left keys are naturally sorted (rowid or ORDER BY on join key)
+        let left_keys_sorted = match left_key {
+            JoinKey::RowId => !left_has_order,
+            JoinKey::Col(col) => self.left.sorted_asc_by_col(col),
+        };
 
         let ((left_scan, left_meta), (mut right_scan, right_meta)) = build_sides(
             self.left,
@@ -345,7 +350,7 @@ impl<'db> Join<'db> {
                 if !matches!(right_key, JoinKey::Col(_)) {
                     return Err(Error::UnsupportedJoinKeyType.into());
                 }
-                if !matches!(left_key, JoinKey::RowId) || left_has_order {
+                if !left_keys_sorted {
                     return Err(Error::UnsupportedJoinStrategy.into());
                 }
                 let index_cols = discover_index_cols_for_root(
@@ -378,7 +383,7 @@ impl<'db> Join<'db> {
                             }
                         } else if prefer_hash {
                             JoinPlan::HashJoin
-                        } else if matches!(left_key, JoinKey::RowId) && !left_has_order {
+                        } else if left_keys_sorted {
                             JoinPlan::IndexMerge {
                                 index_root: index.root,
                                 index_key_col: index.key_col,
@@ -440,6 +445,29 @@ impl<'db> Join<'db> {
 }
 
 impl<'db> PreparedJoin<'db> {
+    /// Returns a string describing the chosen join strategy for diagnostics.
+    pub fn explain(&self) -> &'static str {
+        match &self.plan {
+            JoinPlan::IndexNestedLoop { index_cols, .. } => {
+                if covering_map_for_index(&self.right, index_cols.as_deref()).is_some() {
+                    "index-nested-loop (covering)"
+                } else {
+                    "index-nested-loop"
+                }
+            }
+            JoinPlan::IndexMerge { index_cols, .. } => {
+                if covering_map_for_index(&self.right, index_cols.as_deref()).is_some() {
+                    "index-merge (covering)"
+                } else {
+                    "index-merge"
+                }
+            }
+            JoinPlan::HashJoin => "hash-join",
+            JoinPlan::NestedLoopScan => "nested-loop-scan",
+            JoinPlan::RowIdNestedLoop => "rowid-nested-loop",
+        }
+    }
+
     /// Execute the prepared join and invoke `cb` for each joined row.
     pub fn for_each<F>(&mut self, scratch: &mut JoinScratch, mut cb: F) -> Result<()>
     where
@@ -1414,6 +1442,7 @@ where
     let (values, bytes, serials, stack) = right_scratch.split_mut();
     let mut seen = 0usize;
     let limit = right_scan.limit();
+    let has_filters = right_scan.has_filters();
 
     table::scan_table_cells_with_scratch_and_stack_until(pager, right_root, stack, |cell| {
         if let Some(limit) = limit
@@ -1424,13 +1453,34 @@ where
         let rowid = cell.rowid();
         let payload = cell.payload();
         let payload_len = payload.len();
-        let Some(row) =
-            right_scan.eval_payload_with_filters(payload, values, bytes, serials, true)?
-        else {
-            return Ok(None::<()>);
+
+        // Fast path: no filters, extract only join key column
+        let key_value = if !has_filters {
+            match right_meta.join_key {
+                JoinKey::RowId => Some(ValueRef::Integer(rowid)),
+                JoinKey::Col(col) => {
+                    bytes.clear();
+                    match table::decode_record_column(payload, col, bytes)? {
+                        Some(slot) => {
+                            let value = unsafe { slot.as_value_ref_with_scratch(bytes) };
+                            if matches!(value, ValueRef::Null) { None } else { Some(value) }
+                        }
+                        None => None,
+                    }
+                }
+            }
+        } else {
+            // Slow path: decode full row for filter evaluation
+            let Some(row) =
+                right_scan.eval_payload_with_filters(payload, values, bytes, serials, true)?
+            else {
+                return Ok(None::<()>);
+            };
+            right_meta.join_key(rowid, &row)?
         };
+
         seen += 1;
-        let Some(key_value) = right_meta.join_key(rowid, &row)? else {
+        let Some(key_value) = key_value else {
             return Ok(None::<()>);
         };
         let Some(key_ref) = hash_key_from_value(key_value)? else {

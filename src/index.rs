@@ -130,9 +130,8 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                         let mid = (lo + hi) / 2;
                         let offset = cell_ptr_at(cell_ptrs, mid)?;
                         let cell = read_index_interior_cell(self.pager, &page, offset)?;
-                        let child = cell
-                            .child()
-                            .ok_or(table::Error::Corrupted("missing child pointer"))?;
+                        let child =
+                            cell.child().ok_or(table::Error::Corrupted("missing child pointer"))?;
                         let key = decode_key_from_payload(
                             self.key_col,
                             cell.payload(),
@@ -218,8 +217,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         let cell_ptrs = cell_ptrs(&page, &header)?;
         let offset = cell_ptr_at(cell_ptrs, leaf.cell_index)?;
         let cell = read_index_leaf_cell(self.pager, &page, offset)?;
-        let key =
-            decode_key_from_payload(self.key_col, cell.payload(), &mut self.scratch.bytes)?;
+        let key = decode_key_from_payload(self.key_col, cell.payload(), &mut self.scratch.bytes)?;
         if matches!(key, ValueRef::Real(value) if value.is_nan())
             || matches!(target, ValueRef::Real(value) if value.is_nan())
         {

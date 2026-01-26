@@ -56,11 +56,12 @@ fn bench_join_inlj_hot(c: &mut Criterion) {
     c.bench_function("join_inlj_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            prepared.for_each(&mut scratch, |_jr| {
-                rows += 1;
-                Ok(())
-            })
-            .expect("join");
+            prepared
+                .for_each(&mut scratch, |_jr| {
+                    rows += 1;
+                    Ok(())
+                })
+                .expect("join");
             black_box(rows);
         });
     });
@@ -85,11 +86,12 @@ fn bench_join_hash_hot(c: &mut Criterion) {
     c.bench_function("join_hash_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            prepared.for_each(&mut scratch, |_jr| {
-                rows += 1;
-                Ok(())
-            })
-            .expect("join");
+            prepared
+                .for_each(&mut scratch, |_jr| {
+                    rows += 1;
+                    Ok(())
+                })
+                .expect("join");
             black_box(rows);
         });
     });
