@@ -288,9 +288,5 @@ impl std::error::Error for Error {
 }
 
 fn is_valid_page_size(page_size: usize) -> bool {
-    match page_size {
-        512..=32768 => page_size.is_power_of_two(),
-        65536 => true,
-        _ => false,
-    }
+    matches!(page_size, 512..=32768 if page_size.is_power_of_two()) || page_size == 65536
 }
