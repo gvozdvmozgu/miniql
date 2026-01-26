@@ -1290,6 +1290,7 @@ fn raw_to_ref<'row>(value: ValueSlot) -> ValueRef<'row> {
     unsafe { value.as_value_ref() }
 }
 
+#[inline(always)]
 fn raw_to_ref_with_scratch<'row>(value: ValueSlot, scratch_bytes: &'row [u8]) -> ValueRef<'row> {
     // SAFETY: raw values point into the current row payload/overflow buffer and
     // are only materialized for the duration of the row callback.
@@ -1363,15 +1364,21 @@ struct EvalContext<'row> {
 }
 
 impl<'row> EvalContext<'row> {
+    /// Get value at index. idx is validated during compile phase.
+    #[inline(always)]
     fn value_by_idx(&self, idx: usize, col: u16) -> table::Result<ValueRef<'row>> {
-        self.values
-            .get(idx)
-            .copied()
-            .map(|raw| raw_to_ref_with_scratch(raw, self.scratch_bytes))
-            .ok_or(table::Error::InvalidColumnIndex { col, column_count: self.values.len() })
+        // SAFETY: idx is computed during compile and verified against column count.
+        // At runtime the values slice has the same number of elements.
+        if idx < self.values.len() {
+            let raw = unsafe { *self.values.get_unchecked(idx) };
+            Ok(raw_to_ref_with_scratch(raw, self.scratch_bytes))
+        } else {
+            Err(table::Error::InvalidColumnIndex { col, column_count: self.values.len() })
+        }
     }
 }
 
+#[inline(always)]
 fn eval_compiled_expr(
     expr: &CompiledExpr,
     values: &[ValueSlot],
@@ -1381,6 +1388,7 @@ fn eval_compiled_expr(
     eval_compiled_expr_inner(expr, &ctx)
 }
 
+#[inline]
 fn eval_compiled_expr_inner(expr: &CompiledExpr, ctx: &EvalContext<'_>) -> table::Result<Truth> {
     match expr {
         CompiledExpr::CmpColLit { idx, op, lit } => {
@@ -1482,6 +1490,7 @@ impl ValueLit {
     }
 }
 
+#[inline(always)]
 fn compare<'a, 'b>(op: CmpOp, left: ValueRef<'a>, right: ValueRef<'b>) -> Truth {
     match (left, right) {
         (ValueRef::Null, _) | (_, ValueRef::Null) => Truth::Null,
@@ -1495,6 +1504,7 @@ fn compare<'a, 'b>(op: CmpOp, left: ValueRef<'a>, right: ValueRef<'b>) -> Truth 
     }
 }
 
+#[inline(always)]
 fn cmp_f64(op: CmpOp, left: f64, right: f64) -> Truth {
     match left.partial_cmp(&right) {
         Some(order) => cmp_order(op, order),
@@ -1502,6 +1512,7 @@ fn cmp_f64(op: CmpOp, left: f64, right: f64) -> Truth {
     }
 }
 
+#[inline(always)]
 fn cmp_order(op: CmpOp, order: std::cmp::Ordering) -> Truth {
     let matches = match op {
         CmpOp::Eq => order == std::cmp::Ordering::Equal,

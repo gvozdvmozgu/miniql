@@ -1346,7 +1346,9 @@ pub(crate) fn decode_record_project_into(
     serials: &mut Vec<u64>,
 ) -> Result<usize> {
     match payload {
-        PayloadRef::Inline(bytes) => decode_record_project_into_bytes(bytes, needed_cols, out),
+        PayloadRef::Inline(payload_bytes) => {
+            decode_record_project_into_bytes(payload_bytes, needed_cols, out, serials)
+        }
         PayloadRef::Overflow(payload) => {
             decode_record_project_into_overflow(&payload, needed_cols, out, bytes, serials)
         }
@@ -1426,12 +1428,15 @@ fn record_column_count_overflow(payload: &OverflowPayload<'_>) -> Result<usize> 
     Ok(count)
 }
 
+#[inline(always)]
 fn decode_record_project_into_bytes(
     payload: &[u8],
     needed_cols: Option<&[u16]>,
     out: &mut Vec<ValueSlot>,
+    serials: &mut Vec<u64>,
 ) -> Result<usize> {
     out.clear();
+    serials.clear();
 
     let mut header_pos = 0usize;
     let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
@@ -1446,14 +1451,15 @@ fn decode_record_project_into_bytes(
     }
 
     let serial_bytes = &payload[header_pos..header_len];
-    let mut serial_pos = 0usize;
-    let mut value_pos = header_len;
 
     if let Some(needed_cols) = needed_cols {
-        let mut needed_iter = needed_cols.iter().copied();
-        let mut next_needed = needed_iter.next();
-        let mut column_count = 0usize;
-        while serial_pos < serial_bytes.len() {
+        // PROJECTION PATH: SQLite optimization - parse header only up to max needed
+        // column
+        let max_needed_col = needed_cols.iter().map(|&c| c as usize).max().unwrap_or(0);
+
+        // Phase 1: Parse serial types lazily (only up to max_needed_col + 1)
+        let mut serial_pos = 0usize;
+        while serial_pos < serial_bytes.len() && serials.len() <= max_needed_col {
             let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
             let serial = if b < 0x80 {
                 serial_pos += 1;
@@ -1461,20 +1467,103 @@ fn decode_record_project_into_bytes(
             } else {
                 read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
             };
-            let col_idx = column_count as u16;
-            if Some(col_idx) == next_needed {
-                let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
-                push_checked(out, value, "values")?;
-                next_needed = needed_iter.next();
+            serials.push(serial);
+        }
+
+        // Count remaining columns without storing (needed for column_count validation)
+        let mut column_count = serials.len();
+        while serial_pos < serial_bytes.len() {
+            let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
+            if b < 0x80 {
+                serial_pos += 1;
             } else {
-                skip_value_at(serial, payload, &mut value_pos)?;
+                // Skip multi-byte varint
+                while serial_pos < serial_bytes.len() {
+                    let byte = unsafe { *serial_bytes.get_unchecked(serial_pos) };
+                    serial_pos += 1;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
             }
             column_count += 1;
         }
+
+        // Check capacity once before decoding
+        if out.capacity() < needed_cols.len() {
+            return Err(Error::ScratchTooSmall {
+                kind: "values",
+                needed: needed_cols.len(),
+                capacity: out.capacity(),
+            });
+        }
+
+        // Phase 2: Decode only needed columns
+        match needed_cols.len() {
+            0 => {}
+            1 => {
+                // Fast path for single column projection
+                let col_idx = needed_cols[0] as usize;
+                if col_idx < column_count {
+                    let mut value_pos = header_len;
+                    for i in 0..col_idx {
+                        value_pos += serial_type_len_fast(unsafe { *serials.get_unchecked(i) });
+                    }
+                    let serial = unsafe { *serials.get_unchecked(col_idx) };
+                    let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
+                    out.push(value);
+                }
+            }
+            _ => {
+                // General path: running offset for multiple columns
+                let mut value_pos = header_len;
+                let mut prev_col: usize = 0;
+
+                for &col in needed_cols {
+                    let col_idx = col as usize;
+                    if col_idx >= column_count {
+                        continue;
+                    }
+
+                    if col_idx >= prev_col {
+                        // Forward skip
+                        for i in prev_col..col_idx {
+                            value_pos += serial_type_len_fast(unsafe { *serials.get_unchecked(i) });
+                        }
+                    } else {
+                        // Backward: restart from header
+                        value_pos = header_len;
+                        for i in 0..col_idx {
+                            value_pos += serial_type_len_fast(unsafe { *serials.get_unchecked(i) });
+                        }
+                    }
+
+                    let serial = unsafe { *serials.get_unchecked(col_idx) };
+                    let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
+                    out.push(value);
+                    prev_col = col_idx + 1;
+                }
+            }
+        }
         Ok(column_count)
     } else {
-        let mut column_count = 0usize;
+        // NO PROJECTION PATH: single-pass parse + decode (no intermediate serials
+        // storage) Estimate column count from header size (each serial type is
+        // at least 1 byte)
+        let estimated_cols = serial_bytes.len();
+        if out.capacity() < estimated_cols {
+            return Err(Error::ScratchTooSmall {
+                kind: "values",
+                needed: estimated_cols,
+                capacity: out.capacity(),
+            });
+        }
+
+        let mut serial_pos = 0usize;
+        let mut value_pos = header_len;
+
         while serial_pos < serial_bytes.len() {
+            // Parse serial type inline
             let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
             let serial = if b < 0x80 {
                 serial_pos += 1;
@@ -1482,11 +1571,46 @@ fn decode_record_project_into_bytes(
             } else {
                 read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
             };
+
+            // Decode value immediately - no capacity check needed
             let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
-            push_checked(out, value, "values")?;
-            column_count += 1;
+            out.push(value);
         }
-        Ok(column_count)
+
+        Ok(out.len())
+    }
+}
+
+/// Lookup table for serial type lengths (serial types 0-127).
+/// This is the same optimization SQLite uses in sqlite3SmallTypeSizes[].
+/// For serial_type < 128, we can use a single table lookup instead of branching.
+#[rustfmt::skip]
+static SERIAL_TYPE_LEN: [u8; 128] = [
+    //  0   1   2   3   4   5   6   7   8   9
+        0,  1,  2,  3,  4,  6,  8,  8,  0,  0,  // 0-9
+        0,  0,  0,  0,  1,  1,  2,  2,  3,  3,  // 10-19
+        4,  4,  5,  5,  6,  6,  7,  7,  8,  8,  // 20-29
+        9,  9, 10, 10, 11, 11, 12, 12, 13, 13,  // 30-39
+       14, 14, 15, 15, 16, 16, 17, 17, 18, 18,  // 40-49
+       19, 19, 20, 20, 21, 21, 22, 22, 23, 23,  // 50-59
+       24, 24, 25, 25, 26, 26, 27, 27, 28, 28,  // 60-69
+       29, 29, 30, 30, 31, 31, 32, 32, 33, 33,  // 70-79
+       34, 34, 35, 35, 36, 36, 37, 37, 38, 38,  // 80-89
+       39, 39, 40, 40, 41, 41, 42, 42, 43, 43,  // 90-99
+       44, 44, 45, 45, 46, 46, 47, 47, 48, 48,  // 100-109
+       49, 49, 50, 50, 51, 51, 52, 52, 53, 53,  // 110-119
+       54, 54, 55, 55, 56, 56, 57, 57,          // 120-127
+];
+
+/// Fast inline version of serial_type_len using lookup table for small types
+#[inline(always)]
+fn serial_type_len_fast(serial_type: u64) -> usize {
+    if serial_type < 128 {
+        // Fast path: table lookup (no branches)
+        SERIAL_TYPE_LEN[serial_type as usize] as usize
+    } else {
+        // Slow path: compute for large serial types (rare - very long strings/blobs)
+        ((serial_type - 12) / 2) as usize
     }
 }
 
@@ -1768,9 +1892,13 @@ fn serial_type_len(serial_type: u64) -> Result<usize> {
     }
 }
 
+#[inline]
 fn decode_value_ref_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Result<ValueSlot> {
+    // Optimized match order: most common types first, no redundant checks
     let value = match serial_type {
         0 => ValueSlot::Null,
+        8 => ValueSlot::Integer(0),
+        9 => ValueSlot::Integer(1),
         1 => ValueSlot::Integer(read_signed_be_at(bytes, pos, 1)?),
         2 => ValueSlot::Integer(read_signed_be_at(bytes, pos, 2)?),
         3 => ValueSlot::Integer(read_signed_be_at(bytes, pos, 3)?),
@@ -1778,17 +1906,17 @@ fn decode_value_ref_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Resul
         5 => ValueSlot::Integer(read_signed_be_at(bytes, pos, 6)?),
         6 => ValueSlot::Integer(read_signed_be_at(bytes, pos, 8)?),
         7 => ValueSlot::Real(f64::from_bits(read_u64_be_at(bytes, pos)?)),
-        8 => ValueSlot::Integer(0),
-        9 => ValueSlot::Integer(1),
-        serial if serial >= 12 && serial % 2 == 0 => {
+        10 | 11 => return Err(Error::UnsupportedSerialType(serial_type)),
+        // For serial >= 12: even = blob, odd = text. Length = (serial-12)/2 or (serial-13)/2
+        serial => {
             let len = ((serial - 12) / 2) as usize;
-            ValueSlot::Blob(BytesSpan::mmap(read_exact_bytes_at(bytes, pos, len)?))
+            let slice = read_exact_bytes_at(bytes, pos, len)?;
+            if serial & 1 == 0 {
+                ValueSlot::Blob(BytesSpan::mmap(slice))
+            } else {
+                ValueSlot::Text(BytesSpan::mmap(slice))
+            }
         }
-        serial if serial >= 13 => {
-            let len = ((serial - 13) / 2) as usize;
-            ValueSlot::Text(BytesSpan::mmap(read_exact_bytes_at(bytes, pos, len)?))
-        }
-        other => return Err(Error::UnsupportedSerialType(other)),
     };
 
     Ok(value)
@@ -1898,38 +2026,47 @@ fn read_varint_checked(decoder: &mut Decoder<'_>, msg: &'static str) -> Result<u
     decoder.try_read_varint().ok_or(Error::Corrupted(msg))
 }
 
+#[inline]
 pub(crate) fn read_varint_at(bytes: &[u8], pos: &mut usize, msg: &'static str) -> Result<u64> {
-    if *pos >= bytes.len() {
+    let mut idx = *pos;
+    if idx >= bytes.len() {
         return Err(Error::Corrupted(msg));
     }
 
-    let first = bytes[*pos];
-    *pos += 1;
+    // SAFETY: we just checked idx < bytes.len()
+    let first = unsafe { *bytes.get_unchecked(idx) };
+    idx += 1;
     if first & 0x80 == 0 {
+        *pos = idx;
         return Ok(u64::from(first));
     }
 
     let mut result = u64::from(first & 0x7F);
     for _ in 0..7 {
-        if *pos >= bytes.len() {
+        if idx >= bytes.len() {
             return Err(Error::Corrupted(msg));
         }
-        let byte = bytes[*pos];
-        *pos += 1;
+        // SAFETY: we just checked idx < bytes.len()
+        let byte = unsafe { *bytes.get_unchecked(idx) };
+        idx += 1;
         result = (result << 7) | u64::from(byte & 0x7F);
         if byte & 0x80 == 0 {
+            *pos = idx;
             return Ok(result);
         }
     }
 
-    if *pos >= bytes.len() {
+    if idx >= bytes.len() {
         return Err(Error::Corrupted(msg));
     }
-    let byte = bytes[*pos];
-    *pos += 1;
+    // SAFETY: we just checked idx < bytes.len()
+    let byte = unsafe { *bytes.get_unchecked(idx) };
+    idx += 1;
+    *pos = idx;
     Ok((result << 8) | u64::from(byte))
 }
 
+#[inline(always)]
 unsafe fn read_varint_unchecked_at(bytes: &[u8], pos: &mut usize) -> u64 {
     let mut idx = *pos;
     // SAFETY: caller guarantees enough bytes for full varint.
