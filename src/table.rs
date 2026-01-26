@@ -1512,10 +1512,12 @@ fn decode_record_project_into_overflow(
     out: &mut Vec<ValueSlot>,
     bytes: &mut Vec<u8>,
     serials: &mut Vec<u64>,
+    offsets: &mut Vec<u32>,
 ) -> Result<usize> {
     out.clear();
     bytes.clear();
     serials.clear();
+    offsets.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
     let header_len = serial_cursor.read_varint("record header truncated")? as usize;
@@ -1524,12 +1526,15 @@ fn decode_record_project_into_overflow(
         return Err(Error::Corrupted("invalid record header length"));
     }
 
+    let mut value_pos = header_len;
     while serial_cursor.position() < header_len {
         let serial = serial_cursor.read_varint("record header truncated")?;
         if serial_cursor.position() > header_len {
             return Err(Error::Corrupted("record header truncated"));
         }
         push_checked(serials, serial, "serials")?;
+        push_checked(offsets, value_pos as u32, "offsets")?;
+        value_pos += serial_type_len_fast(serial);
     }
 
     let mut value_cursor = OverflowCursor::new(payload, header_len)?;
@@ -1562,13 +1567,14 @@ pub(crate) fn decode_record_project_into(
     out: &mut Vec<ValueSlot>,
     bytes: &mut Vec<u8>,
     serials: &mut Vec<u64>,
+    offsets: &mut Vec<u32>,
 ) -> Result<usize> {
     match payload {
         PayloadRef::Inline(payload_bytes) => {
-            decode_record_project_into_bytes(payload_bytes, needed_cols, out, serials)
+            decode_record_project_into_bytes(payload_bytes, needed_cols, out, serials, offsets)
         }
         PayloadRef::Overflow(payload) => {
-            decode_record_project_into_overflow(&payload, needed_cols, out, bytes, serials)
+            decode_record_project_into_overflow(&payload, needed_cols, out, bytes, serials, offsets)
         }
     }
 }
@@ -1579,14 +1585,15 @@ pub(crate) fn decode_record_project_into_mapped(
     out: &mut Vec<ValueSlot>,
     bytes: &mut Vec<u8>,
     serials: &mut Vec<u64>,
+    offsets: &mut Vec<u32>,
 ) -> Result<usize> {
     match payload {
         PayloadRef::Inline(bytes) => {
             decode_record_project_into_bytes_mapped(bytes, needed_map, out)
         }
-        PayloadRef::Overflow(payload) => {
-            decode_record_project_into_overflow_mapped(&payload, needed_map, out, bytes, serials)
-        }
+        PayloadRef::Overflow(payload) => decode_record_project_into_overflow_mapped(
+            &payload, needed_map, out, bytes, serials, offsets,
+        ),
     }
 }
 
@@ -1652,9 +1659,11 @@ fn decode_record_project_into_bytes(
     needed_cols: Option<&[u16]>,
     out: &mut Vec<ValueSlot>,
     serials: &mut Vec<u64>,
+    offsets: &mut Vec<u32>,
 ) -> Result<usize> {
     out.clear();
     serials.clear();
+    offsets.clear();
 
     let mut header_pos = 0usize;
     let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
@@ -1674,9 +1683,17 @@ fn decode_record_project_into_bytes(
         // PROJECTION PATH: SQLite optimization - parse header only up to max needed
         // column
         let max_needed_col = needed_cols.iter().map(|&c| c as usize).max().unwrap_or(0);
+        let needed_cap = max_needed_col.saturating_add(1);
+        if serials.capacity() < needed_cap {
+            serials.reserve(needed_cap - serials.capacity());
+        }
+        if offsets.capacity() < needed_cap {
+            offsets.reserve(needed_cap - offsets.capacity());
+        }
 
         // Phase 1: Parse serial types lazily (only up to max_needed_col + 1)
         let mut serial_pos = 0usize;
+        let mut value_pos = header_len;
         while serial_pos < serial_bytes.len() && serials.len() <= max_needed_col {
             let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
             let serial = if b < 0x80 {
@@ -1686,6 +1703,8 @@ fn decode_record_project_into_bytes(
                 read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
             };
             serials.push(serial);
+            offsets.push(value_pos as u32);
+            value_pos += serial_type_len_fast(serial);
         }
 
         // Count remaining columns without storing (needed for column_count validation)
@@ -1723,43 +1742,22 @@ fn decode_record_project_into_bytes(
                 // Fast path for single column projection
                 let col_idx = needed_cols[0] as usize;
                 if col_idx < column_count {
-                    let mut value_pos = header_len;
-                    for i in 0..col_idx {
-                        value_pos += serial_type_len_fast(unsafe { *serials.get_unchecked(i) });
-                    }
                     let serial = unsafe { *serials.get_unchecked(col_idx) };
-                    let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
+                    let mut decode_pos = unsafe { *offsets.get_unchecked(col_idx) } as usize;
+                    let value = decode_value_ref_at(serial, payload, &mut decode_pos)?;
                     out.push(value);
                 }
             }
             _ => {
-                // Multi-column path: precompute all offsets once (SQLite aOffset[] style)
-                // This converts O(k*n) to O(n) where k = avg distance between columns
-                let mut value_pos = header_len;
-
-                // For sorted needed_cols, compute offsets progressively
+                // Multi-column path: use cached offsets (SQLite aOffset[] style)
                 // needed_cols is already sorted by build_plan
-                let mut serial_idx = 0usize;
                 for &col in needed_cols {
                     let col_idx = col as usize;
                     if col_idx >= column_count {
                         continue;
                     }
-
-                    // Advance to col_idx
-                    while serial_idx < col_idx {
-                        value_pos +=
-                            serial_type_len_fast(unsafe { *serials.get_unchecked(serial_idx) });
-                        serial_idx += 1;
-                    }
-
                     let serial = unsafe { *serials.get_unchecked(col_idx) };
-                    let pos = value_pos;
-                    // Advance past this column for next iteration
-                    value_pos += serial_type_len_fast(serial);
-                    serial_idx = col_idx + 1;
-
-                    let mut decode_pos = pos;
+                    let mut decode_pos = unsafe { *offsets.get_unchecked(col_idx) } as usize;
                     let value = decode_value_ref_at(serial, payload, &mut decode_pos)?;
                     out.push(value);
                 }
@@ -1894,11 +1892,13 @@ fn decode_record_project_into_overflow_mapped(
     out: &mut Vec<ValueSlot>,
     bytes: &mut Vec<u8>,
     serials: &mut Vec<u64>,
+    offsets: &mut Vec<u32>,
 ) -> Result<usize> {
     out.clear();
     out.resize(needed_map.len(), ValueSlot::Null);
     bytes.clear();
     serials.clear();
+    offsets.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
     let header_len = serial_cursor.read_varint("record header truncated")? as usize;
@@ -1907,12 +1907,15 @@ fn decode_record_project_into_overflow_mapped(
         return Err(Error::Corrupted("invalid record header length"));
     }
 
+    let mut value_pos = header_len;
     while serial_cursor.position() < header_len {
         let serial = serial_cursor.read_varint("record header truncated")?;
         if serial_cursor.position() > header_len {
             return Err(Error::Corrupted("record header truncated"));
         }
         push_checked(serials, serial, "serials")?;
+        push_checked(offsets, value_pos as u32, "offsets")?;
+        value_pos += serial_type_len_fast(serial);
     }
 
     let mut value_cursor = OverflowCursor::new(payload, header_len)?;

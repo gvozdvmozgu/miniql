@@ -409,12 +409,14 @@ impl<'db> Join<'db> {
             let mut right_values = Vec::new();
             let mut right_bytes = Vec::new();
             let mut right_serials = Vec::new();
+            let mut right_offsets = Vec::new();
             Some(resolve_right_null_len(
                 &mut right_scan,
                 &right_meta,
                 &mut right_values,
                 &mut right_bytes,
                 &mut right_serials,
+                &mut right_offsets,
             )?)
         } else {
             None
@@ -496,6 +498,7 @@ impl<'db> PreparedJoin<'db> {
             right_values,
             right_bytes,
             right_serials,
+            right_offsets,
             index_scratch,
             hash_state,
             right_nulls,
@@ -516,6 +519,7 @@ impl<'db> PreparedJoin<'db> {
                     right_values,
                     right_bytes,
                     right_serials,
+                    right_offsets,
                     index_scratch,
                     right_nulls,
                     right_null_len,
@@ -534,6 +538,7 @@ impl<'db> PreparedJoin<'db> {
                 right_values,
                 right_bytes,
                 right_serials,
+                right_offsets,
                 index_scratch,
                 right_nulls,
                 right_null_len,
@@ -550,6 +555,7 @@ impl<'db> PreparedJoin<'db> {
                 right_values,
                 right_bytes,
                 right_serials,
+                right_offsets,
                 hash_state,
                 right_nulls,
                 right_null_len,
@@ -575,6 +581,7 @@ impl<'db> PreparedJoin<'db> {
                 right_values,
                 right_bytes,
                 right_serials,
+                right_offsets,
                 right_nulls,
                 right_null_len,
                 cb,
@@ -659,6 +666,7 @@ pub struct JoinScratch {
     right_values: Vec<ValueSlot>,
     right_bytes: Vec<u8>,
     right_serials: Vec<u64>,
+    right_offsets: Vec<u32>,
     index: IndexScratch,
     hash: HashState,
     right_nulls: Vec<ValueSlot>,
@@ -670,6 +678,7 @@ type JoinScratchParts<'a> = (
     &'a mut Vec<ValueSlot>,
     &'a mut Vec<u8>,
     &'a mut Vec<u64>,
+    &'a mut Vec<u32>,
     &'a mut IndexScratch,
     &'a mut HashState,
     &'a mut Vec<ValueSlot>,
@@ -684,6 +693,7 @@ impl JoinScratch {
             right_values: Vec::new(),
             right_bytes: Vec::new(),
             right_serials: Vec::new(),
+            right_offsets: Vec::new(),
             index: IndexScratch::new(),
             hash: HashState::new(),
             right_nulls: Vec::new(),
@@ -698,6 +708,7 @@ impl JoinScratch {
             right_values: Vec::with_capacity(right_values),
             right_bytes: Vec::with_capacity(overflow),
             right_serials: Vec::with_capacity(right_values),
+            right_offsets: Vec::with_capacity(right_values),
             index: IndexScratch::with_capacity(right_values, overflow),
             hash: HashState::with_capacity(right_values, overflow),
             right_nulls: Vec::with_capacity(right_values),
@@ -711,6 +722,7 @@ impl JoinScratch {
             &mut self.right_values,
             &mut self.right_bytes,
             &mut self.right_serials,
+            &mut self.right_offsets,
             &mut self.index,
             &mut self.hash,
             &mut self.right_nulls,
@@ -1001,6 +1013,7 @@ fn index_nested_loop<F>(
     right_values: &mut Vec<ValueSlot>,
     right_bytes: &mut Vec<u8>,
     right_serials: &mut Vec<u64>,
+    right_offsets: &mut Vec<u32>,
     index_scratch: &mut IndexScratch,
     right_nulls: &mut Vec<ValueSlot>,
     right_null_len: Option<usize>,
@@ -1043,6 +1056,7 @@ where
                         right_values,
                         right_bytes,
                         right_serials,
+                        right_offsets,
                         true,
                     )? {
                         let right_out = right_meta.output_row(right_row.values_raw());
@@ -1067,6 +1081,7 @@ where
                         right_values,
                         right_bytes,
                         right_serials,
+                        right_offsets,
                     )?
                 {
                     let right_out = right_meta.output_row(right_row.values_raw());
@@ -1109,6 +1124,7 @@ fn index_merge_join<F>(
     right_values: &mut Vec<ValueSlot>,
     right_bytes: &mut Vec<u8>,
     right_serials: &mut Vec<u64>,
+    right_offsets: &mut Vec<u32>,
     index_scratch: &mut IndexScratch,
     right_nulls: &mut Vec<ValueSlot>,
     right_null_len: Option<usize>,
@@ -1152,6 +1168,7 @@ where
                         right_values,
                         right_bytes,
                         right_serials,
+                        right_offsets,
                         true,
                     )? {
                         let right_out = right_meta.output_row(right_row.values_raw());
@@ -1176,6 +1193,7 @@ where
                         right_values,
                         right_bytes,
                         right_serials,
+                        right_offsets,
                     )?
                 {
                     let right_out = right_meta.output_row(right_row.values_raw());
@@ -1219,6 +1237,7 @@ fn rowid_nested_loop<F>(
     right_values: &mut Vec<ValueSlot>,
     right_bytes: &mut Vec<u8>,
     right_serials: &mut Vec<u64>,
+    right_offsets: &mut Vec<u32>,
     right_nulls: &mut Vec<ValueSlot>,
     right_null_len: Option<usize>,
     cb: &mut F,
@@ -1239,8 +1258,13 @@ where
             return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
         };
         if let Some(cell) = table::lookup_rowid_cell(pager, right_root, target_rowid)?
-            && let Some(right_row) =
-                right_scan.eval_payload(cell.payload(), right_values, right_bytes, right_serials)?
+            && let Some(right_row) = right_scan.eval_payload(
+                cell.payload(),
+                right_values,
+                right_bytes,
+                right_serials,
+                right_offsets,
+            )?
         {
             let right_out = right_meta.output_row(right_row.values_raw());
             cb(JoinedRow {
@@ -1422,6 +1446,7 @@ fn hash_join<F>(
     right_values: &mut Vec<ValueSlot>,
     right_bytes: &mut Vec<u8>,
     right_serials: &mut Vec<u64>,
+    right_offsets: &mut Vec<u32>,
     hash_state: &mut HashState,
     right_nulls: &mut Vec<ValueSlot>,
     right_null_len: Option<usize>,
@@ -1440,7 +1465,6 @@ where
     let pager = right_scan.pager();
     let right_root = right_scan.root();
     let (values, bytes, serials, offsets, stack) = right_scratch.split_mut();
-    let _ = offsets; // Reserved for future offset caching
     let mut seen = 0usize;
     let limit = right_scan.limit();
     let has_filters = right_scan.has_filters();
@@ -1472,8 +1496,8 @@ where
             }
         } else {
             // Slow path: decode full row for filter evaluation
-            let Some(row) =
-                right_scan.eval_payload_with_filters(payload, values, bytes, serials, true)?
+            let Some(row) = right_scan
+                .eval_payload_with_filters(payload, values, bytes, serials, offsets, true)?
             else {
                 return Ok(None::<()>);
             };
@@ -1567,6 +1591,7 @@ where
                             right_values,
                             right_bytes,
                             right_serials,
+                            right_offsets,
                             false,
                         )? {
                             let right_out = right_meta.output_row(right_row.values_raw());
@@ -1598,6 +1623,7 @@ where
                             right_values,
                             right_bytes,
                             right_serials,
+                            right_offsets,
                             false,
                         )? {
                             let right_out = right_meta.output_row(right_row.values_raw());
@@ -2125,6 +2151,7 @@ fn resolve_right_null_len(
     right_values: &mut Vec<ValueSlot>,
     right_bytes: &mut Vec<u8>,
     right_serials: &mut Vec<u64>,
+    right_offsets: &mut Vec<u32>,
 ) -> Result<usize> {
     if let Some(map) = right_meta.output_map.as_ref() {
         return Ok(map.len());
@@ -2147,6 +2174,7 @@ fn resolve_right_null_len(
                 right_values,
                 right_bytes,
                 right_serials,
+                right_offsets,
             )?;
             Ok(Some(count))
         })?;

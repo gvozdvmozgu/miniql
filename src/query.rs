@@ -609,8 +609,9 @@ impl<'db> PreparedScan<'db> {
         values: &'row mut Vec<ValueSlot>,
         bytes: &'row mut Vec<u8>,
         serials: &'row mut Vec<u64>,
+        offsets: &'row mut Vec<u32>,
     ) -> table::Result<Option<Row<'row>>> {
-        self.eval_payload_with_filters(payload, values, bytes, serials, true)
+        self.eval_payload_with_filters(payload, values, bytes, serials, offsets, true)
     }
 
     pub(crate) fn eval_payload_with_filters<'row>(
@@ -619,11 +620,18 @@ impl<'db> PreparedScan<'db> {
         values: &'row mut Vec<ValueSlot>,
         bytes: &'row mut Vec<u8>,
         serials: &'row mut Vec<u64>,
+        offsets: &'row mut Vec<u32>,
         apply_filters: bool,
     ) -> table::Result<Option<Row<'row>>> {
         let needed_cols = self.needed_cols.as_deref();
-        let count =
-            table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
+        let count = table::decode_record_project_into(
+            payload,
+            needed_cols,
+            values,
+            bytes,
+            serials,
+            offsets,
+        )?;
 
         if let Some(expected) = self.column_count_hint.get().copied() {
             if expected != count {
@@ -660,6 +668,7 @@ impl<'db> PreparedScan<'db> {
         Ok(Some(row))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn eval_index_payload_with_map<'row>(
         &'row mut self,
         payload: table::PayloadRef<'row>,
@@ -667,6 +676,7 @@ impl<'db> PreparedScan<'db> {
         values: &'row mut Vec<ValueSlot>,
         bytes: &'row mut Vec<u8>,
         serials: &'row mut Vec<u64>,
+        offsets: &'row mut Vec<u32>,
         apply_filters: bool,
     ) -> table::Result<Option<Row<'row>>> {
         let Some(needed_cols) = self.needed_cols.as_deref() else {
@@ -678,8 +688,9 @@ impl<'db> PreparedScan<'db> {
             ));
         }
 
-        let _count =
-            table::decode_record_project_into_mapped(payload, needed_map, values, bytes, serials)?;
+        let _count = table::decode_record_project_into_mapped(
+            payload, needed_map, values, bytes, serials, offsets,
+        )?;
 
         let values = values.as_slice();
         let scratch_bytes = bytes.as_slice();
@@ -809,7 +820,7 @@ impl<'db> PreparedScan<'db> {
     {
         let pager = self.pager;
         let root = self.root;
-        let (values, bytes, serials, _, btree_stack) = scratch.split_mut();
+        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
 
         table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
             let rowid = cell.rowid();
@@ -817,8 +828,14 @@ impl<'db> PreparedScan<'db> {
 
             // Decode columns needed for filter
             let needed_cols = self.needed_cols.as_deref();
-            let count =
-                table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
+            let count = table::decode_record_project_into(
+                payload,
+                needed_cols,
+                values,
+                bytes,
+                serials,
+                offsets,
+            )?;
 
             // Validate column count once
             if let Some(expected) = self.column_count_hint.get().copied() {
@@ -870,7 +887,7 @@ impl<'db> PreparedScan<'db> {
     {
         let pager = self.pager;
         let root = self.root;
-        let (values, bytes, serials, _, btree_stack) = scratch.split_mut();
+        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
         let mut seen = 0usize;
 
         table::scan_table_cells_with_scratch_and_stack_until(pager, root, btree_stack, |cell| {
@@ -879,8 +896,14 @@ impl<'db> PreparedScan<'db> {
 
             // Decode columns needed for filter
             let needed_cols = self.needed_cols.as_deref();
-            let count =
-                table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
+            let count = table::decode_record_project_into(
+                payload,
+                needed_cols,
+                values,
+                bytes,
+                serials,
+                offsets,
+            )?;
 
             // Validate column count once
             if let Some(expected) = self.column_count_hint.get().copied() {
@@ -938,7 +961,7 @@ impl<'db> PreparedScan<'db> {
         let pager = self.pager;
         let root = self.root;
 
-        let (values, bytes, serials, _, btree_stack) = scratch.split_mut();
+        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
         let key_arena = Bump::new();
         let mut seq = 0u64;
         let mut entries = Vec::with_capacity(256);
@@ -955,8 +978,14 @@ impl<'db> PreparedScan<'db> {
 
             // Decode columns needed for filter and ORDER BY
             let needed_cols = self.needed_cols.as_deref();
-            let count =
-                table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
+            let count = table::decode_record_project_into(
+                payload,
+                needed_cols,
+                values,
+                bytes,
+                serials,
+                offsets,
+            )?;
 
             // Validate column count once
             if let Some(expected) = self.column_count_hint.get().copied() {
@@ -1029,7 +1058,7 @@ impl<'db> PreparedScan<'db> {
         let pager = self.pager;
         let root = self.root;
 
-        let (values, bytes, serials, _, btree_stack) = scratch.split_mut();
+        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
         let key_arena = Bump::new();
         let mut seq = 0u64;
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
@@ -1046,8 +1075,14 @@ impl<'db> PreparedScan<'db> {
 
             // Decode columns needed for filter and ORDER BY
             let needed_cols = self.needed_cols.as_deref();
-            let count =
-                table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
+            let count = table::decode_record_project_into(
+                payload,
+                needed_cols,
+                values,
+                bytes,
+                serials,
+                offsets,
+            )?;
 
             // Validate column count once
             if let Some(expected) = self.column_count_hint.get().copied() {
@@ -1138,7 +1173,7 @@ impl<'db> PreparedScan<'db> {
         let root = self.root;
         let limit = self.limit;
 
-        let (values, bytes, serials, _, btree_stack) = scratch.split_mut();
+        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
 
         match limit {
             Some(limit) => {
@@ -1150,7 +1185,7 @@ impl<'db> PreparedScan<'db> {
                     |cell| {
                         let rowid = cell.rowid();
                         let Some(row) =
-                            self.eval_payload(cell.payload(), values, bytes, serials)?
+                            self.eval_payload(cell.payload(), values, bytes, serials, offsets)?
                         else {
                             return Ok(None);
                         };
@@ -1166,7 +1201,8 @@ impl<'db> PreparedScan<'db> {
             None => {
                 table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
                     let rowid = cell.rowid();
-                    let Some(row) = self.eval_payload(cell.payload(), values, bytes, serials)?
+                    let Some(row) =
+                        self.eval_payload(cell.payload(), values, bytes, serials, offsets)?
                     else {
                         return Ok(());
                     };
@@ -1756,12 +1792,14 @@ mod tests {
         let mut decoded = Vec::with_capacity(needed.len());
         let mut bytes = Vec::new();
         let mut serials = Vec::with_capacity(needed.len());
+        let mut offsets = Vec::with_capacity(needed.len());
         let _ = table::decode_record_project_into(
             table::PayloadRef::Inline(&payload),
             Some(&needed),
             &mut decoded,
             &mut bytes,
             &mut serials,
+            &mut offsets,
         )
         .expect("decode");
         assert_eq!(decoded.len(), 2);
