@@ -2033,20 +2033,31 @@ pub(crate) fn read_varint_at(bytes: &[u8], pos: &mut usize, msg: &'static str) -
         return Err(Error::Corrupted(msg));
     }
 
+    // Unrolled for common cases (1-2 byte varints are most common)
     // SAFETY: we just checked idx < bytes.len()
-    let first = unsafe { *bytes.get_unchecked(idx) };
+    let b0 = unsafe { *bytes.get_unchecked(idx) };
     idx += 1;
-    if first & 0x80 == 0 {
+    if b0 < 0x80 {
         *pos = idx;
-        return Ok(u64::from(first));
+        return Ok(u64::from(b0));
     }
 
-    let mut result = u64::from(first & 0x7F);
-    for _ in 0..7 {
+    if idx >= bytes.len() {
+        return Err(Error::Corrupted(msg));
+    }
+    let b1 = unsafe { *bytes.get_unchecked(idx) };
+    idx += 1;
+    if b1 < 0x80 {
+        *pos = idx;
+        return Ok((u64::from(b0 & 0x7F) << 7) | u64::from(b1));
+    }
+
+    // Rare case: 3+ byte varint - fall back to loop
+    let mut result = (u64::from(b0 & 0x7F) << 7) | u64::from(b1 & 0x7F);
+    for _ in 0..6 {
         if idx >= bytes.len() {
             return Err(Error::Corrupted(msg));
         }
-        // SAFETY: we just checked idx < bytes.len()
         let byte = unsafe { *bytes.get_unchecked(idx) };
         idx += 1;
         result = (result << 7) | u64::from(byte & 0x7F);
@@ -2059,7 +2070,6 @@ pub(crate) fn read_varint_at(bytes: &[u8], pos: &mut usize, msg: &'static str) -
     if idx >= bytes.len() {
         return Err(Error::Corrupted(msg));
     }
-    // SAFETY: we just checked idx < bytes.len()
     let byte = unsafe { *bytes.get_unchecked(idx) };
     idx += 1;
     *pos = idx;
@@ -2070,15 +2080,25 @@ pub(crate) fn read_varint_at(bytes: &[u8], pos: &mut usize, msg: &'static str) -
 unsafe fn read_varint_unchecked_at(bytes: &[u8], pos: &mut usize) -> u64 {
     let mut idx = *pos;
     // SAFETY: caller guarantees enough bytes for full varint.
-    let first = unsafe { *bytes.get_unchecked(idx) };
+
+    // Unrolled for common cases (1-2 byte varints are most common)
+    let b0 = unsafe { *bytes.get_unchecked(idx) };
     idx += 1;
-    if first & 0x80 == 0 {
+    if b0 < 0x80 {
         *pos = idx;
-        return u64::from(first);
+        return u64::from(b0);
     }
 
-    let mut result = u64::from(first & 0x7F);
-    for _ in 0..7 {
+    let b1 = unsafe { *bytes.get_unchecked(idx) };
+    idx += 1;
+    if b1 < 0x80 {
+        *pos = idx;
+        return (u64::from(b0 & 0x7F) << 7) | u64::from(b1);
+    }
+
+    // Rare case: 3+ byte varint - fall back to loop
+    let mut result = (u64::from(b0 & 0x7F) << 7) | u64::from(b1 & 0x7F);
+    for _ in 0..6 {
         let byte = unsafe { *bytes.get_unchecked(idx) };
         idx += 1;
         result = (result << 7) | u64::from(byte & 0x7F);
