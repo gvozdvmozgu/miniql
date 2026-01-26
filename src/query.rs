@@ -1209,9 +1209,11 @@ fn compile_expr(expr: &Expr, needed_cols: Option<&[u16]>) -> table::Result<Compi
             (Expr::Col(c), Expr::Lit(lit)) => {
                 Ok(CompiledExpr::CmpColLit { idx: col_to_idx(*c)?, op, lit: lit.clone() })
             }
-            (Expr::Lit(lit), Expr::Col(c)) => {
-                Ok(CompiledExpr::CmpColLit { idx: col_to_idx(*c)?, op: swap_cmp(op), lit: lit.clone() })
-            }
+            (Expr::Lit(lit), Expr::Col(c)) => Ok(CompiledExpr::CmpColLit {
+                idx: col_to_idx(*c)?,
+                op: swap_cmp(op),
+                lit: lit.clone(),
+            }),
             _ => Ok(make_fallback(
                 Box::new(compile_expr(lhs, needed_cols)?),
                 Box::new(compile_expr(rhs, needed_cols)?),
