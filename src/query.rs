@@ -379,6 +379,8 @@ pub struct PreparedScan<'db> {
     root: PageId,
     needed_cols: Option<Box<[u16]>>,
     proj_map: Option<Box<[usize]>>,
+    /// Maps ORDER BY column position -> values array index (None = decode all)
+    order_val_map: Option<Box<[usize]>>,
     referenced_cols: Box<[u16]>,
     compiled_expr: Option<CompiledExpr>,
     filter_fn: Option<FilterFn<'db>>,
@@ -534,7 +536,7 @@ impl<'db> Scan<'db> {
             return Err(err);
         }
 
-        let Plan { needed_cols, proj_map, referenced_cols } = plan;
+        let Plan { needed_cols, proj_map, order_val_map, referenced_cols } = plan;
         let column_count_hint = OnceCell::new();
         if let Some(count) = col_count_hint {
             let _ = column_count_hint.set(count);
@@ -545,6 +547,7 @@ impl<'db> Scan<'db> {
             root,
             needed_cols: needed_cols.map(|cols| cols.into_boxed_slice()),
             proj_map: proj_map.map(|cols| cols.into_boxed_slice()),
+            order_val_map: order_val_map.map(|cols| cols.into_boxed_slice()),
             referenced_cols: referenced_cols.into_boxed_slice(),
             compiled_expr,
             filter_fn,
@@ -794,12 +797,17 @@ impl<'db> PreparedScan<'db> {
 
         let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
         let _ = offsets; // Reserved for future offset caching
-        let mut order_bytes = Vec::with_capacity(64);
         let key_arena = Bump::new();
         let mut seq = 0u64;
 
         let mut entries = Vec::with_capacity(256);
         let apply_filters = self.compiled_expr.is_some() || self.filter_fn.is_some();
+
+        // Copy order_val_map into SmallVec to avoid borrowing self in closure
+        // This avoids re-reading overflow pages for large blobs
+        let order_val_map: SmallVec<[usize; 4]> =
+            self.order_val_map.as_deref().map(|m| m.iter().copied().collect()).unwrap_or_default();
+        let has_order_map = self.order_val_map.is_some();
 
         if apply_filters {
             table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
@@ -812,13 +820,10 @@ impl<'db> PreparedScan<'db> {
                 };
 
                 let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
-                for order in order_by {
-                    let Some(value) =
-                        table::decode_record_column(payload, order.col, &mut order_bytes)?
-                    else {
-                        return Err(table::Error::Corrupted("ORDER BY column missing"));
-                    };
-                    let value = stabilize_sort_key_value(value, order_bytes.as_slice(), &key_arena);
+                for (i, order) in order_by.iter().enumerate() {
+                    let val_idx = if has_order_map { order_val_map[i] } else { order.col as usize };
+                    let slot = values.get(val_idx).copied().unwrap_or(ValueSlot::Null);
+                    let value = stabilize_sort_key_value(slot, bytes.as_slice(), &key_arena);
                     keys.push(SortKey { value, dir: order.dir });
                 }
 
@@ -834,14 +839,15 @@ impl<'db> PreparedScan<'db> {
                 let cell_offset = cell.cell_offset();
                 let payload = cell.payload();
 
+                // Decode needed columns (including ORDER BY) to values buffer
+                let needed_cols = self.needed_cols.as_deref();
+                table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
+
                 let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
-                for order in order_by {
-                    let Some(value) =
-                        table::decode_record_column(payload, order.col, &mut order_bytes)?
-                    else {
-                        return Err(table::Error::Corrupted("ORDER BY column missing"));
-                    };
-                    let value = stabilize_sort_key_value(value, order_bytes.as_slice(), &key_arena);
+                for (i, order) in order_by.iter().enumerate() {
+                    let val_idx = if has_order_map { order_val_map[i] } else { order.col as usize };
+                    let slot = values.get(val_idx).copied().unwrap_or(ValueSlot::Null);
+                    let value = stabilize_sort_key_value(slot, bytes.as_slice(), &key_arena);
                     keys.push(SortKey { value, dir: order.dir });
                 }
 
@@ -882,12 +888,16 @@ impl<'db> PreparedScan<'db> {
 
         let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
         let _ = offsets; // Reserved for future offset caching
-        let mut order_bytes = Vec::with_capacity(64);
         let key_arena = Bump::new();
         let mut seq = 0u64;
 
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
         let apply_filters = self.compiled_expr.is_some() || self.filter_fn.is_some();
+
+        // Copy order_val_map into SmallVec to avoid borrowing self in closure
+        let order_val_map: SmallVec<[usize; 4]> =
+            self.order_val_map.as_deref().map(|m| m.iter().copied().collect()).unwrap_or_default();
+        let has_order_map = self.order_val_map.is_some();
 
         if apply_filters {
             table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
@@ -900,13 +910,10 @@ impl<'db> PreparedScan<'db> {
                 };
 
                 let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
-                for order in order_by {
-                    let Some(value) =
-                        table::decode_record_column(payload, order.col, &mut order_bytes)?
-                    else {
-                        return Err(table::Error::Corrupted("ORDER BY column missing"));
-                    };
-                    let value = stabilize_sort_key_value(value, order_bytes.as_slice(), &key_arena);
+                for (i, order) in order_by.iter().enumerate() {
+                    let val_idx = if has_order_map { order_val_map[i] } else { order.col as usize };
+                    let slot = values.get(val_idx).copied().unwrap_or(ValueSlot::Null);
+                    let value = stabilize_sort_key_value(slot, bytes.as_slice(), &key_arena);
                     keys.push(SortKey { value, dir: order.dir });
                 }
 
@@ -931,14 +938,15 @@ impl<'db> PreparedScan<'db> {
                 let cell_offset = cell.cell_offset();
                 let payload = cell.payload();
 
+                // Decode needed columns (including ORDER BY) to values buffer
+                let needed_cols = self.needed_cols.as_deref();
+                table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
+
                 let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
-                for order in order_by {
-                    let Some(value) =
-                        table::decode_record_column(payload, order.col, &mut order_bytes)?
-                    else {
-                        return Err(table::Error::Corrupted("ORDER BY column missing"));
-                    };
-                    let value = stabilize_sort_key_value(value, order_bytes.as_slice(), &key_arena);
+                for (i, order) in order_by.iter().enumerate() {
+                    let val_idx = if has_order_map { order_val_map[i] } else { order.col as usize };
+                    let slot = values.get(val_idx).copied().unwrap_or(ValueSlot::Null);
+                    let value = stabilize_sort_key_value(slot, bytes.as_slice(), &key_arena);
                     keys.push(SortKey { value, dir: order.dir });
                 }
 
@@ -1101,6 +1109,7 @@ fn cmp_f64_total(left: f64, right: f64) -> Ordering {
 struct Plan {
     needed_cols: Option<Vec<u16>>,
     proj_map: Option<Vec<usize>>,
+    order_val_map: Option<Vec<usize>>,
     referenced_cols: Vec<u16>,
 }
 
@@ -1127,10 +1136,15 @@ fn build_plan(
     let needed_cols = if decode_all {
         None
     } else {
-        let mut needed = Vec::with_capacity(pred_cols.len() + proj_len);
+        let mut needed = Vec::with_capacity(pred_cols.len() + proj_len + order_len);
         needed.extend_from_slice(pred_cols);
         if let Some(proj) = projection {
             needed.extend(proj.iter().copied());
+        }
+        // Include ORDER BY columns so they're decoded together (avoids
+        // re-reading overflow pages for large blobs)
+        if let Some(order_by) = order_by {
+            needed.extend(order_by.iter().map(|order| order.col));
         }
         needed.sort_unstable();
         needed.dedup();
@@ -1151,7 +1165,23 @@ fn build_plan(
         }
     });
 
-    Plan { needed_cols, proj_map, referenced_cols }
+    // Build ORDER BY column → values index mapping (avoids re-reading overflow)
+    let order_val_map = order_by.map(|order_by| {
+        if let Some(needed) = needed_cols.as_ref() {
+            order_by
+                .iter()
+                .map(|order| {
+                    needed
+                        .binary_search(&order.col)
+                        .unwrap_or_else(|_| panic!("missing ORDER BY column in needed set"))
+                })
+                .collect()
+        } else {
+            order_by.iter().map(|order| order.col as usize).collect()
+        }
+    });
+
+    Plan { needed_cols, proj_map, order_val_map, referenced_cols }
 }
 
 fn compile_expr(expr: &Expr, needed_cols: Option<&[u16]>) -> table::Result<CompiledExpr> {
