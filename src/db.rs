@@ -7,6 +7,7 @@ use crate::pager::{PageId, Pager};
 use crate::query::{Scan, ScanScratch};
 use crate::schema::parse_table_schema;
 use crate::table;
+use crate::table::ValueRef;
 
 /// Read-only handle to a SQLite database file.
 pub struct Db {
@@ -27,31 +28,62 @@ struct SchemaCache {
 
 impl SchemaCache {
     fn load(pager: &Pager) -> table::Result<Self> {
-        let rows = table::read_table(pager, PageId::ROOT)?;
         let mut tables = HashMap::new();
+        table::scan_table_cells_with_scratch(pager, PageId::ROOT, |cell| {
+            let payload = cell.payload();
+            let mut handle_row = |row: table::RowView<'_>| -> table::Result<()> {
+                let row_type = match row.get(0)? {
+                    Some(ValueRef::Text(bytes)) => std::str::from_utf8(bytes).ok(),
+                    _ => None,
+                };
+                if row_type.is_none_or(|value| !value.eq_ignore_ascii_case("table")) {
+                    return Ok(());
+                }
+                let name = match row.get(1)? {
+                    Some(ValueRef::Text(bytes)) => match std::str::from_utf8(bytes) {
+                        Ok(value) => value,
+                        Err(_) => return Ok(()),
+                    },
+                    _ => return Ok(()),
+                };
+                let rootpage = match row.get(3)? {
+                    Some(ValueRef::Integer(value)) => value,
+                    _ => return Ok(()),
+                };
+                let Ok(rootpage) = u32::try_from(rootpage) else {
+                    return Ok(());
+                };
+                let Some(root) = PageId::try_new(rootpage) else {
+                    return Ok(());
+                };
+                let sql = match row.get(4)? {
+                    Some(ValueRef::Text(bytes)) => std::str::from_utf8(bytes).ok(),
+                    _ => None,
+                };
+                let column_count = sql.and_then(|sql| {
+                    let schema = parse_table_schema(sql);
+                    if schema.columns.is_empty() { None } else { Some(schema.columns.len()) }
+                });
 
-        for row in rows {
-            if row.values.len() < 5 {
-                continue;
-            }
-            let row_type = row.values[0].as_text();
-            let Some(row_type) = row_type else { continue };
-            if !row_type.eq_ignore_ascii_case("table") {
-                continue;
-            }
-            let Some(name) = row.values[1].as_text() else { continue };
-            let Some(rootpage) = row.values[3].as_integer() else { continue };
-            let Ok(rootpage) = u32::try_from(rootpage) else { continue };
-            let Some(root) = PageId::try_new(rootpage) else { continue };
-            let sql = row.values[4].as_text();
-            let column_count = sql.and_then(|sql| {
-                let schema = parse_table_schema(sql);
-                if schema.columns.is_empty() { None } else { Some(schema.columns.len()) }
-            });
+                let info = TableInfo { name: name.to_owned(), root, column_count };
+                tables.insert(name.to_ascii_lowercase(), info);
+                Ok(())
+            };
 
-            let info = TableInfo { name: name.to_owned(), root, column_count };
-            tables.insert(name.to_ascii_lowercase(), info);
-        }
+            match payload {
+                table::PayloadRef::Inline(bytes) => {
+                    let row = table::RowView::from_inline(bytes)?;
+                    handle_row(row)?;
+                }
+                table::PayloadRef::Overflow(_) => {
+                    let payload_buf = payload.to_vec()?;
+                    let row = table::RowView::from_inline(&payload_buf)?;
+                    handle_row(row)?;
+                }
+            }
+
+            Ok(())
+        })?;
 
         Ok(Self { tables })
     }

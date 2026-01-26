@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use miniql::index::{IndexCursor, IndexScratch};
 use miniql::join::{Join, JoinKey, JoinScratch, JoinStrategy};
 use miniql::pager::Pager;
-use miniql::table::{self, TableRow, ValueRef};
+use miniql::table::{self, ValueRef};
 use miniql::{Db, PageId};
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -19,25 +19,38 @@ fn open_db(name: &str) -> Db {
     Db::open(fixture_path(name)).expect("open fixture database")
 }
 
-fn schema_root(rows: &[TableRow], kind: &str, name: &str) -> Option<u32> {
-    rows.iter().find_map(|row| {
-        if row.values.len() < 4 {
-            return None;
+fn schema_root(pager: &Pager, kind: &str, name: &str) -> Option<u32> {
+    let mut found = None;
+    table::scan_table(pager, PageId::ROOT, |_, row| {
+        let row_type = match row.get(0)? {
+            Some(ValueRef::Text(bytes)) => std::str::from_utf8(bytes).ok(),
+            _ => None,
+        };
+        if row_type != Some(kind) {
+            return Ok(());
         }
-
-        let row_type = row.values[0].as_text()?;
-        let row_name = row.values[1].as_text()?;
-        let rootpage = row.values[3].as_integer()?;
-
-        if row_type == kind && row_name == name { u32::try_from(rootpage).ok() } else { None }
+        let row_name = match row.get(1)? {
+            Some(ValueRef::Text(bytes)) => std::str::from_utf8(bytes).ok(),
+            _ => None,
+        };
+        if row_name != Some(name) {
+            return Ok(());
+        }
+        let rootpage = match row.get(3)? {
+            Some(ValueRef::Integer(value)) => Some(value),
+            _ => None,
+        };
+        found = rootpage.and_then(|value| u32::try_from(value).ok());
+        Ok(())
     })
+    .expect("read sqlite_schema");
+    found
 }
 
 fn join_roots(pager: &Pager) -> (PageId, PageId, PageId) {
-    let rows = table::read_table(pager, PageId::ROOT).expect("read sqlite_schema");
-    let users_root = schema_root(&rows, "table", "users").expect("users table root");
-    let orders_root = schema_root(&rows, "table", "orders").expect("orders table root");
-    let index_root = schema_root(&rows, "index", "orders_user_id_idx").expect("orders index root");
+    let users_root = schema_root(pager, "table", "users").expect("users table root");
+    let orders_root = schema_root(pager, "table", "orders").expect("orders table root");
+    let index_root = schema_root(pager, "index", "orders_user_id_idx").expect("orders index root");
     (PageId::new(users_root), PageId::new(orders_root), PageId::new(index_root))
 }
 
@@ -225,9 +238,8 @@ fn left_join_emits_null_right_rows() {
 fn auto_discovers_unique_autoindex() {
     let pager = open_pager("join_unique.db");
     let db = open_db("join_unique.db");
-    let rows = table::read_table(&pager, PageId::ROOT).expect("read sqlite_schema");
-    let users_root = schema_root(&rows, "table", "users_unique").expect("users_unique root");
-    let orders_root = schema_root(&rows, "table", "orders_unique").expect("orders_unique root");
+    let users_root = schema_root(&pager, "table", "users_unique").expect("users_unique root");
+    let orders_root = schema_root(&pager, "table", "orders_unique").expect("orders_unique root");
 
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();
@@ -266,9 +278,8 @@ fn auto_discovers_unique_autoindex() {
 fn auto_discovers_composite_primary_key_autoindex() {
     let pager = open_pager("join_pk.db");
     let db = open_db("join_pk.db");
-    let rows = table::read_table(&pager, PageId::ROOT).expect("read sqlite_schema");
-    let pk_root = schema_root(&rows, "table", "composite_pk").expect("composite_pk root");
-    let orders_root = schema_root(&rows, "table", "pk_orders").expect("pk_orders root");
+    let pk_root = schema_root(&pager, "table", "composite_pk").expect("composite_pk root");
+    let orders_root = schema_root(&pager, "table", "pk_orders").expect("pk_orders root");
 
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();

@@ -8,7 +8,6 @@ use crate::pager::{PageId, PageRef, Pager};
 pub type Result<T> = std::result::Result<T, Error>;
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const DEFAULT_SPILL_CAPACITY: usize = 8 * 1024;
 
 /// Table decoding and validation errors.
 #[non_exhaustive]
@@ -88,52 +87,12 @@ impl From<JoinError> for Error {
     }
 }
 
-/// Owned value decoded from a row.
-#[derive(Debug, Clone)]
-pub enum Value {
-    Null,
-    Integer(i64),
-    Real(f64),
-    Text(String),
-    Blob(Vec<u8>),
-}
-
-impl Value {
-    /// Return the value as UTF-8 text.
-    pub fn as_text(&self) -> Option<&str> {
-        match self {
-            Self::Text(text) => Some(text.as_str()),
-            _ => None,
-        }
+fn display_blob(bytes: &[u8], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str("x'")?;
+    for byte in bytes {
+        write!(f, "{byte:02x}")?;
     }
-
-    /// Return the value as an integer.
-    pub fn as_integer(&self) -> Option<i64> {
-        match self {
-            Self::Integer(value) => Some(*value),
-            _ => None,
-        }
-    }
-
-    fn display_blob(bytes: &[u8], f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("x'")?;
-        for byte in bytes {
-            write!(f, "{byte:02x}")?;
-        }
-        f.write_str("'")
-    }
-}
-
-impl fmt::Display for Value {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Null => f.write_str("NULL"),
-            Self::Integer(value) => write!(f, "{value}"),
-            Self::Real(value) => write!(f, "{value}"),
-            Self::Text(value) => f.write_str(value),
-            Self::Blob(bytes) => Self::display_blob(bytes, f),
-        }
-    }
+    f.write_str("'")
 }
 
 /// Borrowed value reference into a row payload.
@@ -273,6 +232,12 @@ impl<'row> OverflowPayload<'row> {
     ) -> Self {
         Self { pager, total_len, local, first_overflow }
     }
+
+    /// Returns the local (inline) portion of the overflow payload.
+    #[inline]
+    pub fn local(&self) -> &'row [u8] {
+        self.local
+    }
 }
 
 impl<'row> PayloadRef<'row> {
@@ -340,12 +305,6 @@ impl ValueSlot {
     }
 }
 
-fn slot_to_ref<'row>(value: ValueSlot) -> ValueRef<'row> {
-    // SAFETY: raw values point into the current row payload/overflow buffer and
-    // are only materialized for the duration of the row callback.
-    unsafe { value.as_value_ref() }
-}
-
 impl<'row> ValueRef<'row> {
     /// Return the value as UTF-8 text.
     pub fn as_text(&self) -> Option<&'row str> {
@@ -382,182 +341,331 @@ impl fmt::Display for ValueRef<'_> {
                 Ok(value) => f.write_str(value),
                 Err(_) => f.write_str("<invalid utf8>"),
             },
-            Self::Blob(bytes) => Value::display_blob(bytes, f),
+            Self::Blob(bytes) => display_blob(bytes, f),
         }
     }
 }
 
-/// Borrowed row view used by low-level scans.
-#[derive(Debug, Clone, Copy)]
+/// Row view that decodes values on demand.
+///
+/// This is more efficient than decoding entire rows when you only need to
+/// access a subset of columns or just want to count rows without reading data.
+#[derive(Clone, Copy)]
 pub struct RowView<'row> {
-    values: &'row [ValueSlot],
+    payload: &'row [u8],
+    header_len: usize,
+    serial_bytes: &'row [u8],
 }
 
 impl<'row> RowView<'row> {
+    /// Create a row view from inline payload bytes.
+    #[inline]
+    pub fn from_inline(payload: &'row [u8]) -> Result<Self> {
+        let mut header_pos = 0usize;
+        let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+        let header_len = if first < 0x80 {
+            header_pos = 1;
+            first as usize
+        } else {
+            read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+        };
+        if header_len < header_pos || header_len > payload.len() {
+            return Err(Error::Corrupted("invalid record header length"));
+        }
+
+        let serial_bytes = &payload[header_pos..header_len];
+        Ok(Self { payload, header_len, serial_bytes })
+    }
+
     /// Number of columns in the row.
-    pub fn len(&self) -> usize {
-        self.values.len()
+    #[inline]
+    pub fn column_count(&self) -> usize {
+        // Count varints in serial_bytes
+        let mut count = 0usize;
+        let mut pos = 0usize;
+        while pos < self.serial_bytes.len() {
+            let b = unsafe { *self.serial_bytes.get_unchecked(pos) };
+            if b < 0x80 {
+                pos += 1;
+            } else {
+                // Skip multi-byte varint
+                while pos < self.serial_bytes.len() {
+                    let byte = unsafe { *self.serial_bytes.get_unchecked(pos) };
+                    pos += 1;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+            }
+            count += 1;
+        }
+        count
     }
 
-    /// Returns true when there are no columns.
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+    /// Decode and return a single column value by index.
+    #[inline]
+    pub fn get(&self, col_idx: usize) -> Result<Option<ValueRef<'row>>> {
+        // Parse serial types up to col_idx
+        let mut serial_pos = 0usize;
+        let mut value_pos = self.header_len;
+        let mut current_col = 0usize;
+
+        while serial_pos < self.serial_bytes.len() {
+            let b = unsafe { *self.serial_bytes.get_unchecked(serial_pos) };
+            let serial = if b < 0x80 {
+                serial_pos += 1;
+                b as u64
+            } else {
+                read_varint_at(self.serial_bytes, &mut serial_pos, "record header truncated")?
+            };
+
+            if current_col == col_idx {
+                // Decode this column
+                return Ok(Some(decode_value_ref_inline(serial, self.payload, value_pos)?));
+            }
+
+            // Skip this column's value
+            value_pos += serial_type_len_fast(serial);
+            current_col += 1;
+        }
+
+        Ok(None)
     }
 
-    /// Return a value reference by column index.
-    pub fn get(&self, i: usize) -> Option<ValueRef<'row>> {
-        self.values.get(i).copied().map(slot_to_ref)
+    /// Get an i64 value or return a type mismatch error.
+    #[inline]
+    pub fn get_i64(&self, col_idx: usize) -> Result<i64> {
+        match self.get(col_idx)? {
+            Some(ValueRef::Integer(v)) => Ok(v),
+            Some(other) => Err(Error::TypeMismatch {
+                col: col_idx,
+                expected: "INTEGER",
+                got: value_ref_kind(other),
+            }),
+            None => Err(Error::InvalidColumnIndex {
+                col: col_idx as u16,
+                column_count: self.column_count(),
+            }),
+        }
     }
 
-    /// Iterate over values in the row.
-    pub fn iter(&self) -> impl Iterator<Item = ValueRef<'row>> + '_ {
-        self.values.iter().copied().map(slot_to_ref)
+    /// Get a text value or return a type mismatch error.
+    #[inline]
+    pub fn get_text(&self, col_idx: usize) -> Result<&'row str> {
+        match self.get(col_idx)? {
+            Some(ValueRef::Text(bytes)) => Ok(str::from_utf8(bytes)?),
+            Some(other) => Err(Error::TypeMismatch {
+                col: col_idx,
+                expected: "TEXT",
+                got: value_ref_kind(other),
+            }),
+            None => Err(Error::InvalidColumnIndex {
+                col: col_idx as u16,
+                column_count: self.column_count(),
+            }),
+        }
     }
-}
 
-impl TryFrom<ValueRef<'_>> for Value {
-    type Error = Error;
-
-    fn try_from(value: ValueRef<'_>) -> Result<Self> {
-        match value {
-            ValueRef::Null => Ok(Value::Null),
-            ValueRef::Integer(value) => Ok(Value::Integer(value)),
-            ValueRef::Real(value) => Ok(Value::Real(value)),
-            ValueRef::Text(bytes) => Ok(Value::Text(str::from_utf8(bytes)?.to_owned())),
-            ValueRef::Blob(bytes) => Ok(Value::Blob(bytes.to_owned())),
+    /// Get raw bytes (text or blob) or return a type mismatch error.
+    #[inline]
+    pub fn get_bytes(&self, col_idx: usize) -> Result<&'row [u8]> {
+        match self.get(col_idx)? {
+            Some(ValueRef::Text(bytes)) | Some(ValueRef::Blob(bytes)) => Ok(bytes),
+            Some(other) => Err(Error::TypeMismatch {
+                col: col_idx,
+                expected: "BYTES",
+                got: value_ref_kind(other),
+            }),
+            None => Err(Error::InvalidColumnIndex {
+                col: col_idx as u16,
+                column_count: self.column_count(),
+            }),
         }
     }
 }
 
-/// Owned row produced by `read_table`.
-#[derive(Debug, Clone)]
-pub struct TableRow {
-    pub rowid: i64,
-    pub values: Vec<Value>,
-}
-
-/// Scratch buffers for table scans.
-#[derive(Debug, Default)]
-pub struct RowScratch {
-    values: Vec<ValueSlot>,
-    bytes: Vec<u8>,
-    serials: Vec<u64>,
-    btree_stack: Vec<PageId>,
-}
-
-impl RowScratch {
-    /// Create an empty scratch buffer.
-    pub fn new() -> Self {
-        Self::default()
+#[inline]
+fn value_ref_kind(value: ValueRef<'_>) -> &'static str {
+    match value {
+        ValueRef::Null => "NULL",
+        ValueRef::Integer(_) => "INTEGER",
+        ValueRef::Real(_) => "REAL",
+        ValueRef::Text(_) => "TEXT",
+        ValueRef::Blob(_) => "BLOB",
     }
+}
 
-    /// Create a scratch buffer with capacity hints.
-    pub fn with_capacity(values: usize, overflow: usize) -> Self {
-        Self {
-            values: Vec::with_capacity(values),
-            bytes: Vec::with_capacity(overflow),
-            serials: Vec::with_capacity(values),
-            btree_stack: Vec::with_capacity(64),
+/// Decode a value directly from inline payload (no intermediate ValueSlot).
+#[inline]
+fn decode_value_ref_inline(
+    serial_type: u64,
+    payload: &[u8],
+    mut pos: usize,
+) -> Result<ValueRef<'_>> {
+    Ok(match serial_type {
+        0 => ValueRef::Null,
+        8 => ValueRef::Integer(0),
+        9 => ValueRef::Integer(1),
+        1 => ValueRef::Integer(read_signed_be_at(payload, &mut pos, 1)?),
+        2 => ValueRef::Integer(read_signed_be_at(payload, &mut pos, 2)?),
+        3 => ValueRef::Integer(read_signed_be_at(payload, &mut pos, 3)?),
+        4 => ValueRef::Integer(read_signed_be_at(payload, &mut pos, 4)?),
+        5 => ValueRef::Integer(read_signed_be_at(payload, &mut pos, 6)?),
+        6 => ValueRef::Integer(read_signed_be_at(payload, &mut pos, 8)?),
+        7 => ValueRef::Real(f64::from_bits(read_u64_be_at(payload, &mut pos)?)),
+        10 | 11 => return Err(Error::UnsupportedSerialType(serial_type)),
+        serial => {
+            let len = ((serial - 12) / 2) as usize;
+            let slice = read_exact_bytes_at(payload, &mut pos, len)?;
+            if serial & 1 == 0 { ValueRef::Blob(slice) } else { ValueRef::Text(slice) }
         }
-    }
-
-    fn take_stack(&mut self) -> Vec<PageId> {
-        std::mem::take(&mut self.btree_stack)
-    }
-
-    fn return_stack(&mut self, stack: Vec<PageId>) {
-        self.btree_stack = stack;
-    }
-
-    fn prepare_row(&mut self) {
-        self.values.clear();
-        self.bytes.clear();
-        self.serials.clear();
-    }
-
-    fn split_mut(&mut self) -> (&mut Vec<ValueSlot>, &mut Vec<u8>, &mut Vec<u64>) {
-        (&mut self.values, &mut self.bytes, &mut self.serials)
-    }
-
-    fn values_slice(&self) -> &[ValueSlot] {
-        self.values.as_slice()
-    }
+    })
 }
 
-/// Read all rows from a table into owned values.
+/// Scan a table with on-demand row decoding.
 ///
-/// ```rust
-/// use std::path::Path;
+/// This is more efficient than fully decoding rows when you only need to count
+/// rows or access a small subset of columns, as it defers decoding until values
+/// are actually accessed.
 ///
-/// use miniql::pager::{PageId, Pager};
-/// use miniql::table;
-///
-/// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/users.db");
-/// let file = std::fs::File::open(path).unwrap();
-/// let pager = Pager::new(file).unwrap();
-/// let rows = table::read_table(&pager, PageId::new(2)).unwrap();
-/// assert_eq!(rows.len(), 2);
-/// ```
-pub fn read_table(pager: &Pager, page_id: PageId) -> Result<Vec<TableRow>> {
-    let mut rows = Vec::new();
-    let mut scratch = RowScratch::with_capacity(8, DEFAULT_SPILL_CAPACITY);
-    scan_table_ref_with_scratch(pager, page_id, &mut scratch, |rowid, row| {
-        let mut owned = Vec::with_capacity(row.len());
-        for value in row.iter() {
-            owned.push(Value::try_from(value)?);
-        }
-        rows.push(TableRow { rowid, values: owned });
-        Ok(())
-    })?;
-    Ok(rows)
+/// Note: Only works with inline payloads (non-overflow rows). For tables with
+/// large TEXT/BLOB columns that overflow, use `scan_table_cells_with_scratch`
+/// and decode columns from the payload.
+pub fn scan_table<F>(pager: &Pager, page_id: PageId, mut f: F) -> Result<()>
+where
+    F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
+{
+    let mut stack = Vec::with_capacity(64);
+    stack.push(page_id);
+    scan_table_with_stack(pager, &mut stack, &mut f)
 }
 
-/// Read all rows from a table (alias for `read_table`).
-pub fn read_table_ref(pager: &Pager, page_id: PageId) -> Result<Vec<TableRow>> {
-    read_table(pager, page_id)
-}
-
-/// Scan a table using an existing scratch buffer.
-pub fn scan_table_ref_with_scratch<F>(
+pub(crate) fn scan_table_with_stack<F>(
     pager: &Pager,
-    page_id: PageId,
-    scratch: &mut RowScratch,
-    mut f: F,
+    stack: &mut Vec<PageId>,
+    f: &mut F,
 ) -> Result<()>
 where
     F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
 {
-    scan_table_page_ref(pager, page_id, scratch, &mut f)
+    let max_pages = pager.page_count().max(1);
+    let mut seen_pages = 0u32;
+
+    while let Some(page_id) = stack.pop() {
+        seen_pages += 1;
+        if seen_pages > max_pages {
+            return Err(Error::Corrupted("btree page cycle detected"));
+        }
+
+        let page = pager.page(page_id)?;
+        let header = parse_header(&page)?;
+        let cell_ptrs = cell_ptrs(&page, &header)?;
+
+        match header.kind {
+            BTreeKind::TableLeaf => {
+                for idx in 0..header.cell_count as usize {
+                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let (rowid, payload) = read_scan_cell(pager, &page, offset)?;
+                    match payload {
+                        PayloadRef::Inline(bytes) => {
+                            let row = RowView::from_inline(bytes)?;
+                            f(rowid, row)?;
+                        }
+                        PayloadRef::Overflow(_) => {
+                            return Err(Error::Corrupted(
+                                "scan does not support overflow payloads",
+                            ));
+                        }
+                    }
+                }
+            }
+            BTreeKind::TableInterior => {
+                if let Some(right_most) = header.right_most_child {
+                    let right_most = PageId::try_new(right_most)
+                        .ok_or(Error::Corrupted("child page id is zero"))?;
+                    stack.push(right_most);
+                }
+
+                let page_len = page.usable_bytes().len();
+                for idx in (0..header.cell_count as usize).rev() {
+                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    if offset as usize >= page_len {
+                        return Err(Error::Corrupted("cell offset out of bounds"));
+                    }
+
+                    let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
+                    let child = read_u32_checked(&mut decoder, "cell child pointer truncated")?;
+                    let child =
+                        PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
+
+                    let _ = read_varint_checked(&mut decoder, "cell key truncated")?;
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
-/// Scan a table, invoking `f` for each row.
-pub fn scan_table_ref<F>(pager: &Pager, page_id: PageId, f: F) -> Result<()>
-where
-    F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
-{
-    let mut scratch = RowScratch::with_capacity(8, DEFAULT_SPILL_CAPACITY);
-    scan_table_ref_with_scratch(pager, page_id, &mut scratch, f)
-}
+/// Read a cell's rowid and payload without full parsing.
+#[inline]
+fn read_scan_cell<'row>(
+    pager: &'row Pager,
+    page: &'row PageRef<'_>,
+    offset: u16,
+) -> Result<(i64, PayloadRef<'row>)> {
+    let usable = page.usable_bytes();
+    if offset as usize >= usable.len() {
+        return Err(Error::Corrupted("cell offset out of bounds"));
+    }
 
-/// Scan a table until the callback returns `Some`.
-pub fn scan_table_ref_until<F, T>(pager: &Pager, page_id: PageId, mut f: F) -> Result<Option<T>>
-where
-    F: for<'row> FnMut(i64, RowView<'row>) -> Result<Option<T>>,
-{
-    let mut scratch = RowScratch::with_capacity(8, DEFAULT_SPILL_CAPACITY);
-    scan_table_page_ref_until(pager, page_id, &mut scratch, &mut f)
-}
+    let mut pos = offset as usize;
+    let remaining = usable.len().saturating_sub(pos);
+    let (payload_length, rowid) = if remaining >= 18 {
+        let payload_length = unsafe { read_varint_unchecked_at(usable, &mut pos) };
+        let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) } as i64;
+        (payload_length, rowid)
+    } else {
+        let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
+        let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+        (payload_length, rowid)
+    };
+    let payload_length =
+        usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
+    if payload_length > MAX_PAYLOAD_BYTES {
+        return Err(Error::PayloadTooLarge(payload_length));
+    }
 
-pub(crate) fn scan_table_ref_until_with_scratch<F, T>(
-    pager: &Pager,
-    page_id: PageId,
-    scratch: &mut RowScratch,
-    mut f: F,
-) -> Result<Option<T>>
-where
-    F: for<'row> FnMut(i64, RowView<'row>) -> Result<Option<T>>,
-{
-    scan_table_page_ref_until(pager, page_id, scratch, &mut f)
+    let start = pos;
+    let usable_size = page.usable_size();
+    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted("usable size underflow"))?;
+    if payload_length <= x {
+        let end = start + payload_length;
+        if end > usable.len() {
+            return Err(Error::Corrupted("payload extends past page boundary"));
+        }
+        return Ok((rowid, PayloadRef::Inline(&usable[start..end])));
+    }
+
+    // Overflow payload
+    let local_len = local_payload_len(usable_size, payload_length)?;
+    let end_local = start + local_len;
+    if end_local > usable.len() {
+        return Err(Error::Corrupted("payload extends past page boundary"));
+    }
+
+    let overflow_end = end_local + 4;
+    if overflow_end > usable.len() {
+        return Err(Error::Corrupted("overflow pointer out of bounds"));
+    }
+    let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
+    if overflow_page == 0 {
+        return Err(Error::OverflowChainTruncated);
+    }
+    let payload =
+        OverflowPayload::new(pager, payload_length, &usable[start..end_local], overflow_page);
+    Ok((rowid, PayloadRef::Overflow(payload)))
 }
 
 /// Scan raw table cells with a caller-provided scratch buffer.
@@ -676,28 +784,6 @@ where
     scan_table_page_cells_until_with_stack(pager, stack, &mut f)
 }
 
-fn scan_table_page_ref<'pager, F>(
-    pager: &'pager Pager,
-    page_id: PageId,
-    scratch: &mut RowScratch,
-    f: &mut F,
-) -> Result<()>
-where
-    F: for<'row> FnMut(i64, RowView<'row>) -> Result<()>,
-{
-    let mut stack = scratch.take_stack();
-    let result = scan_table_cells_with_scratch_and_stack(pager, page_id, &mut stack, |cell| {
-        scratch.prepare_row();
-        let (values, bytes, serials) = scratch.split_mut();
-        let _ = decode_record_project_into(cell.payload(), None, values, bytes, serials)?;
-        let row = RowView { values: scratch.values_slice() };
-        f(cell.rowid(), row)?;
-        Ok(())
-    });
-    scratch.return_stack(stack);
-    result
-}
-
 fn scan_table_page_cells<'pager, F>(pager: &'pager Pager, page_id: PageId, f: &mut F) -> Result<()>
 where
     F: for<'row> FnMut(CellRef<'row>) -> Result<()>,
@@ -763,28 +849,6 @@ where
     }
 
     Ok(())
-}
-
-fn scan_table_page_ref_until<'pager, F, T>(
-    pager: &'pager Pager,
-    page_id: PageId,
-    scratch: &mut RowScratch,
-    f: &mut F,
-) -> Result<Option<T>>
-where
-    F: for<'row> FnMut(i64, RowView<'row>) -> Result<Option<T>>,
-{
-    let mut stack = scratch.take_stack();
-    let result =
-        scan_table_cells_with_scratch_and_stack_until(pager, page_id, &mut stack, |cell| {
-            scratch.prepare_row();
-            let (values, bytes, serials) = scratch.split_mut();
-            let _ = decode_record_project_into(cell.payload(), None, values, bytes, serials)?;
-            let row = RowView { values: scratch.values_slice() };
-            f(cell.rowid(), row)
-        });
-    scratch.return_stack(stack);
-    result
 }
 
 fn scan_table_page_cells_until_with_stack<'pager, F, T>(

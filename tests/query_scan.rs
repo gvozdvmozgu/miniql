@@ -2,7 +2,7 @@ mod util;
 
 use std::path::{Path, PathBuf};
 
-use miniql::{Db, ScanScratch, ValueRef, asc, col, desc, lit_bytes, lit_i64};
+use miniql::{Db, ScanScratch, asc, col, desc, lit_bytes, lit_i64};
 use rusqlite::params;
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -20,15 +20,10 @@ fn filters_rows_with_predicate() {
     let mut scratch = ScanScratch::with_capacity(4, 0);
     let mut seen = Vec::new();
 
-    let mut scan = users
-        .scan()
-        .project([1, 2])
-        .filter(col(2).gt(lit_i64(25)))
-        .compile()
-        .expect("compile scan");
+    let mut scan = users.scan().filter(col(2).gt(lit_i64(25))).compile().expect("compile scan");
     scan.for_each(&mut scratch, |rowid, row| {
-        let name = row.get_text(0)?;
-        let age = row.get_i64(1)?;
+        let name = row.get_text(1)?;
+        let age = row.get_i64(2)?;
         seen.push((rowid, name.to_owned(), age));
         Ok(())
     })
@@ -44,8 +39,7 @@ fn null_predicate_behavior() {
     let mut scratch = ScanScratch::with_capacity(4, 0);
     let mut count = 0usize;
 
-    let mut scan =
-        users.scan().project([1]).filter(col(0).is_null()).compile().expect("compile scan");
+    let mut scan = users.scan().filter(col(0).is_null()).compile().expect("compile scan");
     scan.for_each(&mut scratch, |_, _| {
         count += 1;
         Ok(())
@@ -57,8 +51,7 @@ fn null_predicate_behavior() {
     let mut scratch = ScanScratch::with_capacity(4, 0);
     let mut count = 0usize;
 
-    let mut scan =
-        users.scan().project([1]).filter(col(0).eq(lit_i64(1))).compile().expect("compile scan");
+    let mut scan = users.scan().filter(col(0).eq(lit_i64(1))).compile().expect("compile scan");
     scan.for_each(&mut scratch, |_, _| {
         count += 1;
         Ok(())
@@ -69,21 +62,17 @@ fn null_predicate_behavior() {
 }
 
 #[test]
-fn projection_remaps_columns() {
+fn filter_with_text_column() {
     let db = open_db("users.db");
     let users = db.table("users").expect("users table");
     let mut scratch = ScanScratch::with_capacity(4, 0);
     let mut first = None;
 
-    let mut scan = users
-        .scan()
-        .project([2, 1])
-        .filter(col(1).eq(lit_bytes(b"alice")))
-        .compile()
-        .expect("compile scan");
+    let mut scan =
+        users.scan().filter(col(1).eq(lit_bytes(b"alice"))).compile().expect("compile scan");
     scan.for_each(&mut scratch, |rowid, row| {
-        let age = row.get_i64(0)?;
         let name = row.get_text(1)?;
+        let age = row.get_i64(2)?;
         first = Some((rowid, name.to_owned(), age));
         Ok(())
     })
@@ -93,7 +82,7 @@ fn projection_remaps_columns() {
 }
 
 #[test]
-fn scan_without_projection_decodes_all_columns() {
+fn scan_reads_all_columns() {
     let db = open_db("users.db");
     let users = db.table("users").expect("users table");
     let mut scratch = ScanScratch::with_capacity(4, 0);
@@ -101,7 +90,7 @@ fn scan_without_projection_decodes_all_columns() {
 
     let mut scan = users.scan().filter(col(2).gt(lit_i64(25))).compile().expect("compile scan");
     scan.for_each(&mut scratch, |rowid, row| {
-        assert!(matches!(row.get(0), Some(ValueRef::Null)));
+        assert!(matches!(row.get(0), Ok(Some(miniql::ValueRef::Null)))); // col 0 is NULL
         let name = row.get_text(1)?;
         let age = row.get_i64(2)?;
         first = Some((rowid, name.to_owned(), age));
@@ -139,7 +128,6 @@ fn order_by_multi_column_with_limit() {
 
     people
         .scan()
-        .project([0])
         .order_by([asc(1), desc(0)])
         .limit(3)
         .for_each(&mut scratch, |_, row| {

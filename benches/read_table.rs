@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use codspeed_criterion_compat::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use miniql::pager::{PageId, Pager};
 use miniql::query::{Scan, ScanScratch, col, lit_bytes, lit_i64};
-use miniql::table::{self, RowScratch};
+use miniql::table;
 
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
@@ -14,11 +14,10 @@ fn bench_read_sqlite_schema_ref_hot(c: &mut Criterion) {
     let db_path = fixture_path("users.db");
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
-    let mut scratch = RowScratch::with_capacity(8, 0);
     c.bench_function("read_sqlite_schema_ref_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            table::scan_table_ref_with_scratch(&pager, PageId::ROOT, &mut scratch, |_, _| {
+            table::scan_table(&pager, PageId::ROOT, |_, _| {
                 rows += 1;
                 Ok(())
             })
@@ -32,11 +31,10 @@ fn bench_read_users_table_ref_hot(c: &mut Criterion) {
     let db_path = fixture_path("users.db");
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
-    let mut scratch = RowScratch::with_capacity(8, 0);
     c.bench_function("read_users_table_ref_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            table::scan_table_ref_with_scratch(&pager, PageId::new(2), &mut scratch, |_, _| {
+            table::scan_table(&pager, PageId::new(2), |_, _| {
                 rows += 1;
                 Ok(())
             })
@@ -56,8 +54,7 @@ fn bench_read_sqlite_schema_ref_cold(c: &mut Criterion) {
             },
             |pager| {
                 let mut rows = 0usize;
-                let mut scratch = RowScratch::with_capacity(8, 0);
-                table::scan_table_ref_with_scratch(&pager, PageId::ROOT, &mut scratch, |_, _| {
+                table::scan_table(&pager, PageId::ROOT, |_, _| {
                     rows += 1;
                     Ok(())
                 })
@@ -79,8 +76,7 @@ fn bench_read_users_table_ref_cold(c: &mut Criterion) {
             },
             |pager| {
                 let mut rows = 0usize;
-                let mut scratch = RowScratch::with_capacity(8, 0);
-                table::scan_table_ref_with_scratch(&pager, PageId::new(2), &mut scratch, |_, _| {
+                table::scan_table(&pager, PageId::new(2), |_, _| {
                     rows += 1;
                     Ok(())
                 })
@@ -96,11 +92,13 @@ fn bench_read_overflow_table_ref_hot(c: &mut Criterion) {
     let db_path = fixture_path("overflow.db");
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
-    let mut scratch = RowScratch::with_capacity(4, 10008);
     c.bench_function("read_overflow_table_ref_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            table::scan_table_ref_with_scratch(&pager, PageId::new(2), &mut scratch, |_, _| {
+            table::scan_table_cells_with_scratch(&pager, PageId::new(2), |cell| {
+                let payload = cell.payload().to_vec()?;
+                let row = table::RowView::from_inline(&payload)?;
+                let _ = row.get(0)?;
                 rows += 1;
                 Ok(())
             })

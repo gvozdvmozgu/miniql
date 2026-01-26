@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use miniql::pager::{PageId, Pager};
-use miniql::table::{self, TableRow, Value, ValueRef};
+use miniql::table::{self, ValueRef};
 
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
@@ -12,83 +12,70 @@ fn open_pager(name: &str) -> Pager {
     Pager::new(file).expect("create pager")
 }
 
-fn users_root_page(rows: &[TableRow]) -> Option<u32> {
-    rows.iter().find_map(|row| {
-        if row.values.len() < 4 {
-            return None;
-        }
+fn row_text<'row>(row: table::RowView<'row>, idx: usize) -> table::Result<Option<&'row str>> {
+    match row.get(idx)? {
+        Some(ValueRef::Text(bytes)) => Ok(std::str::from_utf8(bytes).ok()),
+        _ => Ok(None),
+    }
+}
 
-        let row_type = row.values[0].as_text()?;
-        let name = row.values[1].as_text()?;
-        let rootpage = row.values[3].as_integer()?;
-
-        if row_type == "table" && name == "users" { u32::try_from(rootpage).ok() } else { None }
-    })
+fn row_integer(row: table::RowView<'_>, idx: usize) -> table::Result<Option<i64>> {
+    match row.get(idx)? {
+        Some(ValueRef::Integer(value)) => Ok(Some(value)),
+        _ => Ok(None),
+    }
 }
 
 #[test]
 fn reads_schema_and_finds_users_root() {
     let pager = open_pager("users.db");
-    let rows = table::read_table(&pager, PageId::ROOT).expect("read sqlite_schema");
-    let root = users_root_page(&rows).expect("users table entry in sqlite_schema");
+    let mut found = None;
+    table::scan_table(&pager, PageId::ROOT, |_, row| {
+        let row_type = match row_text(row, 0)? {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+        if !row_type.eq_ignore_ascii_case("table") {
+            return Ok(());
+        }
+        let name = match row_text(row, 1)? {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+        if name != "users" {
+            return Ok(());
+        }
+        let rootpage = match row_integer(row, 3)? {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+        found = u32::try_from(rootpage).ok();
+        Ok(())
+    })
+    .expect("read sqlite_schema");
+    let root = found.expect("users table entry in sqlite_schema");
     assert_eq!(root, 2);
-}
-
-#[test]
-fn reads_users_table_rows() {
-    let pager = open_pager("users.db");
-    let rows = table::read_table(&pager, PageId::new(2)).expect("read users table");
-
-    assert_eq!(rows.len(), 2);
-
-    let first = &rows[0];
-    assert_eq!(first.rowid, 1);
-    assert_eq!(first.values.len(), 3);
-    assert!(matches!(first.values[0], Value::Null));
-    assert_eq!(first.values[1].as_text(), Some("alice"));
-    assert_eq!(first.values[2].as_integer(), Some(30));
-
-    let second = &rows[1];
-    assert_eq!(second.rowid, 2);
-    assert_eq!(second.values.len(), 3);
-    assert!(matches!(second.values[0], Value::Null));
-    assert_eq!(second.values[1].as_text(), Some("bob"));
-    assert_eq!(second.values[2].as_integer(), Some(25));
-}
-
-#[test]
-fn reads_users_table_rows_by_ref() {
-    let pager = open_pager("users.db");
-    let rows = table::read_table_ref(&pager, PageId::new(2)).expect("read users table");
-
-    assert_eq!(rows.len(), 2);
-
-    let first = &rows[0];
-    assert_eq!(first.rowid, 1);
-    assert!(matches!(first.values[0], Value::Null));
-    assert_eq!(first.values[1].as_text(), Some("alice"));
-    assert_eq!(first.values[2].as_integer(), Some(30));
 }
 
 #[test]
 fn scans_users_table_rows() {
     let pager = open_pager("users.db");
     let mut seen = 0usize;
-    table::scan_table_ref(&pager, PageId::new(2), |rowid, row| {
+    table::scan_table(&pager, PageId::new(2), |rowid, row| {
         match seen {
             0 => {
                 assert_eq!(rowid, 1);
-                assert_eq!(row.len(), 3);
-                assert!(matches!(row.get(0), Some(ValueRef::Null)));
-                assert_eq!(row.get(1).and_then(|v| v.as_text()), Some("alice"));
-                assert_eq!(row.get(2).and_then(|v| v.as_integer()), Some(30));
+                assert_eq!(row.column_count(), 3);
+                assert!(matches!(row.get(0)?, Some(ValueRef::Null)));
+                assert_eq!(row.get(1)?.and_then(|v| v.as_text()), Some("alice"));
+                assert_eq!(row.get(2)?.and_then(|v| v.as_integer()), Some(30));
             }
             1 => {
                 assert_eq!(rowid, 2);
-                assert_eq!(row.len(), 3);
-                assert!(matches!(row.get(0), Some(ValueRef::Null)));
-                assert_eq!(row.get(1).and_then(|v| v.as_text()), Some("bob"));
-                assert_eq!(row.get(2).and_then(|v| v.as_integer()), Some(25));
+                assert_eq!(row.column_count(), 3);
+                assert!(matches!(row.get(0)?, Some(ValueRef::Null)));
+                assert_eq!(row.get(1)?.and_then(|v| v.as_text()), Some("bob"));
+                assert_eq!(row.get(2)?.and_then(|v| v.as_integer()), Some(25));
             }
             _ => panic!("unexpected extra row"),
         }
@@ -111,28 +98,29 @@ fn opens_with_different_page_sizes() {
 #[test]
 fn reads_overflow_payloads() {
     let pager = open_pager("overflow.db");
-    let mut rows = 0usize;
-    let mut scratch = table::RowScratch::with_capacity(2, 16 * 1024);
-    table::scan_table_ref_with_scratch(&pager, PageId::new(2), &mut scratch, |rowid, row| {
-        assert_eq!(rowid, 1);
-        assert_eq!(row.len(), 2);
-        assert_eq!(row.get(0).and_then(|v| v.as_integer()), Some(1));
-        let text = row.get(1).and_then(|v| v.as_text()).expect("utf8 text");
+    let mut seen = 0usize;
+    table::scan_table_cells_with_scratch(&pager, PageId::new(2), |cell| {
+        assert_eq!(cell.rowid(), 1);
+        let payload = cell.payload().to_vec()?;
+        let row = table::RowView::from_inline(&payload)?;
+        assert_eq!(row.column_count(), 2);
+        assert_eq!(row.get(0)?.and_then(|v| v.as_integer()), Some(1));
+        let text = row.get(1)?.and_then(|v| v.as_text()).expect("utf8 text");
         assert!(text.len() > 5000);
         assert!(text.starts_with("payload-"));
-        rows += 1;
+        seen += 1;
         Ok(())
     })
     .expect("scan overflow table");
-    assert_eq!(rows, 1);
+    assert_eq!(seen, 1);
 }
 
 #[test]
 fn scans_tables_with_interior_pages() {
     let pager = open_pager("interior.db");
     let mut rows = 0usize;
-    table::scan_table_ref(&pager, PageId::new(2), |_, row| {
-        assert_eq!(row.len(), 2);
+    table::scan_table(&pager, PageId::new(2), |_, row| {
+        assert_eq!(row.column_count(), 2);
         rows += 1;
         Ok(())
     })

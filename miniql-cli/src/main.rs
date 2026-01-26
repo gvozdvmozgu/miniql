@@ -36,12 +36,13 @@ fn print_table(db: &Db, table_name: &str) -> Result<(), miniql::Error> {
     Ok(())
 }
 
-fn print_row(rowid: i64, row: miniql::Row<'_>) {
+fn print_row(rowid: i64, row: miniql::RowView<'_>) {
     print!("{:>6} |", rowid);
-    for idx in 0..row.len() {
+    for idx in 0..row.column_count() {
         match row.get(idx) {
-            Some(value) => print!(" {value} |"),
-            None => print!(" <missing> |"),
+            Ok(Some(value)) => print!(" {value} |"),
+            Ok(None) => print!(" <missing> |"),
+            Err(_) => print!(" <error> |"),
         }
     }
     println!();

@@ -3,26 +3,41 @@ mod util;
 use miniql::join::{Join, JoinKey, JoinScratch, JoinStrategy, JoinType};
 use miniql::pager::{PageId, Pager};
 use miniql::query::Scan;
-use miniql::table::{self, TableRow};
+use miniql::table::{self, ValueRef};
 use rusqlite::params;
 
-fn schema_root(rows: &[TableRow], kind: &str, name: &str) -> Option<u32> {
-    rows.iter().find_map(|row| {
-        if row.values.len() < 4 {
-            return None;
+fn schema_root(pager: &Pager, kind: &str, name: &str) -> Option<u32> {
+    let mut found = None;
+    table::scan_table(pager, PageId::ROOT, |_, row| {
+        let row_type = match row.get(0)? {
+            Some(ValueRef::Text(bytes)) => std::str::from_utf8(bytes).ok(),
+            _ => None,
+        };
+        if row_type != Some(kind) {
+            return Ok(());
         }
-        let row_type = row.values[0].as_text()?;
-        let row_name = row.values[1].as_text()?;
-        let rootpage = row.values[3].as_integer()?;
-        if row_type == kind && row_name == name { u32::try_from(rootpage).ok() } else { None }
+        let row_name = match row.get(1)? {
+            Some(ValueRef::Text(bytes)) => std::str::from_utf8(bytes).ok(),
+            _ => None,
+        };
+        if row_name != Some(name) {
+            return Ok(());
+        }
+        let rootpage = match row.get(3)? {
+            Some(ValueRef::Integer(value)) => Some(value),
+            _ => None,
+        };
+        found = rootpage.and_then(|value| u32::try_from(value).ok());
+        Ok(())
     })
+    .expect("read sqlite_schema");
+    found
 }
 
 fn join_roots(pager: &Pager, left: &str, right: &str, index: &str) -> (PageId, PageId, PageId) {
-    let rows = table::read_table(pager, PageId::ROOT).expect("read sqlite_schema");
-    let left_root = schema_root(&rows, "table", left).expect("left table root");
-    let right_root = schema_root(&rows, "table", right).expect("right table root");
-    let index_root = schema_root(&rows, "index", index).expect("index root");
+    let left_root = schema_root(pager, "table", left).expect("left table root");
+    let right_root = schema_root(pager, "table", right).expect("right table root");
+    let index_root = schema_root(pager, "index", index).expect("index root");
     (PageId::new(left_root), PageId::new(right_root), PageId::new(index_root))
 }
 

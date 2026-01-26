@@ -559,10 +559,13 @@ impl<'db> Scan<'db> {
         })
     }
 
-    /// Execute the scan and invoke `cb` for each row.
+    /// Execute the scan and invoke `cb` for each row with on-demand decoding.
+    ///
+    /// Values are decoded on-demand when `RowView::get()` is called.
+    /// Supports filters, ORDER BY, and LIMIT.
     pub fn for_each<F>(self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
     where
-        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+        F: for<'row> FnMut(i64, table::RowView<'row>) -> table::Result<()>,
     {
         let mut prepared = self.compile()?;
         prepared.for_each(scratch, &mut cb)
@@ -698,18 +701,49 @@ impl<'db> PreparedScan<'db> {
         Ok(Some(row))
     }
 
-    /// Execute the prepared scan and invoke `cb` for each row.
+    /// Execute the prepared scan with on-demand row decoding.
+    ///
+    /// Values are decoded on-demand when `RowView::get()` is called.
+    /// This is more efficient when you only access a subset of columns.
+    ///
+    /// Supports filters, ORDER BY, and LIMIT. For filters and ORDER BY,
+    /// only the required columns are decoded; the callback receives a
+    /// `RowView` for on-demand access to other columns.
+    ///
+    /// # Example
+    /// ```rust
+    /// use std::path::Path;
+    ///
+    /// use miniql::{Db, ScanScratch};
+    ///
+    /// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/users.db");
+    /// let db = Db::open(path).unwrap();
+    /// let table = db.table("users").unwrap();
+    /// let mut scratch = ScanScratch::new();
+    /// let mut count = 0;
+    /// table
+    ///     .scan()
+    ///     .compile()
+    ///     .unwrap()
+    ///     .for_each(&mut scratch, |_, _| {
+    ///         count += 1;
+    ///         Ok(())
+    ///     })
+    ///     .unwrap();
+    /// assert_eq!(count, 2);
+    /// ```
     pub fn for_each<F>(&mut self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
     where
-        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+        F: for<'row> FnMut(i64, table::RowView<'row>) -> table::Result<()>,
     {
         if self.limit == Some(0) {
             return Ok(());
         }
 
         let has_order = matches!(self.order_by.as_deref(), Some(o) if !o.is_empty());
+        let has_filter = self.compiled_expr.is_some() || self.filter_fn.is_some();
+
         if has_order {
-            // take() needed due to borrow rules; restored after call
             let order_by = self.order_by.take().unwrap();
             let result = match self.limit {
                 Some(limit) => self.for_each_ordered_limited(scratch, &order_by, limit, &mut cb),
@@ -719,66 +753,169 @@ impl<'db> PreparedScan<'db> {
             return result;
         }
 
-        match self.limit {
-            Some(limit) => self.for_each_unordered_limited(scratch, limit, &mut cb),
-            None => self.for_each_unordered_unlimited(scratch, &mut cb),
+        if has_filter {
+            return match self.limit {
+                Some(limit) => self.for_each_filtered_limited(scratch, limit, &mut cb),
+                None => self.for_each_filtered_unlimited(scratch, &mut cb),
+            };
+        }
+
+        // Simple case: no filter, no ORDER BY
+        let pager = self.pager;
+        let root = self.root;
+        let limit = self.limit;
+        let (_, _, _, _, btree_stack) = scratch.split_mut();
+
+        match limit {
+            Some(limit) => {
+                let mut seen = 0usize;
+                btree_stack.clear();
+                btree_stack.push(root);
+                table::scan_table_with_stack(pager, btree_stack, &mut |rowid, row| {
+                    cb(rowid, row)?;
+                    seen += 1;
+                    if seen >= limit {
+                        return Err(table::Error::Corrupted("__limit_reached__"));
+                    }
+                    Ok(())
+                })
+                .or_else(|e| {
+                    if matches!(&e, table::Error::Corrupted(msg) if *msg == "__limit_reached__") {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })
+            }
+            None => {
+                btree_stack.clear();
+                btree_stack.push(root);
+                table::scan_table_with_stack(pager, btree_stack, &mut cb)
+            }
         }
     }
 
-    fn for_each_unordered_unlimited<F>(
+    fn for_each_filtered_unlimited<F>(
         &mut self,
         scratch: &mut ScanScratch,
         cb: &mut F,
     ) -> table::Result<()>
     where
-        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+        F: for<'row> FnMut(i64, table::RowView<'row>) -> table::Result<()>,
     {
         let pager = self.pager;
         let root = self.root;
+        let (values, bytes, serials, _, btree_stack) = scratch.split_mut();
 
-        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
-        let _ = offsets; // Reserved for future offset caching
         table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
             let rowid = cell.rowid();
-            let Some(row) = self.eval_payload(cell.payload(), values, bytes, serials)? else {
+            let payload = cell.payload();
+
+            // Decode columns needed for filter
+            let needed_cols = self.needed_cols.as_deref();
+            let count =
+                table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
+
+            // Validate column count once
+            if let Some(expected) = self.column_count_hint.get().copied() {
+                if expected != count {
+                    return Err(table::Error::Corrupted(
+                        "row column count does not match table schema",
+                    ));
+                }
+            } else {
+                if let Some(err) = validate_columns(&self.referenced_cols, count) {
+                    return Err(err);
+                }
+                let _ = self.column_count_hint.set(count);
+            }
+
+            // Apply filter
+            if let Some(expr) = self.compiled_expr.as_ref()
+                && eval_compiled_expr(expr, values.as_slice(), bytes.as_slice())? != Truth::True
+            {
                 return Ok(());
+            }
+            if let Some(filter_fn) = self.filter_fn.as_mut() {
+                let row = Row { values: values.as_slice(), proj_map: None };
+                if !filter_fn(&row)? {
+                    return Ok(());
+                }
+            }
+
+            // Pass RowView to callback
+            let row_view = match payload {
+                table::PayloadRef::Inline(data) => table::RowView::from_inline(data)?,
+                table::PayloadRef::Overflow(ovf) => table::RowView::from_inline(ovf.local())?,
             };
-            cb(rowid, row)?;
+            cb(rowid, row_view)?;
             Ok(())
         })?;
 
         Ok(())
     }
 
-    fn for_each_unordered_limited<F>(
+    fn for_each_filtered_limited<F>(
         &mut self,
         scratch: &mut ScanScratch,
         limit: usize,
         cb: &mut F,
     ) -> table::Result<()>
     where
-        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+        F: for<'row> FnMut(i64, table::RowView<'row>) -> table::Result<()>,
     {
         let pager = self.pager;
         let root = self.root;
+        let (values, bytes, serials, _, btree_stack) = scratch.split_mut();
         let mut seen = 0usize;
-
-        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
-        let _ = offsets; // Reserved for future offset caching
 
         table::scan_table_cells_with_scratch_and_stack_until(pager, root, btree_stack, |cell| {
             let rowid = cell.rowid();
-            let Some(row) = self.eval_payload(cell.payload(), values, bytes, serials)? else {
-                return Ok(None);
-            };
+            let payload = cell.payload();
 
-            cb(rowid, row)?;
+            // Decode columns needed for filter
+            let needed_cols = self.needed_cols.as_deref();
+            let count =
+                table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
+
+            // Validate column count once
+            if let Some(expected) = self.column_count_hint.get().copied() {
+                if expected != count {
+                    return Err(table::Error::Corrupted(
+                        "row column count does not match table schema",
+                    ));
+                }
+            } else {
+                if let Some(err) = validate_columns(&self.referenced_cols, count) {
+                    return Err(err);
+                }
+                let _ = self.column_count_hint.set(count);
+            }
+
+            // Apply filter
+            if let Some(expr) = self.compiled_expr.as_ref()
+                && eval_compiled_expr(expr, values.as_slice(), bytes.as_slice())? != Truth::True
+            {
+                return Ok(None);
+            }
+            if let Some(filter_fn) = self.filter_fn.as_mut() {
+                let row = Row { values: values.as_slice(), proj_map: None };
+                if !filter_fn(&row)? {
+                    return Ok(None);
+                }
+            }
+
+            // Pass RowView to callback
+            let row_view = match payload {
+                table::PayloadRef::Inline(data) => table::RowView::from_inline(data)?,
+                table::PayloadRef::Overflow(ovf) => table::RowView::from_inline(ovf.local())?,
+            };
+            cb(rowid, row_view)?;
             seen += 1;
 
             if seen >= limit {
                 return Ok(Some(()));
             }
-
             Ok(None)
         })?;
 
@@ -792,84 +929,84 @@ impl<'db> PreparedScan<'db> {
         cb: &mut F,
     ) -> table::Result<()>
     where
-        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+        F: for<'row> FnMut(i64, table::RowView<'row>) -> table::Result<()>,
     {
         let pager = self.pager;
         let root = self.root;
 
-        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
-        let _ = offsets; // Reserved for future offset caching
+        let (values, bytes, serials, _, btree_stack) = scratch.split_mut();
         let key_arena = Bump::new();
         let mut seq = 0u64;
-
         let mut entries = Vec::with_capacity(256);
-        let apply_filters = self.compiled_expr.is_some() || self.filter_fn.is_some();
 
-        // Copy order_val_map into SmallVec to avoid borrowing self in closure
-        // This avoids re-reading overflow pages for large blobs
         let order_val_map: SmallVec<[usize; 4]> =
             self.order_val_map.as_deref().map(|m| m.iter().copied().collect()).unwrap_or_default();
         let has_order_map = self.order_val_map.is_some();
 
-        if apply_filters {
-            table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
-                let rowid = cell.rowid();
-                let page_id = cell.page_id();
-                let cell_offset = cell.cell_offset();
-                let payload = cell.payload();
-                let Some(_row) = self.eval_payload(payload, values, bytes, serials)? else {
-                    return Ok(());
-                };
+        table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
+            let rowid = cell.rowid();
+            let page_id = cell.page_id();
+            let cell_offset = cell.cell_offset();
+            let payload = cell.payload();
 
-                let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
-                for (i, order) in order_by.iter().enumerate() {
-                    let val_idx = if has_order_map { order_val_map[i] } else { order.col as usize };
-                    let slot = values.get(val_idx).copied().unwrap_or(ValueSlot::Null);
-                    let value = stabilize_sort_key_value(slot, bytes.as_slice(), &key_arena);
-                    keys.push(SortKey { value, dir: order.dir });
-                }
-
-                entries.push(SortEntry { rowid, page_id, cell_offset, keys, seq });
-                seq = seq.wrapping_add(1);
-
-                Ok(())
-            })?;
-        } else {
-            table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
-                let rowid = cell.rowid();
-                let page_id = cell.page_id();
-                let cell_offset = cell.cell_offset();
-                let payload = cell.payload();
-
-                // Decode needed columns (including ORDER BY) to values buffer
-                let needed_cols = self.needed_cols.as_deref();
+            // Decode columns needed for filter and ORDER BY
+            let needed_cols = self.needed_cols.as_deref();
+            let count =
                 table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
 
-                let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
-                for (i, order) in order_by.iter().enumerate() {
-                    let val_idx = if has_order_map { order_val_map[i] } else { order.col as usize };
-                    let slot = values.get(val_idx).copied().unwrap_or(ValueSlot::Null);
-                    let value = stabilize_sort_key_value(slot, bytes.as_slice(), &key_arena);
-                    keys.push(SortKey { value, dir: order.dir });
+            // Validate column count once
+            if let Some(expected) = self.column_count_hint.get().copied() {
+                if expected != count {
+                    return Err(table::Error::Corrupted(
+                        "row column count does not match table schema",
+                    ));
                 }
+            } else {
+                if let Some(err) = validate_columns(&self.referenced_cols, count) {
+                    return Err(err);
+                }
+                let _ = self.column_count_hint.set(count);
+            }
 
-                entries.push(SortEntry { rowid, page_id, cell_offset, keys, seq });
-                seq = seq.wrapping_add(1);
+            // Apply filter
+            if let Some(expr) = self.compiled_expr.as_ref()
+                && eval_compiled_expr(expr, values.as_slice(), bytes.as_slice())? != Truth::True
+            {
+                return Ok(());
+            }
+            if let Some(filter_fn) = self.filter_fn.as_mut() {
+                let row = Row { values: values.as_slice(), proj_map: None };
+                if !filter_fn(&row)? {
+                    return Ok(());
+                }
+            }
 
-                Ok(())
-            })?;
-        }
+            // Extract sort keys
+            let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
+            for (i, order) in order_by.iter().enumerate() {
+                let val_idx = if has_order_map { order_val_map[i] } else { order.col as usize };
+                let slot = values.get(val_idx).copied().unwrap_or(ValueSlot::Null);
+                let value = stabilize_sort_key_value(slot, bytes.as_slice(), &key_arena);
+                keys.push(SortKey { value, dir: order.dir });
+            }
+
+            entries.push(SortEntry { rowid, page_id, cell_offset, keys, seq });
+            seq = seq.wrapping_add(1);
+
+            Ok(())
+        })?;
 
         entries.sort();
 
         for entry in entries {
             let cell =
                 table::read_table_cell_ref_from_bytes(pager, entry.page_id, entry.cell_offset)?;
-            if let Some(row) =
-                self.eval_payload_with_filters(cell.payload(), values, bytes, serials, false)?
-            {
-                cb(entry.rowid, row)?;
-            }
+            let payload = cell.payload();
+            let row_view = match payload {
+                table::PayloadRef::Inline(data) => table::RowView::from_inline(data)?,
+                table::PayloadRef::Overflow(ovf) => table::RowView::from_inline(ovf.local())?,
+            };
+            cb(entry.rowid, row_view)?;
         }
 
         Ok(())
@@ -883,90 +1020,81 @@ impl<'db> PreparedScan<'db> {
         cb: &mut F,
     ) -> table::Result<()>
     where
-        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+        F: for<'row> FnMut(i64, table::RowView<'row>) -> table::Result<()>,
     {
         let pager = self.pager;
         let root = self.root;
 
-        let (values, bytes, serials, offsets, btree_stack) = scratch.split_mut();
-        let _ = offsets; // Reserved for future offset caching
+        let (values, bytes, serials, _, btree_stack) = scratch.split_mut();
         let key_arena = Bump::new();
         let mut seq = 0u64;
-
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
-        let apply_filters = self.compiled_expr.is_some() || self.filter_fn.is_some();
 
-        // Copy order_val_map into SmallVec to avoid borrowing self in closure
         let order_val_map: SmallVec<[usize; 4]> =
             self.order_val_map.as_deref().map(|m| m.iter().copied().collect()).unwrap_or_default();
         let has_order_map = self.order_val_map.is_some();
 
-        if apply_filters {
-            table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
-                let rowid = cell.rowid();
-                let page_id = cell.page_id();
-                let cell_offset = cell.cell_offset();
-                let payload = cell.payload();
-                let Some(_row) = self.eval_payload(payload, values, bytes, serials)? else {
-                    return Ok(());
-                };
+        table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
+            let rowid = cell.rowid();
+            let page_id = cell.page_id();
+            let cell_offset = cell.cell_offset();
+            let payload = cell.payload();
 
-                let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
-                for (i, order) in order_by.iter().enumerate() {
-                    let val_idx = if has_order_map { order_val_map[i] } else { order.col as usize };
-                    let slot = values.get(val_idx).copied().unwrap_or(ValueSlot::Null);
-                    let value = stabilize_sort_key_value(slot, bytes.as_slice(), &key_arena);
-                    keys.push(SortKey { value, dir: order.dir });
-                }
-
-                let entry = SortEntry { rowid, page_id, cell_offset, keys, seq };
-                seq = seq.wrapping_add(1);
-
-                if heap.len() < limit {
-                    heap.push(entry);
-                } else if let Some(top) = heap.peek()
-                    && entry.cmp(top) == Ordering::Less
-                {
-                    heap.pop();
-                    heap.push(entry);
-                }
-
-                Ok(())
-            })?;
-        } else {
-            table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
-                let rowid = cell.rowid();
-                let page_id = cell.page_id();
-                let cell_offset = cell.cell_offset();
-                let payload = cell.payload();
-
-                // Decode needed columns (including ORDER BY) to values buffer
-                let needed_cols = self.needed_cols.as_deref();
+            // Decode columns needed for filter and ORDER BY
+            let needed_cols = self.needed_cols.as_deref();
+            let count =
                 table::decode_record_project_into(payload, needed_cols, values, bytes, serials)?;
 
-                let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
-                for (i, order) in order_by.iter().enumerate() {
-                    let val_idx = if has_order_map { order_val_map[i] } else { order.col as usize };
-                    let slot = values.get(val_idx).copied().unwrap_or(ValueSlot::Null);
-                    let value = stabilize_sort_key_value(slot, bytes.as_slice(), &key_arena);
-                    keys.push(SortKey { value, dir: order.dir });
+            // Validate column count once
+            if let Some(expected) = self.column_count_hint.get().copied() {
+                if expected != count {
+                    return Err(table::Error::Corrupted(
+                        "row column count does not match table schema",
+                    ));
                 }
-
-                let entry = SortEntry { rowid, page_id, cell_offset, keys, seq };
-                seq = seq.wrapping_add(1);
-
-                if heap.len() < limit {
-                    heap.push(entry);
-                } else if let Some(top) = heap.peek()
-                    && entry.cmp(top) == Ordering::Less
-                {
-                    heap.pop();
-                    heap.push(entry);
+            } else {
+                if let Some(err) = validate_columns(&self.referenced_cols, count) {
+                    return Err(err);
                 }
+                let _ = self.column_count_hint.set(count);
+            }
 
-                Ok(())
-            })?;
-        }
+            // Apply filter
+            if let Some(expr) = self.compiled_expr.as_ref()
+                && eval_compiled_expr(expr, values.as_slice(), bytes.as_slice())? != Truth::True
+            {
+                return Ok(());
+            }
+            if let Some(filter_fn) = self.filter_fn.as_mut() {
+                let row = Row { values: values.as_slice(), proj_map: None };
+                if !filter_fn(&row)? {
+                    return Ok(());
+                }
+            }
+
+            // Extract sort keys
+            let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
+            for (i, order) in order_by.iter().enumerate() {
+                let val_idx = if has_order_map { order_val_map[i] } else { order.col as usize };
+                let slot = values.get(val_idx).copied().unwrap_or(ValueSlot::Null);
+                let value = stabilize_sort_key_value(slot, bytes.as_slice(), &key_arena);
+                keys.push(SortKey { value, dir: order.dir });
+            }
+
+            let entry = SortEntry { rowid, page_id, cell_offset, keys, seq };
+            seq = seq.wrapping_add(1);
+
+            if heap.len() < limit {
+                heap.push(entry);
+            } else if let Some(top) = heap.peek()
+                && entry.cmp(top) == Ordering::Less
+            {
+                heap.pop();
+                heap.push(entry);
+            }
+
+            Ok(())
+        })?;
 
         let mut rows = heap.into_vec();
         rows.sort();
@@ -974,10 +1102,73 @@ impl<'db> PreparedScan<'db> {
         for entry in rows {
             let cell =
                 table::read_table_cell_ref_from_bytes(pager, entry.page_id, entry.cell_offset)?;
-            if let Some(row) =
-                self.eval_payload_with_filters(cell.payload(), values, bytes, serials, false)?
-            {
-                cb(entry.rowid, row)?;
+            let payload = cell.payload();
+            let row_view = match payload {
+                table::PayloadRef::Inline(data) => table::RowView::from_inline(data)?,
+                table::PayloadRef::Overflow(ovf) => table::RowView::from_inline(ovf.local())?,
+            };
+            cb(entry.rowid, row_view)?;
+        }
+
+        Ok(())
+    }
+
+    /// Execute the scan with eager (pre-decoded) rows.
+    ///
+    /// Internal method used by join operations that need access to raw values.
+    /// Supports filters and LIMIT, but not ORDER BY - use `for_each` for ORDER
+    /// BY.
+    pub(crate) fn for_each_eager<F>(
+        &mut self,
+        scratch: &mut ScanScratch,
+        mut cb: F,
+    ) -> table::Result<()>
+    where
+        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+    {
+        if self.limit == Some(0) {
+            return Ok(());
+        }
+
+        let pager = self.pager;
+        let root = self.root;
+        let limit = self.limit;
+
+        let (values, bytes, serials, _, btree_stack) = scratch.split_mut();
+
+        match limit {
+            Some(limit) => {
+                let mut seen = 0usize;
+                table::scan_table_cells_with_scratch_and_stack_until(
+                    pager,
+                    root,
+                    btree_stack,
+                    |cell| {
+                        let rowid = cell.rowid();
+                        let Some(row) =
+                            self.eval_payload(cell.payload(), values, bytes, serials)?
+                        else {
+                            return Ok(None);
+                        };
+                        cb(rowid, row)?;
+                        seen += 1;
+                        if seen >= limit {
+                            return Ok(Some(()));
+                        }
+                        Ok(None)
+                    },
+                )?;
+            }
+            None => {
+                table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
+                    let rowid = cell.rowid();
+                    let Some(row) = self.eval_payload(cell.payload(), values, bytes, serials)?
+                    else {
+                        return Ok(());
+                    };
+                    cb(rowid, row)?;
+                    Ok(())
+                })?;
             }
         }
 

@@ -1014,7 +1014,7 @@ where
     let mut cursor = IndexCursor::new(pager, index_root, index_key_col, index_scratch);
     let covering_map = covering_map_for_index(right_scan, index_cols);
 
-    left_scan.for_each(left_scratch, |left_rowid, left_row| {
+    left_scan.for_each_eager(left_scratch, |left_rowid, left_row| {
         let left_out = left_meta.output_row(left_row.values_raw());
         let Some(left_key_value) = left_meta.join_key(left_rowid, &left_row)? else {
             return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
@@ -1123,7 +1123,7 @@ where
     let covering_map = covering_map_for_index(right_scan, index_cols);
     let mut right_exhausted = false;
 
-    left_scan.for_each(left_scratch, |left_rowid, left_row| {
+    left_scan.for_each_eager(left_scratch, |left_rowid, left_row| {
         let left_out = left_meta.output_row(left_row.values_raw());
         let Some(left_key_value) = left_meta.join_key(left_rowid, &left_row)? else {
             return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
@@ -1229,7 +1229,7 @@ where
     let right_root = right_scan.root();
     let pager = right_scan.pager();
 
-    left_scan.for_each(left_scratch, |left_rowid, left_row| {
+    left_scan.for_each_eager(left_scratch, |left_rowid, left_row| {
         let left_out = left_meta.output_row(left_row.values_raw());
         let Some(left_key_value) = left_meta.join_key(left_rowid, &left_row)? else {
             return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
@@ -1533,7 +1533,7 @@ where
         Ok(None::<()>)
     })?;
 
-    left_scan.for_each(left_scratch, |left_rowid, left_row| {
+    left_scan.for_each_eager(left_scratch, |left_rowid, left_row| {
         let left_out = left_meta.output_row(left_row.values_raw());
         let Some(left_key_value) = left_meta.join_key(left_rowid, &left_row)? else {
             return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
@@ -1652,14 +1652,14 @@ fn nested_loop_scan<F>(
 where
     F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
 {
-    left_scan.for_each(left_scratch, |left_rowid, left_row| {
+    left_scan.for_each_eager(left_scratch, |left_rowid, left_row| {
         let left_out = left_meta.output_row(left_row.values_raw());
         let Some(left_key_value) = left_meta.join_key(left_rowid, &left_row)? else {
             return emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb);
         };
         let mut matched = false;
 
-        right_scan.for_each(right_scratch, |right_rowid, right_row| {
+        right_scan.for_each_eager(right_scratch, |right_rowid, right_row| {
             let Some(right_key_value) = right_meta.join_key(right_rowid, &right_row)? else {
                 return Ok(());
             };
@@ -1751,17 +1751,40 @@ fn index_cols_to_indices(schema: &TableSchema, index_cols: &[String]) -> Option<
     Some(mapped)
 }
 
-fn row_text<'row>(row: table::RowView<'row>, idx: usize) -> Option<&'row str> {
-    match row.get(idx)? {
-        ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
-        _ => None,
+fn decode_column_value<'row>(
+    payload: table::PayloadRef<'row>,
+    col: u16,
+    scratch: &'row mut Vec<u8>,
+) -> Result<Option<ValueRef<'row>>> {
+    let Some(slot) = table::decode_record_column(payload, col, scratch)? else {
+        return Ok(None);
+    };
+    let scratch_bytes = scratch.as_slice();
+    let value = unsafe { slot.as_value_ref_with_scratch(scratch_bytes) };
+    Ok(Some(value))
+}
+
+fn decode_text_owned(
+    payload: table::PayloadRef<'_>,
+    col: u16,
+    scratch: &mut Vec<u8>,
+) -> Result<Option<String>> {
+    match decode_column_value(payload, col, scratch)? {
+        Some(ValueRef::Text(bytes)) => {
+            Ok(std::str::from_utf8(bytes).ok().map(|value| value.to_owned()))
+        }
+        _ => Ok(None),
     }
 }
 
-fn row_integer(row: table::RowView<'_>, idx: usize) -> Option<i64> {
-    match row.get(idx)? {
-        ValueRef::Integer(value) => Some(value),
-        _ => None,
+fn decode_integer(
+    payload: table::PayloadRef<'_>,
+    col: u16,
+    scratch: &mut Vec<u8>,
+) -> Result<Option<i64>> {
+    match decode_column_value(payload, col, scratch)? {
+        Some(ValueRef::Integer(value)) => Ok(Some(value)),
+        _ => Ok(None),
     }
 }
 
@@ -1793,36 +1816,32 @@ fn index_sql_is_unique(sql: &str) -> bool {
     false
 }
 
-fn find_table_info(
-    pager: &Pager,
-    table_root: PageId,
-    scratch: &mut table::RowScratch,
-) -> Result<Option<(String, String)>> {
+fn find_table_info(pager: &Pager, table_root: PageId) -> Result<Option<(String, String)>> {
     let target_root = table_root.into_inner() as i64;
-    table::scan_table_ref_until_with_scratch(pager, PageId::ROOT, scratch, |_, row| {
-        if row.len() < 5 {
-            return Ok(None);
-        }
-        let row_type = match row_text(row, 0) {
+    let mut stack = Vec::with_capacity(64);
+    let mut scratch = Vec::new();
+    table::scan_table_cells_with_scratch_and_stack_until(pager, PageId::ROOT, &mut stack, |cell| {
+        let payload = cell.payload();
+        let row_type = match decode_text_owned(payload, 0, &mut scratch)? {
             Some(value) => value,
             None => return Ok(None),
         };
         if !row_type.eq_ignore_ascii_case("table") {
             return Ok(None);
         }
-        let rootpage = match row_integer(row, 3) {
+        let rootpage = match decode_integer(payload, 3, &mut scratch)? {
             Some(value) => value,
             None => return Ok(None),
         };
         if rootpage != target_root {
             return Ok(None);
         }
-        let name = match row_text(row, 1) {
-            Some(value) => value.to_owned(),
+        let name = match decode_text_owned(payload, 1, &mut scratch)? {
+            Some(value) => value,
             None => return Ok(None),
         };
-        let sql = match row_text(row, 4) {
-            Some(value) => value.to_owned(),
+        let sql = match decode_text_owned(payload, 4, &mut scratch)? {
+            Some(value) => value,
             None => return Ok(None),
         };
         Ok(Some((name, sql)))
@@ -1834,8 +1853,7 @@ fn discover_index_for_join(
     table_root: PageId,
     join_col: u16,
 ) -> Result<Option<IndexInfo>> {
-    let mut scratch = table::RowScratch::with_capacity(8, table::DEFAULT_SPILL_CAPACITY);
-    let Some((table_name, table_sql)) = find_table_info(pager, table_root, &mut scratch)? else {
+    let Some((table_name, table_sql)) = find_table_info(pager, table_root)? else {
         return Ok(None);
     };
 
@@ -1853,30 +1871,35 @@ fn discover_index_for_join(
 
     let mut autoindexes = Vec::new();
     let mut best: Option<IndexInfo> = None;
-    let found =
-        table::scan_table_ref_until_with_scratch(pager, PageId::ROOT, &mut scratch, |_, row| {
-            if row.len() < 5 {
-                return Ok(None);
-            }
-            let row_type = match row_text(row, 0) {
+    let mut stack = Vec::with_capacity(64);
+    let mut scratch = Vec::new();
+    let found = table::scan_table_cells_with_scratch_and_stack_until(
+        pager,
+        PageId::ROOT,
+        &mut stack,
+        |cell| {
+            let payload = cell.payload();
+            let row_type = match decode_text_owned(payload, 0, &mut scratch)? {
                 Some(value) => value,
                 None => return Ok(None),
             };
             if !row_type.eq_ignore_ascii_case("index") {
                 return Ok(None);
             }
-            let tbl_name = match row_text(row, 2) {
+            let tbl_name = match decode_text_owned(payload, 2, &mut scratch)? {
                 Some(value) => value,
                 None => return Ok(None),
             };
             if !tbl_name.eq_ignore_ascii_case(&table_name) {
                 return Ok(None);
             }
-            let rootpage = match row_integer(row, 3).and_then(|value| u32::try_from(value).ok()) {
+            let rootpage = match decode_integer(payload, 3, &mut scratch)?
+                .and_then(|value| u32::try_from(value).ok())
+            {
                 Some(value) => value,
                 None => return Ok(None),
             };
-            match row.get(4) {
+            match decode_column_value(payload, 4, &mut scratch)? {
                 Some(ValueRef::Text(bytes)) => {
                     let sql = match std::str::from_utf8(bytes) {
                         Ok(value) => value,
@@ -1912,7 +1935,8 @@ fn discover_index_for_join(
                 _ => {}
             }
             Ok(None)
-        })?;
+        },
+    )?;
 
     if let Some(index) = found {
         return Ok(Some(index));
@@ -1932,8 +1956,7 @@ fn discover_index_cols_for_root(
     table_root: PageId,
     index_root: PageId,
 ) -> Result<Option<Vec<u16>>> {
-    let mut scratch = table::RowScratch::with_capacity(8, table::DEFAULT_SPILL_CAPACITY);
-    let Some((table_name, table_sql)) = find_table_info(pager, table_root, &mut scratch)? else {
+    let Some((table_name, table_sql)) = find_table_info(pager, table_root)? else {
         return Ok(None);
     };
 
@@ -1948,33 +1971,38 @@ fn discover_index_cols_for_root(
         Unsupported,
     }
 
-    let outcome =
-        table::scan_table_ref_until_with_scratch(pager, PageId::ROOT, &mut scratch, |_, row| {
-            if row.len() < 5 {
-                return Ok(None);
-            }
-            let row_type = match row_text(row, 0) {
+    let mut stack = Vec::with_capacity(64);
+    let mut scratch = Vec::new();
+    let outcome = table::scan_table_cells_with_scratch_and_stack_until(
+        pager,
+        PageId::ROOT,
+        &mut stack,
+        |cell| {
+            let payload = cell.payload();
+            let row_type = match decode_text_owned(payload, 0, &mut scratch)? {
                 Some(value) => value,
                 None => return Ok(None),
             };
             if !row_type.eq_ignore_ascii_case("index") {
                 return Ok(None);
             }
-            let tbl_name = match row_text(row, 2) {
+            let tbl_name = match decode_text_owned(payload, 2, &mut scratch)? {
                 Some(value) => value,
                 None => return Ok(None),
             };
             if !tbl_name.eq_ignore_ascii_case(&table_name) {
                 return Ok(None);
             }
-            let rootpage = match row_integer(row, 3).and_then(|value| u32::try_from(value).ok()) {
+            let rootpage = match decode_integer(payload, 3, &mut scratch)?
+                .and_then(|value| u32::try_from(value).ok())
+            {
                 Some(value) => value,
                 None => return Ok(None),
             };
             if PageId::new(rootpage) != index_root {
                 return Ok(None);
             }
-            match row.get(4) {
+            match decode_column_value(payload, 4, &mut scratch)? {
                 Some(ValueRef::Text(bytes)) => {
                     let sql = match std::str::from_utf8(bytes) {
                         Ok(value) => value,
@@ -1991,7 +2019,8 @@ fn discover_index_cols_for_root(
                 Some(ValueRef::Null) | None => Ok(Some(IndexColsOutcome::Autoindex)),
                 _ => Ok(Some(IndexColsOutcome::Unsupported)),
             }
-        })?;
+        },
+    )?;
 
     match outcome {
         Some(IndexColsOutcome::Explicit(cols)) => return Ok(Some(cols)),
