@@ -847,6 +847,7 @@ where
     Ok(None)
 }
 
+#[inline]
 fn read_table_cell_ref<'row>(
     pager: &'row Pager,
     page_id: PageId,
@@ -1954,12 +1955,14 @@ fn decode_value_ref_at_cursor(
     Ok(value)
 }
 
+#[inline]
 fn skip_value_at_cursor(serial_type: u64, cursor: &mut OverflowCursor<'_>) -> Result<()> {
     let len = serial_type_len(serial_type)?;
     cursor.skip(len)?;
     Ok(())
 }
 
+#[inline]
 fn read_signed_be_at(bytes: &[u8], pos: &mut usize, len: usize) -> Result<i64> {
     let p = *pos;
     let end = p + len;
@@ -2007,6 +2010,7 @@ fn read_signed_be_at(bytes: &[u8], pos: &mut usize, len: usize) -> Result<i64> {
     }
 }
 
+#[inline]
 fn read_u64_be_at(bytes: &[u8], pos: &mut usize) -> Result<u64> {
     let p = *pos;
     let end = p + 8;
@@ -2116,6 +2120,7 @@ unsafe fn read_varint_unchecked_at(bytes: &[u8], pos: &mut usize) -> u64 {
     (result << 8) | u64::from(byte)
 }
 
+#[inline]
 fn read_exact_bytes_at<'row>(bytes: &'row [u8], pos: &mut usize, len: usize) -> Result<&'row [u8]> {
     let start = *pos;
     let end = start + len;
@@ -2139,6 +2144,7 @@ struct BTreeHeader {
     right_most_child: Option<u32>,
 }
 
+#[inline]
 fn parse_header(page: &PageRef<'_>) -> Result<BTreeHeader> {
     let offset = page.offset();
     if offset >= page.usable_size() {
@@ -2187,6 +2193,7 @@ fn parse_header(page: &PageRef<'_>) -> Result<BTreeHeader> {
     Ok(BTreeHeader { kind, cell_count, cell_ptrs_start, right_most_child })
 }
 
+#[inline]
 fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &BTreeHeader) -> Result<&'a [u8]> {
     let cell_ptrs_len = header.cell_count as usize * 2;
     let cell_ptrs_end = header
@@ -2209,6 +2216,7 @@ fn cell_ptr_at(cell_ptrs: &[u8], idx: usize) -> Result<u16> {
     Ok(u16::from_be_bytes([cell_ptrs[offset], cell_ptrs[offset + 1]]))
 }
 
+#[inline]
 pub(crate) fn local_payload_len(usable_size: usize, payload_len: usize) -> Result<usize> {
     if payload_len == 0 {
         return Ok(0);

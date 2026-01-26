@@ -289,6 +289,7 @@ impl<'row> Row<'row> {
     }
 
     /// Number of columns in the projected row.
+    #[inline]
     pub fn len(&self) -> usize {
         self.proj_map.map_or(self.values.len(), |map| map.len())
     }
@@ -299,6 +300,7 @@ impl<'row> Row<'row> {
     }
 
     /// Return a value reference by column index.
+    #[inline]
     pub fn get(&self, i: usize) -> Option<ValueRef<'row>> {
         let idx = match self.proj_map {
             Some(map) => *map.get(i)?,
@@ -1265,6 +1267,7 @@ fn validate_columns(referenced: &[u16], column_count: usize) -> Option<table::Er
         .map(|&col| table::Error::InvalidColumnIndex { col, column_count })
 }
 
+#[inline]
 fn raw_to_ref<'row>(value: ValueSlot) -> ValueRef<'row> {
     // SAFETY: raw values point into the current row payload/overflow buffer and
     // are only materialized for the duration of the row callback.
@@ -1278,6 +1281,7 @@ fn raw_to_ref_with_scratch<'row>(value: ValueSlot, scratch_bytes: &'row [u8]) ->
     unsafe { value.as_value_ref_with_scratch(scratch_bytes) }
 }
 
+#[inline]
 fn value_kind(value: ValueRef<'_>) -> &'static str {
     match value {
         ValueRef::Null => "NULL",
@@ -1295,6 +1299,7 @@ enum Truth {
     Null,
 }
 
+#[inline]
 fn truth_and(left: Truth, right: Truth) -> Truth {
     match (left, right) {
         (Truth::False, _) | (_, Truth::False) => Truth::False,
@@ -1305,6 +1310,7 @@ fn truth_and(left: Truth, right: Truth) -> Truth {
     }
 }
 
+#[inline]
 fn truth_or(left: Truth, right: Truth) -> Truth {
     match (left, right) {
         (Truth::True, _) | (_, Truth::True) => Truth::True,
@@ -1315,6 +1321,7 @@ fn truth_or(left: Truth, right: Truth) -> Truth {
     }
 }
 
+#[inline]
 fn truth_not(value: Truth) -> Truth {
     match value {
         Truth::True => Truth::False,
@@ -1407,6 +1414,7 @@ fn eval_compiled_expr_inner(expr: &CompiledExpr, ctx: &EvalContext<'_>) -> table
     }
 }
 
+#[inline]
 fn eval_is_null(inner: &CompiledExpr, ctx: &EvalContext<'_>) -> table::Result<Truth> {
     match inner {
         CompiledExpr::Col { col, idx } => match ctx.value_by_idx(*idx, *col)? {
@@ -1423,6 +1431,7 @@ fn eval_is_null(inner: &CompiledExpr, ctx: &EvalContext<'_>) -> table::Result<Tr
     }
 }
 
+#[inline]
 fn eval_is_not_null(inner: &CompiledExpr, ctx: &EvalContext<'_>) -> table::Result<Truth> {
     match eval_is_null(inner, ctx)? {
         Truth::True => Ok(Truth::False),
@@ -1431,6 +1440,7 @@ fn eval_is_not_null(inner: &CompiledExpr, ctx: &EvalContext<'_>) -> table::Resul
     }
 }
 
+#[inline]
 fn eval_cmp(
     op: CmpOp,
     lhs: &CompiledExpr,
@@ -1449,6 +1459,7 @@ fn eval_cmp(
     })
 }
 
+#[inline]
 fn eval_operand<'row, 'expr>(
     expr: &'expr CompiledExpr,
     ctx: &EvalContext<'row>,
