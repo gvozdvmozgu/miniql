@@ -788,8 +788,7 @@ fn lookup_rowid_cell_cached<'row>(
     cache: &mut RowLocationCache,
 ) -> Result<Option<table::CellRef<'row>>> {
     if let Some(loc) = cache.get(rowid)
-        && let Ok(cell) =
-            table::read_table_cell_ref_from_bytes(pager, loc.page_id, loc.cell_offset)
+        && let Ok(cell) = table::read_table_cell_ref_from_bytes(pager, loc.page_id, loc.cell_offset)
         && cell.rowid() == rowid
     {
         return Ok(Some(cell));
