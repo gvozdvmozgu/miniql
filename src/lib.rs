@@ -18,4 +18,4 @@ pub use query::{
     Expr, OrderBy, OrderDir, PreparedScan, Row, Scan, ScanScratch, ValueLit, asc, col, desc,
     lit_bytes, lit_f64, lit_i64, lit_null,
 };
-pub use table::{CellRef, Error, PayloadRef, Result, RowView, ValueRef};
+pub use table::{CachedRowView, CellRef, Error, PayloadRef, Result, RowCache, RowView, ValueRef};

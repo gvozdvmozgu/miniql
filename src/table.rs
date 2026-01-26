@@ -350,6 +350,8 @@ impl fmt::Display for ValueRef<'_> {
 ///
 /// This is more efficient than decoding entire rows when you only need to
 /// access a subset of columns or just want to count rows without reading data.
+/// For repeated column access, use `RowView::cached` with `RowCache` to avoid
+/// re-scanning the header per column.
 #[derive(Clone, Copy)]
 pub struct RowView<'row> {
     payload: &'row [u8],
@@ -375,6 +377,17 @@ impl<'row> RowView<'row> {
 
         let serial_bytes = &payload[header_pos..header_len];
         Ok(Self { payload, header_len, serial_bytes })
+    }
+
+    /// Prepare a cached view for repeated column access without re-scanning
+    /// headers.
+    #[inline]
+    pub fn cached<'cache>(
+        &self,
+        cache: &'cache mut RowCache,
+    ) -> Result<CachedRowView<'row, 'cache>> {
+        cache.ensure(self)?;
+        Ok(CachedRowView { row: *self, cache })
     }
 
     /// Number of columns in the row.
@@ -430,6 +443,146 @@ impl<'row> RowView<'row> {
         }
 
         Ok(None)
+    }
+
+    /// Get an i64 value or return a type mismatch error.
+    #[inline]
+    pub fn get_i64(&self, col_idx: usize) -> Result<i64> {
+        match self.get(col_idx)? {
+            Some(ValueRef::Integer(v)) => Ok(v),
+            Some(other) => Err(Error::TypeMismatch {
+                col: col_idx,
+                expected: "INTEGER",
+                got: value_ref_kind(other),
+            }),
+            None => Err(Error::InvalidColumnIndex {
+                col: col_idx as u16,
+                column_count: self.column_count(),
+            }),
+        }
+    }
+
+    /// Get a text value or return a type mismatch error.
+    #[inline]
+    pub fn get_text(&self, col_idx: usize) -> Result<&'row str> {
+        match self.get(col_idx)? {
+            Some(ValueRef::Text(bytes)) => Ok(str::from_utf8(bytes)?),
+            Some(other) => Err(Error::TypeMismatch {
+                col: col_idx,
+                expected: "TEXT",
+                got: value_ref_kind(other),
+            }),
+            None => Err(Error::InvalidColumnIndex {
+                col: col_idx as u16,
+                column_count: self.column_count(),
+            }),
+        }
+    }
+
+    /// Get raw bytes (text or blob) or return a type mismatch error.
+    #[inline]
+    pub fn get_bytes(&self, col_idx: usize) -> Result<&'row [u8]> {
+        match self.get(col_idx)? {
+            Some(ValueRef::Text(bytes)) | Some(ValueRef::Blob(bytes)) => Ok(bytes),
+            Some(other) => Err(Error::TypeMismatch {
+                col: col_idx,
+                expected: "BYTES",
+                got: value_ref_kind(other),
+            }),
+            None => Err(Error::InvalidColumnIndex {
+                col: col_idx as u16,
+                column_count: self.column_count(),
+            }),
+        }
+    }
+}
+
+/// Cached header offsets/types for a row view.
+#[derive(Debug, Default)]
+pub struct RowCache {
+    serials: Vec<u64>,
+    offsets: Vec<u32>,
+    payload_ptr: *const u8,
+    payload_len: usize,
+}
+
+impl RowCache {
+    /// Create an empty row cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a row cache with column capacity.
+    pub fn with_capacity(cols: usize) -> Self {
+        Self {
+            serials: Vec::with_capacity(cols),
+            offsets: Vec::with_capacity(cols),
+            payload_ptr: ptr::null(),
+            payload_len: 0,
+        }
+    }
+
+    #[inline]
+    fn matches(&self, row: &RowView<'_>) -> bool {
+        self.payload_ptr == row.payload.as_ptr() && self.payload_len == row.payload.len()
+    }
+
+    #[inline]
+    fn ensure(&mut self, row: &RowView<'_>) -> Result<()> {
+        if self.matches(row) {
+            return Ok(());
+        }
+        self.fill(row)
+    }
+
+    fn fill(&mut self, row: &RowView<'_>) -> Result<()> {
+        self.serials.clear();
+        self.offsets.clear();
+
+        let mut serial_pos = 0usize;
+        let mut value_pos = row.header_len;
+        while serial_pos < row.serial_bytes.len() {
+            let b = unsafe { *row.serial_bytes.get_unchecked(serial_pos) };
+            let serial = if b < 0x80 {
+                serial_pos += 1;
+                b as u64
+            } else {
+                read_varint_at(row.serial_bytes, &mut serial_pos, "record header truncated")?
+            };
+
+            self.serials.push(serial);
+            self.offsets.push(value_pos as u32);
+            value_pos += serial_type_len_fast(serial);
+        }
+
+        self.payload_ptr = row.payload.as_ptr();
+        self.payload_len = row.payload.len();
+        Ok(())
+    }
+}
+
+/// Row view backed by a cached header for repeated column access.
+pub struct CachedRowView<'row, 'cache> {
+    row: RowView<'row>,
+    cache: &'cache RowCache,
+}
+
+impl<'row, 'cache> CachedRowView<'row, 'cache> {
+    /// Number of columns in the row.
+    #[inline]
+    pub fn column_count(&self) -> usize {
+        self.cache.serials.len()
+    }
+
+    /// Decode and return a single column value by index using cached offsets.
+    #[inline]
+    pub fn get(&self, col_idx: usize) -> Result<Option<ValueRef<'row>>> {
+        let serial = match self.cache.serials.get(col_idx) {
+            Some(serial) => *serial,
+            None => return Ok(None),
+        };
+        let offset = self.cache.offsets[col_idx] as usize;
+        Ok(Some(decode_value_ref_inline(serial, self.row.payload, offset)?))
     }
 
     /// Get an i64 value or return a type mismatch error.

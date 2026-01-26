@@ -561,7 +561,9 @@ impl<'db> Scan<'db> {
 
     /// Execute the scan and invoke `cb` for each row with on-demand decoding.
     ///
-    /// Values are decoded on-demand when `RowView::get()` is called.
+    /// Values are decoded on-demand when `RowView::get()` is called. For
+    /// repeated column access, use `RowView::cached` with `RowCache` to
+    /// avoid re-scanning headers.
     /// Supports filters, ORDER BY, and LIMIT.
     pub fn for_each<F>(self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
     where
@@ -703,8 +705,10 @@ impl<'db> PreparedScan<'db> {
 
     /// Execute the prepared scan with on-demand row decoding.
     ///
-    /// Values are decoded on-demand when `RowView::get()` is called.
-    /// This is more efficient when you only access a subset of columns.
+    /// Values are decoded on-demand when `RowView::get()` is called. For
+    /// repeated column access, use `RowView::cached` with `RowCache` to
+    /// avoid re-scanning headers. This is more efficient when you only
+    /// access a subset of columns.
     ///
     /// Supports filters, ORDER BY, and LIMIT. For filters and ORDER BY,
     /// only the required columns are decoded; the callback receives a

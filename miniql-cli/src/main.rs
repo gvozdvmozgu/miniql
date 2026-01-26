@@ -28,15 +28,17 @@ fn print_table(db: &Db, table_name: &str) -> Result<(), miniql::Error> {
     println!("table: {table_name} (root page {})", table.root().into_inner());
     let mut scan = table.scan().compile()?;
     let mut scratch = ScanScratch::with_capacity(8, 0);
+    let mut row_cache = miniql::RowCache::new();
     scan.for_each(&mut scratch, |rowid, row| {
-        print_row(rowid, row);
+        let cached = row.cached(&mut row_cache)?;
+        print_row(rowid, &cached);
         Ok(())
     })?;
 
     Ok(())
 }
 
-fn print_row(rowid: i64, row: miniql::RowView<'_>) {
+fn print_row(rowid: i64, row: &miniql::CachedRowView<'_, '_>) {
     print!("{:>6} |", rowid);
     for idx in 0..row.column_count() {
         match row.get(idx) {
