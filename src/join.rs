@@ -501,9 +501,11 @@ impl<'db> PreparedJoin<'db> {
             right_offsets,
             index_scratch,
             hash_state,
+            rowid_cache,
             right_nulls,
         ) = scratch.split_mut();
         let right_null_len = self.right_null_len;
+        rowid_cache.clear();
 
         match &self.plan {
             JoinPlan::IndexNestedLoop { index_root, index_key_col, index_cols } => {
@@ -521,6 +523,7 @@ impl<'db> PreparedJoin<'db> {
                     right_serials,
                     right_offsets,
                     index_scratch,
+                    rowid_cache,
                     right_nulls,
                     right_null_len,
                     cb,
@@ -540,6 +543,7 @@ impl<'db> PreparedJoin<'db> {
                 right_serials,
                 right_offsets,
                 index_scratch,
+                rowid_cache,
                 right_nulls,
                 right_null_len,
                 cb,
@@ -658,6 +662,48 @@ pub struct JoinedRow<'row> {
     pub right: Row<'row>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RowLocation {
+    page_id: PageId,
+    cell_offset: u16,
+}
+
+#[derive(Debug)]
+struct RowLocationCache {
+    entries: Vec<(i64, RowLocation)>,
+    next: usize,
+    capacity: usize,
+}
+
+impl RowLocationCache {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self { entries: Vec::with_capacity(capacity), next: 0, capacity }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.next = 0;
+    }
+
+    fn get(&self, rowid: i64) -> Option<RowLocation> {
+        self.entries.iter().find(|(id, _)| *id == rowid).map(|(_, loc)| *loc)
+    }
+
+    fn insert(&mut self, rowid: i64, loc: RowLocation) {
+        if let Some(entry) = self.entries.iter_mut().find(|(id, _)| *id == rowid) {
+            entry.1 = loc;
+            return;
+        }
+        if self.entries.len() < self.capacity {
+            self.entries.push((rowid, loc));
+        } else {
+            self.entries[self.next] = (rowid, loc);
+            self.next = (self.next + 1) % self.capacity;
+        }
+    }
+}
+
 /// Scratch buffers for join execution.
 #[derive(Debug)]
 pub struct JoinScratch {
@@ -669,6 +715,7 @@ pub struct JoinScratch {
     right_offsets: Vec<u32>,
     index: IndexScratch,
     hash: HashState,
+    rowid_cache: RowLocationCache,
     right_nulls: Vec<ValueSlot>,
 }
 
@@ -681,6 +728,7 @@ type JoinScratchParts<'a> = (
     &'a mut Vec<u32>,
     &'a mut IndexScratch,
     &'a mut HashState,
+    &'a mut RowLocationCache,
     &'a mut Vec<ValueSlot>,
 );
 
@@ -696,6 +744,7 @@ impl JoinScratch {
             right_offsets: Vec::new(),
             index: IndexScratch::new(),
             hash: HashState::new(),
+            rowid_cache: RowLocationCache::new(64),
             right_nulls: Vec::new(),
         }
     }
@@ -711,6 +760,7 @@ impl JoinScratch {
             right_offsets: Vec::with_capacity(right_values),
             index: IndexScratch::with_capacity(right_values, overflow),
             hash: HashState::with_capacity(right_values, overflow),
+            rowid_cache: RowLocationCache::new(64),
             right_nulls: Vec::with_capacity(right_values),
         }
     }
@@ -725,9 +775,35 @@ impl JoinScratch {
             &mut self.right_offsets,
             &mut self.index,
             &mut self.hash,
+            &mut self.rowid_cache,
             &mut self.right_nulls,
         )
     }
+}
+
+fn lookup_rowid_cell_cached<'row>(
+    pager: &'row Pager,
+    root: PageId,
+    rowid: i64,
+    cache: &mut RowLocationCache,
+) -> Result<Option<table::CellRef<'row>>> {
+    if let Some(loc) = cache.get(rowid)
+        && let Ok(cell) =
+            table::read_table_cell_ref_from_bytes(pager, loc.page_id, loc.cell_offset)
+        && cell.rowid() == rowid
+    {
+        return Ok(Some(cell));
+    }
+
+    if let Some(cell) = table::lookup_rowid_cell(pager, root, rowid)? {
+        cache.insert(
+            rowid,
+            RowLocation { page_id: cell.page_id(), cell_offset: cell.cell_offset() },
+        );
+        return Ok(Some(cell));
+    }
+
+    Ok(None)
 }
 
 impl Default for JoinScratch {
@@ -1015,6 +1091,7 @@ fn index_nested_loop<F>(
     right_serials: &mut Vec<u64>,
     right_offsets: &mut Vec<u32>,
     index_scratch: &mut IndexScratch,
+    rowid_cache: &mut RowLocationCache,
     right_nulls: &mut Vec<ValueSlot>,
     right_null_len: Option<usize>,
     cb: &mut F,
@@ -1075,7 +1152,8 @@ where
                 }
             } else {
                 let right_rowid = cursor.current_rowid()?;
-                if let Some(cell) = table::lookup_rowid_cell(pager, right_root, right_rowid)?
+                if let Some(cell) =
+                    lookup_rowid_cell_cached(pager, right_root, right_rowid, rowid_cache)?
                     && let Some(right_row) = right_scan.eval_payload(
                         cell.payload(),
                         right_values,
@@ -1126,6 +1204,7 @@ fn index_merge_join<F>(
     right_serials: &mut Vec<u64>,
     right_offsets: &mut Vec<u32>,
     index_scratch: &mut IndexScratch,
+    rowid_cache: &mut RowLocationCache,
     right_nulls: &mut Vec<ValueSlot>,
     right_null_len: Option<usize>,
     cb: &mut F,
@@ -1187,7 +1266,8 @@ where
                 }
             } else {
                 let right_rowid = cursor.current_rowid()?;
-                if let Some(cell) = table::lookup_rowid_cell(pager, right_root, right_rowid)?
+                if let Some(cell) =
+                    lookup_rowid_cell_cached(pager, right_root, right_rowid, rowid_cache)?
                     && let Some(right_row) = right_scan.eval_payload(
                         cell.payload(),
                         right_values,
