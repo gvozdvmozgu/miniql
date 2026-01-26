@@ -685,15 +685,58 @@ impl<'db> PreparedScan<'db> {
             if order_by.is_empty() {
                 self.order_by = Some(order_by);
             } else {
-                let result = self.for_each_ordered(scratch, order_by.as_ref(), &mut cb);
+                let result = match self.limit {
+                    Some(limit) => {
+                        self.for_each_ordered_limited(scratch, order_by.as_ref(), limit, &mut cb)
+                    }
+                    None => self.for_each_ordered_unlimited(scratch, order_by.as_ref(), &mut cb),
+                };
                 self.order_by = Some(order_by);
                 return result;
             }
         }
 
+        match self.limit {
+            Some(limit) => self.for_each_unordered_limited(scratch, limit, &mut cb),
+            None => self.for_each_unordered_unlimited(scratch, &mut cb),
+        }
+    }
+
+    fn for_each_unordered_unlimited<F>(
+        &mut self,
+        scratch: &mut ScanScratch,
+        cb: &mut F,
+    ) -> table::Result<()>
+    where
+        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+    {
         let pager = self.pager;
         let root = self.root;
-        let limit = self.limit;
+
+        let (values, bytes, serials, btree_stack) = scratch.split_mut();
+        table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
+            let rowid = cell.rowid();
+            let Some(row) = self.eval_payload(cell.payload(), values, bytes, serials)? else {
+                return Ok(());
+            };
+            cb(rowid, row)?;
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    fn for_each_unordered_limited<F>(
+        &mut self,
+        scratch: &mut ScanScratch,
+        limit: usize,
+        cb: &mut F,
+    ) -> table::Result<()>
+    where
+        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+    {
+        let pager = self.pager;
+        let root = self.root;
         let mut seen = 0usize;
 
         let (values, bytes, serials, btree_stack) = scratch.split_mut();
@@ -707,9 +750,7 @@ impl<'db> PreparedScan<'db> {
             cb(rowid, row)?;
             seen += 1;
 
-            if let Some(limit) = limit
-                && seen >= limit
-            {
+            if seen >= limit {
                 return Ok(Some(()));
             }
 
@@ -719,7 +760,7 @@ impl<'db> PreparedScan<'db> {
         Ok(())
     }
 
-    fn for_each_ordered<F>(
+    fn for_each_ordered_unlimited<F>(
         &mut self,
         scratch: &mut ScanScratch,
         order_by: &[OrderBy],
@@ -730,40 +771,126 @@ impl<'db> PreparedScan<'db> {
     {
         let pager = self.pager;
         let root = self.root;
-        let limit = self.limit;
 
         let (values, bytes, serials, btree_stack) = scratch.split_mut();
         let mut order_bytes = Vec::new();
         let key_arena = Bump::new();
         let mut seq = 0u64;
 
-        let mut heap = BinaryHeap::new();
         let mut entries = Vec::new();
+        let apply_filters = self.compiled_expr.is_some() || self.filter_fn.is_some();
 
-        table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
-            let rowid = cell.rowid();
-            let page_id = cell.page_id();
-            let cell_offset = cell.cell_offset();
-            let payload = cell.payload();
-            let Some(_row) = self.eval_payload(payload, values, bytes, serials)? else {
-                return Ok(());
-            };
-
-            let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
-            for order in order_by {
-                let Some(value) =
-                    table::decode_record_column(payload, order.col, &mut order_bytes)?
-                else {
-                    return Err(table::Error::Corrupted("ORDER BY column missing"));
+        if apply_filters {
+            table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
+                let rowid = cell.rowid();
+                let page_id = cell.page_id();
+                let cell_offset = cell.cell_offset();
+                let payload = cell.payload();
+                let Some(_row) = self.eval_payload(payload, values, bytes, serials)? else {
+                    return Ok(());
                 };
-                let value = stabilize_sort_key_value(value, order_bytes.as_slice(), &key_arena);
-                keys.push(SortKey { value, dir: order.dir });
+
+                let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
+                for order in order_by {
+                    let Some(value) =
+                        table::decode_record_column(payload, order.col, &mut order_bytes)?
+                    else {
+                        return Err(table::Error::Corrupted("ORDER BY column missing"));
+                    };
+                    let value = stabilize_sort_key_value(value, order_bytes.as_slice(), &key_arena);
+                    keys.push(SortKey { value, dir: order.dir });
+                }
+
+                entries.push(SortEntry { rowid, page_id, cell_offset, keys, seq });
+                seq = seq.wrapping_add(1);
+
+                Ok(())
+            })?;
+        } else {
+            table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
+                let rowid = cell.rowid();
+                let page_id = cell.page_id();
+                let cell_offset = cell.cell_offset();
+                let payload = cell.payload();
+
+                let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
+                for order in order_by {
+                    let Some(value) =
+                        table::decode_record_column(payload, order.col, &mut order_bytes)?
+                    else {
+                        return Err(table::Error::Corrupted("ORDER BY column missing"));
+                    };
+                    let value = stabilize_sort_key_value(value, order_bytes.as_slice(), &key_arena);
+                    keys.push(SortKey { value, dir: order.dir });
+                }
+
+                entries.push(SortEntry { rowid, page_id, cell_offset, keys, seq });
+                seq = seq.wrapping_add(1);
+
+                Ok(())
+            })?;
+        }
+
+        entries.sort();
+
+        for entry in entries {
+            let cell =
+                table::read_table_cell_ref_from_bytes(pager, entry.page_id, entry.cell_offset)?;
+            if let Some(row) =
+                self.eval_payload_with_filters(cell.payload(), values, bytes, serials, false)?
+            {
+                cb(entry.rowid, row)?;
             }
+        }
 
-            let entry = SortEntry { rowid, page_id, cell_offset, keys, seq };
-            seq = seq.wrapping_add(1);
+        Ok(())
+    }
 
-            if let Some(limit) = limit {
+    fn for_each_ordered_limited<F>(
+        &mut self,
+        scratch: &mut ScanScratch,
+        order_by: &[OrderBy],
+        limit: usize,
+        cb: &mut F,
+    ) -> table::Result<()>
+    where
+        F: for<'row> FnMut(i64, Row<'row>) -> table::Result<()>,
+    {
+        let pager = self.pager;
+        let root = self.root;
+
+        let (values, bytes, serials, btree_stack) = scratch.split_mut();
+        let mut order_bytes = Vec::new();
+        let key_arena = Bump::new();
+        let mut seq = 0u64;
+
+        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+        let apply_filters = self.compiled_expr.is_some() || self.filter_fn.is_some();
+
+        if apply_filters {
+            table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
+                let rowid = cell.rowid();
+                let page_id = cell.page_id();
+                let cell_offset = cell.cell_offset();
+                let payload = cell.payload();
+                let Some(_row) = self.eval_payload(payload, values, bytes, serials)? else {
+                    return Ok(());
+                };
+
+                let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
+                for order in order_by {
+                    let Some(value) =
+                        table::decode_record_column(payload, order.col, &mut order_bytes)?
+                    else {
+                        return Err(table::Error::Corrupted("ORDER BY column missing"));
+                    };
+                    let value = stabilize_sort_key_value(value, order_bytes.as_slice(), &key_arena);
+                    keys.push(SortKey { value, dir: order.dir });
+                }
+
+                let entry = SortEntry { rowid, page_id, cell_offset, keys, seq };
+                seq = seq.wrapping_add(1);
+
                 if heap.len() < limit {
                     heap.push(entry);
                 } else if let Some(top) = heap.peek()
@@ -772,14 +899,44 @@ impl<'db> PreparedScan<'db> {
                     heap.pop();
                     heap.push(entry);
                 }
-            } else {
-                entries.push(entry);
-            }
 
-            Ok(())
-        })?;
+                Ok(())
+            })?;
+        } else {
+            table::scan_table_cells_with_scratch_and_stack(pager, root, btree_stack, |cell| {
+                let rowid = cell.rowid();
+                let page_id = cell.page_id();
+                let cell_offset = cell.cell_offset();
+                let payload = cell.payload();
 
-        let mut rows = if limit.is_some() { heap.into_vec() } else { entries };
+                let mut keys = SmallVec::<[SortKey; 4]>::with_capacity(order_by.len());
+                for order in order_by {
+                    let Some(value) =
+                        table::decode_record_column(payload, order.col, &mut order_bytes)?
+                    else {
+                        return Err(table::Error::Corrupted("ORDER BY column missing"));
+                    };
+                    let value = stabilize_sort_key_value(value, order_bytes.as_slice(), &key_arena);
+                    keys.push(SortKey { value, dir: order.dir });
+                }
+
+                let entry = SortEntry { rowid, page_id, cell_offset, keys, seq };
+                seq = seq.wrapping_add(1);
+
+                if heap.len() < limit {
+                    heap.push(entry);
+                } else if let Some(top) = heap.peek()
+                    && entry.cmp(top) == Ordering::Less
+                {
+                    heap.pop();
+                    heap.push(entry);
+                }
+
+                Ok(())
+            })?;
+        }
+
+        let mut rows = heap.into_vec();
         rows.sort();
 
         for entry in rows {

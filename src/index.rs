@@ -124,11 +124,15 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                     let cell_count = header.cell_count as usize;
                     let mut lo = 0usize;
                     let mut hi = cell_count;
+                    let mut candidate_child: Option<PageId> = None;
 
                     while lo < hi {
                         let mid = (lo + hi) / 2;
                         let offset = cell_ptr_at(cell_ptrs, mid)?;
                         let cell = read_index_interior_cell(self.pager, &page, offset)?;
+                        let child = cell
+                            .child()
+                            .ok_or(table::Error::Corrupted("missing child pointer"))?;
                         let key = decode_key_from_payload(
                             self.key_col,
                             cell.payload(),
@@ -140,14 +144,13 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                             lo = mid + 1;
                         } else {
                             hi = mid;
+                            candidate_child = Some(child);
                         }
                     }
 
                     if lo < cell_count {
-                        let offset = cell_ptr_at(cell_ptrs, lo)?;
-                        let cell = read_index_interior_cell(self.pager, &page, offset)?;
-                        let child =
-                            cell.child().ok_or(table::Error::Corrupted("missing child pointer"))?;
+                        let child = candidate_child
+                            .ok_or(table::Error::Corrupted("missing child pointer"))?;
                         self.scratch.stack.push(StackEntry { page_id, child_slot: lo });
                         page_id = child;
                     } else {
@@ -215,12 +218,8 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         let cell_ptrs = cell_ptrs(&page, &header)?;
         let offset = cell_ptr_at(cell_ptrs, leaf.cell_index)?;
         let cell = read_index_leaf_cell(self.pager, &page, offset)?;
-        let Some(value) =
-            table::decode_record_column(cell.payload(), self.key_col, &mut self.scratch.bytes)?
-        else {
-            return Err(Error::IndexKeyNotComparable.into());
-        };
-        let key = unsafe { value.as_value_ref() };
+        let key =
+            decode_key_from_payload(self.key_col, cell.payload(), &mut self.scratch.bytes)?;
         if matches!(key, ValueRef::Real(value) if value.is_nan())
             || matches!(target, ValueRef::Real(value) if value.is_nan())
         {
@@ -487,7 +486,12 @@ fn decode_key_from_payload<'row>(
     payload: table::PayloadRef<'row>,
     bytes: &'row mut Vec<u8>,
 ) -> Result<ValueRef<'row>> {
-    let Some(raw) = table::decode_record_column(payload, key_col, bytes)? else {
+    let raw = if key_col == 0 {
+        table::decode_record_first_column(payload, bytes)?
+    } else {
+        table::decode_record_column(payload, key_col, bytes)?
+    };
+    let Some(raw) = raw else {
         return Err(Error::IndexKeyNotComparable.into());
     };
     Ok(unsafe { raw.as_value_ref() })

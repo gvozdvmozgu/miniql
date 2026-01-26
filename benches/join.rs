@@ -41,20 +41,22 @@ fn bench_join_inlj_hot(c: &mut Criterion) {
     let pager = open_pager("join.db");
     let (users_root, orders_root, index_root) = join_roots(&pager);
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
+    let mut prepared = Join::new(
+        JoinType::Inner,
+        Scan::table(&pager, users_root),
+        Scan::table(&pager, orders_root),
+    )
+    .on(JoinKey::RowId, JoinKey::Col(0))
+    .project_left([0])
+    .project_right([1])
+    .strategy(JoinStrategy::IndexNestedLoop { index_root, index_key_col: 0 })
+    .compile()
+    .expect("compile join");
 
     c.bench_function("join_inlj_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            Join::new(
-                JoinType::Inner,
-                Scan::table(&pager, users_root),
-                Scan::table(&pager, orders_root),
-            )
-            .on(JoinKey::RowId, JoinKey::Col(0))
-            .project_left([0])
-            .project_right([1])
-            .strategy(JoinStrategy::IndexNestedLoop { index_root, index_key_col: 0 })
-            .for_each(&mut scratch, |_jr| {
+            prepared.for_each(&mut scratch, |_jr| {
                 rows += 1;
                 Ok(())
             })
@@ -68,20 +70,22 @@ fn bench_join_hash_hot(c: &mut Criterion) {
     let pager = open_pager("join.db");
     let (users_root, orders_root, _index_root) = join_roots(&pager);
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
+    let mut prepared = Join::new(
+        JoinType::Inner,
+        Scan::table(&pager, users_root),
+        Scan::table(&pager, orders_root),
+    )
+    .on(JoinKey::RowId, JoinKey::Col(0))
+    .project_left([0])
+    .project_right([1])
+    .strategy(JoinStrategy::Hash)
+    .compile()
+    .expect("compile join");
 
     c.bench_function("join_hash_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
-            Join::new(
-                JoinType::Inner,
-                Scan::table(&pager, users_root),
-                Scan::table(&pager, orders_root),
-            )
-            .on(JoinKey::RowId, JoinKey::Col(0))
-            .project_left([0])
-            .project_right([1])
-            .strategy(JoinStrategy::Hash)
-            .for_each(&mut scratch, |_jr| {
+            prepared.for_each(&mut scratch, |_jr| {
                 rows += 1;
                 Ok(())
             })

@@ -1605,6 +1605,68 @@ pub(crate) fn decode_record_column(
     }
 }
 
+pub(crate) fn decode_record_first_column(
+    payload: PayloadRef<'_>,
+    bytes: &mut Vec<u8>,
+) -> Result<Option<ValueSlot>> {
+    match payload {
+        PayloadRef::Inline(bytes) => decode_record_first_column_bytes(bytes),
+        PayloadRef::Overflow(payload) => decode_record_first_column_overflow(&payload, bytes),
+    }
+}
+
+fn decode_record_first_column_bytes(payload: &[u8]) -> Result<Option<ValueSlot>> {
+    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let mut header_pos = 0usize;
+    let header_len = if first < 0x80 {
+        header_pos = 1;
+        first as usize
+    } else {
+        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+    };
+    if header_len < header_pos || header_len > payload.len() {
+        return Err(Error::Corrupted("invalid record header length"));
+    }
+    if header_pos >= header_len {
+        return Ok(None);
+    }
+
+    let serial = read_varint_at(payload, &mut header_pos, "record header truncated")?;
+    if header_pos > header_len {
+        return Err(Error::Corrupted("record header truncated"));
+    }
+
+    let mut value_pos = header_len;
+    let v = decode_value_ref_at(serial, payload, &mut value_pos)?;
+    Ok(Some(v))
+}
+
+fn decode_record_first_column_overflow(
+    payload: &OverflowPayload<'_>,
+    bytes: &mut Vec<u8>,
+) -> Result<Option<ValueSlot>> {
+    bytes.clear();
+
+    let mut serial_cursor = OverflowCursor::new(payload, 0)?;
+    let header_len = serial_cursor.read_varint("record header truncated")? as usize;
+    let header_pos = serial_cursor.position();
+    if header_len < header_pos || header_len > payload.total_len {
+        return Err(Error::Corrupted("invalid record header length"));
+    }
+    if header_pos >= header_len {
+        return Ok(None);
+    }
+
+    let serial = serial_cursor.read_varint("record header truncated")?;
+    if serial_cursor.position() > header_len {
+        return Err(Error::Corrupted("record header truncated"));
+    }
+
+    let mut value_cursor = OverflowCursor::new(payload, header_len)?;
+    let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, bytes)?;
+    Ok(Some(raw))
+}
+
 fn decode_record_column_bytes(payload: &[u8], col: u16) -> Result<Option<ValueSlot>> {
     let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
     let mut header_pos = 0usize;

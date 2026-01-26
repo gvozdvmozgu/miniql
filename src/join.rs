@@ -214,6 +214,7 @@ struct IndexInfo {
     root: PageId,
     key_col: u16,
     cols: Option<Vec<u16>>,
+    unique_by_key: bool,
 }
 
 impl<'db> Join<'db> {
@@ -364,11 +365,20 @@ impl<'db> Join<'db> {
                 if matches!(right_key, JoinKey::RowId) {
                     JoinPlan::RowIdNestedLoop
                 } else if let JoinKey::Col(col) = right_key {
+                    let prefer_hash = should_prefer_hash_join(&left_scan, &right_scan);
                     if let Some(index) =
                         discover_index_for_join(right_scan.pager(), right_scan.root(), col)?
                     {
                         let index_cols = index.cols.map(|cols| cols.into_boxed_slice());
-                        if matches!(left_key, JoinKey::RowId) && !left_has_order {
+                        if index.unique_by_key {
+                            JoinPlan::IndexNestedLoop {
+                                index_root: index.root,
+                                index_key_col: index.key_col,
+                                index_cols,
+                            }
+                        } else if prefer_hash {
+                            JoinPlan::HashJoin
+                        } else if matches!(left_key, JoinKey::RowId) && !left_has_order {
                             JoinPlan::IndexMerge {
                                 index_root: index.root,
                                 index_key_col: index.key_col,
@@ -1674,6 +1684,13 @@ fn hash_key_from_value<'row>(value: ValueRef<'row>) -> Result<Option<HashKeyRef<
     })
 }
 
+fn should_prefer_hash_join(left_scan: &PreparedScan<'_>, right_scan: &PreparedScan<'_>) -> bool {
+    let (Some(left_limit), Some(right_limit)) = (left_scan.limit(), right_scan.limit()) else {
+        return false;
+    };
+    left_limit >= right_limit.saturating_mul(4)
+}
+
 fn index_cols_to_indices(schema: &TableSchema, index_cols: &[String]) -> Option<Vec<u16>> {
     let mut mapped = Vec::with_capacity(index_cols.len());
     for col in index_cols {
@@ -1695,6 +1712,34 @@ fn row_integer(row: table::RowView<'_>, idx: usize) -> Option<i64> {
         ValueRef::Integer(value) => Some(value),
         _ => None,
     }
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn index_sql_is_unique(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if is_ident_start(bytes[i]) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ident_char(bytes[i]) {
+                i += 1;
+            }
+            if sql[start..i].eq_ignore_ascii_case("UNIQUE") {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn find_table_info(
@@ -1756,6 +1801,7 @@ fn discover_index_for_join(
     };
 
     let mut autoindexes = Vec::new();
+    let mut best: Option<IndexInfo> = None;
     let found =
         table::scan_table_ref_until_with_scratch(pager, PageId::ROOT, &mut scratch, |_, row| {
             if row.len() < 5 {
@@ -1788,15 +1834,25 @@ fn discover_index_for_join(
                     let Some(index_cols) = parse_index_columns(sql) else {
                         return Ok(None);
                     };
+                    let unique_by_key = index_sql_is_unique(sql)
+                        && index_cols.len() == 1
+                        && index_cols[0].eq_ignore_ascii_case(join_col_name);
                     let Some(index_cols) = index_cols_to_indices(&schema, &index_cols) else {
                         return Ok(None);
                     };
                     if index_cols.first().copied() == Some(join_col) {
-                        return Ok(Some(IndexInfo {
+                        let info = IndexInfo {
                             root: PageId::new(rootpage),
                             key_col: 0,
                             cols: Some(index_cols),
-                        }));
+                            unique_by_key,
+                        };
+                        if unique_by_key {
+                            return Ok(Some(info));
+                        }
+                        if best.is_none() {
+                            best = Some(info);
+                        }
                     }
                 }
                 Some(ValueRef::Null) | None => {
@@ -1811,7 +1867,13 @@ fn discover_index_for_join(
         return Ok(Some(index));
     }
 
-    discover_autoindex_for_join(pager, &autoindexes, &schema, join_col_name)
+    if let Some(auto) = discover_autoindex_for_join(pager, &autoindexes, &schema, join_col_name)?
+        && (auto.unique_by_key || best.is_none())
+    {
+        return Ok(Some(auto));
+    }
+
+    Ok(best)
 }
 
 fn discover_index_cols_for_root(
@@ -1933,7 +1995,13 @@ fn discover_autoindex_for_join(
         let Some(cols) = index_cols_to_indices(schema, constraints[0].0) else {
             return Ok(None);
         };
-        return Ok(Some(IndexInfo { root: autoindexes[0], key_col: 0, cols: Some(cols) }));
+        let unique_by_key = constraints[0].0.len() == 1;
+        return Ok(Some(IndexInfo {
+            root: autoindexes[0],
+            key_col: 0,
+            cols: Some(cols),
+            unique_by_key,
+        }));
     }
 
     let mut index_scratch = IndexScratch::new();
@@ -1952,7 +2020,12 @@ fn discover_autoindex_for_join(
         if roots.len() == 1
             && let Some(mapped) = index_cols_to_indices(schema, cols)
         {
-            matches.push(IndexInfo { root: roots[0], key_col: pos as u16, cols: Some(mapped) });
+            matches.push(IndexInfo {
+                root: roots[0],
+                key_col: pos as u16,
+                cols: Some(mapped),
+                unique_by_key: cols.len() == 1,
+            });
         }
     }
 
