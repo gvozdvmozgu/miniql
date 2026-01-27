@@ -1482,11 +1482,10 @@ impl<'db> PreparedAggregate<'db> {
         let mut groups: Vec<GroupState> = Vec::new();
         let mut group_map: FxHashMap<GroupKey, usize> = FxHashMap::default();
 
-        let group_by = self.group_by.clone();
+        let (scan, group_by, agg_template) = (&mut self.scan, &self.group_by, &self.agg_template);
         let group_len = group_by.len();
-        let agg_template = self.agg_template.clone();
 
-        self.scan.for_each_eager(scratch, |_, row| {
+        scan.for_each_eager(scratch, |_, row| {
             let group_idx = if group_len == 0 {
                 if groups.is_empty() {
                     groups.push(GroupState::new(Vec::new(), agg_template.clone()));
@@ -1494,7 +1493,7 @@ impl<'db> PreparedAggregate<'db> {
                 0
             } else {
                 let mut key_values = Vec::with_capacity(group_len);
-                for expr in &group_by {
+                for expr in group_by {
                     let value = eval_value_expr(expr, &row)?;
                     key_values.push(OwnedValue::from_eval_value(value));
                 }
@@ -1519,7 +1518,7 @@ impl<'db> PreparedAggregate<'db> {
         })?;
 
         if group_len == 0 && groups.is_empty() && self.has_agg {
-            groups.push(GroupState::new(Vec::new(), self.agg_template.clone()));
+            groups.push(GroupState::new(Vec::new(), agg_template.clone()));
         }
 
         let mut output_values: Vec<OwnedValue> = Vec::with_capacity(self.select.len());
