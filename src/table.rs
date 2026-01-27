@@ -17,6 +17,7 @@ pub enum Error {
     UnsupportedPageType(u8),
     UnsupportedSerialType(u64),
     Corrupted(&'static str),
+    Query(&'static str),
     InvalidColumnIndex { col: u16, column_count: usize },
     ScratchTooSmall { kind: &'static str, needed: usize, capacity: usize },
     TypeMismatch { col: usize, expected: &'static str, got: &'static str },
@@ -37,6 +38,7 @@ impl fmt::Display for Error {
                 write!(f, "Unsupported record serial type: {serial}")
             }
             Self::Corrupted(msg) => write!(f, "Corrupted table page: {msg}"),
+            Self::Query(msg) => write!(f, "Query error: {msg}"),
             Self::InvalidColumnIndex { col, column_count } => {
                 write!(f, "Invalid column index {col} (column count {column_count})")
             }

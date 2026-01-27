@@ -15,7 +15,8 @@ pub use join::{
 };
 pub use pager::PageId;
 pub use query::{
-    Expr, OrderBy, OrderDir, PreparedScan, Row, Scan, ScanScratch, ValueLit, asc, col, desc,
-    lit_bytes, lit_f64, lit_i64, lit_null,
+    AggExpr, Aggregate, Expr, OrderBy, OrderDir, PreparedAggregate, PreparedScan, Row, Scan,
+    ScanScratch, ValueLit, asc, avg, col, count, count_star, desc, group, lit_bytes, lit_f64,
+    lit_i64, lit_null, max, min, sum,
 };
 pub use table::{CachedRowView, CellRef, Error, PayloadRef, Result, RowCache, RowView, ValueRef};

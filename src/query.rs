@@ -1,8 +1,10 @@
 use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::hash::{Hash, Hasher};
 
 use bumpalo::Bump;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::pager::{PageId, Pager};
@@ -57,6 +59,98 @@ pub enum ValueLit {
     Integer(i64),
     Real(f64),
     Text(Vec<u8>),
+}
+
+/// Aggregate expression used in `Aggregate` projections.
+#[derive(Debug, Clone)]
+pub enum AggExpr {
+    /// Non-aggregate expression (must appear in GROUP BY).
+    Value(Expr),
+    /// COUNT(*)
+    CountStar,
+    /// COUNT(expr)
+    Count(Expr),
+    /// SUM(expr)
+    Sum(Expr),
+    /// AVG(expr)
+    Avg(Expr),
+    /// MIN(expr)
+    Min(Expr),
+    /// MAX(expr)
+    Max(Expr),
+}
+
+impl AggExpr {
+    /// Use a non-aggregate expression in the projection (must appear in GROUP
+    /// BY).
+    pub fn value(expr: Expr) -> Self {
+        Self::Value(expr)
+    }
+
+    /// COUNT(*)
+    pub fn count_star() -> Self {
+        Self::CountStar
+    }
+
+    /// COUNT(expr)
+    pub fn count(expr: Expr) -> Self {
+        Self::Count(expr)
+    }
+
+    /// SUM(expr)
+    pub fn sum(expr: Expr) -> Self {
+        Self::Sum(expr)
+    }
+
+    /// AVG(expr)
+    pub fn avg(expr: Expr) -> Self {
+        Self::Avg(expr)
+    }
+
+    /// MIN(expr)
+    pub fn min(expr: Expr) -> Self {
+        Self::Min(expr)
+    }
+
+    /// MAX(expr)
+    pub fn max(expr: Expr) -> Self {
+        Self::Max(expr)
+    }
+}
+
+/// Shorthand for `AggExpr::value`.
+pub fn group(expr: Expr) -> AggExpr {
+    AggExpr::value(expr)
+}
+
+/// Shorthand for `AggExpr::count_star`.
+pub fn count_star() -> AggExpr {
+    AggExpr::count_star()
+}
+
+/// Shorthand for `AggExpr::count`.
+pub fn count(expr: Expr) -> AggExpr {
+    AggExpr::count(expr)
+}
+
+/// Shorthand for `AggExpr::sum`.
+pub fn sum(expr: Expr) -> AggExpr {
+    AggExpr::sum(expr)
+}
+
+/// Shorthand for `AggExpr::avg`.
+pub fn avg(expr: Expr) -> AggExpr {
+    AggExpr::avg(expr)
+}
+
+/// Shorthand for `AggExpr::min`.
+pub fn min(expr: Expr) -> AggExpr {
+    AggExpr::min(expr)
+}
+
+/// Shorthand for `AggExpr::max`.
+pub fn max(expr: Expr) -> AggExpr {
+    AggExpr::max(expr)
 }
 
 /// Ordering direction for `ORDER BY`.
@@ -484,6 +578,11 @@ impl<'db> Scan<'db> {
     pub fn limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
         self
+    }
+
+    /// Build an aggregate query projection over this scan.
+    pub fn aggregate<const N: usize>(self, exprs: [AggExpr; N]) -> Aggregate<'db> {
+        Aggregate { scan: self, group_by: Vec::new(), select: exprs.to_vec(), having: None }
     }
 
     pub(crate) fn projection(&self) -> Option<&[u16]> {
@@ -1213,6 +1312,623 @@ impl<'db> PreparedScan<'db> {
         }
 
         Ok(())
+    }
+}
+
+/// Builder for aggregate queries over a scan.
+pub struct Aggregate<'db> {
+    scan: Scan<'db>,
+    group_by: Vec<Expr>,
+    select: Vec<AggExpr>,
+    having: Option<Expr>,
+}
+
+/// Compiled aggregate query ready for execution.
+pub struct PreparedAggregate<'db> {
+    scan: PreparedScan<'db>,
+    group_by: Vec<ValueExpr>,
+    select: Vec<SelectItemPlan>,
+    agg_template: Vec<AggState>,
+    having: Option<CompiledExpr>,
+    has_agg: bool,
+}
+
+impl<'db> Aggregate<'db> {
+    /// Apply GROUP BY expressions.
+    pub fn group_by<const N: usize>(mut self, exprs: [Expr; N]) -> Self {
+        self.group_by = exprs.to_vec();
+        self
+    }
+
+    /// Apply a HAVING predicate evaluated against the aggregate output row.
+    pub fn having(mut self, expr: Expr) -> Self {
+        self.having = Some(expr);
+        self
+    }
+
+    /// Compile the aggregate query into an executable plan.
+    pub fn compile(self) -> table::Result<PreparedAggregate<'db>> {
+        let Aggregate { scan, group_by, select, having } = self;
+
+        if select.is_empty() {
+            return Err(table::Error::Query("aggregate projection cannot be empty"));
+        }
+
+        let mut group_by_values = Vec::with_capacity(group_by.len());
+        for expr in &group_by {
+            group_by_values.push(parse_value_expr(expr)?);
+        }
+
+        let mut select_plan = Vec::with_capacity(select.len());
+        let mut agg_template = Vec::new();
+        let mut has_agg = false;
+
+        for expr in select {
+            match expr {
+                AggExpr::Value(inner) => {
+                    let value_expr = parse_value_expr(&inner)?;
+                    if group_by_values.is_empty() {
+                        return Err(table::Error::Query(
+                            "non-aggregate expression requires GROUP BY",
+                        ));
+                    }
+                    let Some(idx) = group_by_values.iter().position(|value| value == &value_expr)
+                    else {
+                        return Err(table::Error::Query(
+                            "non-aggregate expression must appear in GROUP BY",
+                        ));
+                    };
+                    select_plan.push(SelectItemPlan::GroupKey(idx));
+                }
+                AggExpr::CountStar => {
+                    has_agg = true;
+                    let idx = agg_template.len();
+                    agg_template.push(AggState::Count { expr: None, n: 0 });
+                    select_plan.push(SelectItemPlan::Agg(idx));
+                }
+                AggExpr::Count(inner) => {
+                    has_agg = true;
+                    let value_expr = parse_value_expr(&inner)?;
+                    let idx = agg_template.len();
+                    agg_template.push(AggState::Count { expr: Some(value_expr), n: 0 });
+                    select_plan.push(SelectItemPlan::Agg(idx));
+                }
+                AggExpr::Sum(inner) => {
+                    has_agg = true;
+                    let value_expr = parse_value_expr(&inner)?;
+                    let idx = agg_template.len();
+                    agg_template.push(AggState::Sum {
+                        expr: value_expr,
+                        count: 0,
+                        int_sum: 0,
+                        real_sum: 0.0,
+                        use_real: false,
+                    });
+                    select_plan.push(SelectItemPlan::Agg(idx));
+                }
+                AggExpr::Avg(inner) => {
+                    has_agg = true;
+                    let value_expr = parse_value_expr(&inner)?;
+                    let idx = agg_template.len();
+                    agg_template.push(AggState::Avg { expr: value_expr, count: 0, sum: 0.0 });
+                    select_plan.push(SelectItemPlan::Agg(idx));
+                }
+                AggExpr::Min(inner) => {
+                    has_agg = true;
+                    let value_expr = parse_value_expr(&inner)?;
+                    let idx = agg_template.len();
+                    agg_template.push(AggState::Min { expr: value_expr, value: None });
+                    select_plan.push(SelectItemPlan::Agg(idx));
+                }
+                AggExpr::Max(inner) => {
+                    has_agg = true;
+                    let value_expr = parse_value_expr(&inner)?;
+                    let idx = agg_template.len();
+                    agg_template.push(AggState::Max { expr: value_expr, value: None });
+                    select_plan.push(SelectItemPlan::Agg(idx));
+                }
+            }
+        }
+
+        if !has_agg && group_by_values.is_empty() {
+            return Err(table::Error::Query(
+                "aggregate query requires GROUP BY or aggregate functions",
+            ));
+        }
+
+        let having = if let Some(expr) = having {
+            let mut cols = SmallVec::<[u16; 8]>::new();
+            expr.collect_cols(&mut cols);
+            cols.sort_unstable();
+            cols.dedup();
+            if let Some(err) = validate_columns(&cols, select_plan.len()) {
+                return Err(err);
+            }
+            Some(compile_expr(&expr, None)?)
+        } else {
+            None
+        };
+
+        let scan = scan.with_projection_override(None);
+        let scan = scan.compile()?;
+
+        Ok(PreparedAggregate {
+            scan,
+            group_by: group_by_values,
+            select: select_plan,
+            agg_template,
+            having,
+            has_agg,
+        })
+    }
+
+    /// Execute the aggregate query and invoke `cb` for each output row.
+    pub fn for_each<F>(self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
+    where
+        F: for<'row> FnMut(Row<'row>) -> table::Result<()>,
+    {
+        let mut prepared = self.compile()?;
+        prepared.for_each(scratch, &mut cb)
+    }
+}
+
+impl<'db> PreparedAggregate<'db> {
+    /// Execute the prepared aggregate query and invoke `cb` for each output
+    /// row.
+    pub fn for_each<F>(&mut self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
+    where
+        F: for<'row> FnMut(Row<'row>) -> table::Result<()>,
+    {
+        let mut groups: Vec<GroupState> = Vec::new();
+        let mut group_map: FxHashMap<GroupKey, usize> = FxHashMap::default();
+
+        let group_by = self.group_by.clone();
+        let group_len = group_by.len();
+        let agg_template = self.agg_template.clone();
+
+        self.scan.for_each_eager(scratch, |_, row| {
+            let group_idx = if group_len == 0 {
+                if groups.is_empty() {
+                    groups.push(GroupState::new(Vec::new(), agg_template.clone()));
+                }
+                0
+            } else {
+                let mut key_values = Vec::with_capacity(group_len);
+                for expr in &group_by {
+                    let value = eval_value_expr(expr, &row)?;
+                    key_values.push(OwnedValue::from_eval_value(value));
+                }
+                let key = GroupKey(key_values);
+                if let Some(idx) = group_map.get(&key).copied() {
+                    idx
+                } else {
+                    let idx = groups.len();
+                    groups.push(GroupState::new(key.0.clone(), agg_template.clone()));
+                    group_map.insert(key, idx);
+                    idx
+                }
+            };
+
+            let group = groups
+                .get_mut(group_idx)
+                .ok_or(table::Error::Corrupted("aggregate group index out of bounds"))?;
+            for state in &mut group.aggs {
+                state.step(&row)?;
+            }
+            Ok(())
+        })?;
+
+        if group_len == 0 && groups.is_empty() && self.has_agg {
+            groups.push(GroupState::new(Vec::new(), self.agg_template.clone()));
+        }
+
+        let mut output_values: Vec<OwnedValue> = Vec::with_capacity(self.select.len());
+        let mut output_slots: Vec<ValueSlot> = Vec::with_capacity(self.select.len());
+
+        for group in &groups {
+            output_values.clear();
+            output_slots.clear();
+
+            for item in &self.select {
+                match item {
+                    SelectItemPlan::GroupKey(idx) => {
+                        let value = group.keys.get(*idx).cloned().ok_or(
+                            table::Error::Corrupted("aggregate group key index out of bounds"),
+                        )?;
+                        output_values.push(value);
+                    }
+                    SelectItemPlan::Agg(idx) => {
+                        let value = group
+                            .aggs
+                            .get(*idx)
+                            .ok_or(table::Error::Corrupted("aggregate state index out of bounds"))?
+                            .finalize();
+                        output_values.push(value);
+                    }
+                }
+            }
+
+            for value in &output_values {
+                output_slots.push(value.to_slot());
+            }
+
+            if let Some(expr) = self.having.as_ref()
+                && eval_compiled_expr(expr, output_slots.as_slice(), &[])? != Truth::True
+            {
+                continue;
+            }
+
+            let row = Row::from_raw(output_slots.as_slice(), None);
+            cb(row)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ValueExpr {
+    Col(u16),
+    Lit(ValueLit),
+}
+
+impl PartialEq for ValueExpr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Col(l), Self::Col(r)) => l == r,
+            (Self::Lit(l), Self::Lit(r)) => value_lit_eq(l, r),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ValueExpr {}
+
+fn value_lit_eq(left: &ValueLit, right: &ValueLit) -> bool {
+    match (left, right) {
+        (ValueLit::Null, ValueLit::Null) => true,
+        (ValueLit::Integer(l), ValueLit::Integer(r)) => l == r,
+        (ValueLit::Real(l), ValueLit::Real(r)) => {
+            if l.is_nan() && r.is_nan() {
+                true
+            } else {
+                l.to_bits() == r.to_bits()
+            }
+        }
+        (ValueLit::Text(l), ValueLit::Text(r)) => l == r,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SelectItemPlan {
+    GroupKey(usize),
+    Agg(usize),
+}
+
+#[derive(Clone, Debug)]
+enum AggState {
+    Count { expr: Option<ValueExpr>, n: i64 },
+    Sum { expr: ValueExpr, count: i64, int_sum: i64, real_sum: f64, use_real: bool },
+    Avg { expr: ValueExpr, count: i64, sum: f64 },
+    Min { expr: ValueExpr, value: Option<OwnedValue> },
+    Max { expr: ValueExpr, value: Option<OwnedValue> },
+}
+
+impl AggState {
+    fn step<'row>(&mut self, row: &Row<'row>) -> table::Result<()> {
+        match self {
+            Self::Count { expr, n } => {
+                if let Some(expr) = expr {
+                    let value = eval_value_expr(expr, row)?;
+                    if !value.is_null() {
+                        *n += 1;
+                    }
+                } else {
+                    *n += 1;
+                }
+            }
+            Self::Sum { expr, count, int_sum, real_sum, use_real } => {
+                let value = eval_value_expr(expr, row)?;
+                let Some(num) = numeric_value_from_eval(value) else {
+                    return Ok(());
+                };
+                *count += 1;
+                match num {
+                    NumericValue::Integer(value) => {
+                        if *use_real {
+                            *real_sum += value as f64;
+                        } else if let Some(sum) = int_sum.checked_add(value) {
+                            *int_sum = sum;
+                        } else {
+                            *use_real = true;
+                            *real_sum = (*int_sum as f64) + (value as f64);
+                        }
+                    }
+                    NumericValue::Real(value) => {
+                        if !*use_real {
+                            *use_real = true;
+                            *real_sum = *int_sum as f64;
+                        }
+                        *real_sum += value;
+                    }
+                }
+            }
+            Self::Avg { expr, count, sum } => {
+                let value = eval_value_expr(expr, row)?;
+                let Some(num) = numeric_value_from_eval(value) else {
+                    return Ok(());
+                };
+                *count += 1;
+                *sum += num.as_f64();
+            }
+            Self::Min { expr, value } => {
+                let current = eval_value_expr(expr, row)?;
+                if current.is_null() {
+                    return Ok(());
+                }
+                let owned = OwnedValue::from_eval_value(current);
+                let should_replace = match value.as_ref() {
+                    None => true,
+                    Some(existing) => {
+                        compare_value_refs(owned.as_value_ref(), existing.as_value_ref())
+                            == Ordering::Less
+                    }
+                };
+                if should_replace {
+                    *value = Some(owned);
+                }
+            }
+            Self::Max { expr, value } => {
+                let current = eval_value_expr(expr, row)?;
+                if current.is_null() {
+                    return Ok(());
+                }
+                let owned = OwnedValue::from_eval_value(current);
+                let should_replace = match value.as_ref() {
+                    None => true,
+                    Some(existing) => {
+                        compare_value_refs(owned.as_value_ref(), existing.as_value_ref())
+                            == Ordering::Greater
+                    }
+                };
+                if should_replace {
+                    *value = Some(owned);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(&self) -> OwnedValue {
+        match self {
+            Self::Count { n, .. } => OwnedValue::Integer(*n),
+            Self::Sum { count, int_sum, real_sum, use_real, .. } => {
+                if *count == 0 {
+                    OwnedValue::Null
+                } else if *use_real {
+                    OwnedValue::Real(*real_sum)
+                } else {
+                    OwnedValue::Integer(*int_sum)
+                }
+            }
+            Self::Avg { count, sum, .. } => {
+                if *count == 0 {
+                    OwnedValue::Null
+                } else {
+                    OwnedValue::Real(*sum / (*count as f64))
+                }
+            }
+            Self::Min { value, .. } | Self::Max { value, .. } => {
+                value.clone().unwrap_or(OwnedValue::Null)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GroupState {
+    keys: Vec<OwnedValue>,
+    aggs: Vec<AggState>,
+}
+
+impl GroupState {
+    fn new(keys: Vec<OwnedValue>, aggs: Vec<AggState>) -> Self {
+        Self { keys, aggs }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GroupKey(Vec<OwnedValue>);
+
+impl PartialEq for GroupKey {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        self.0.iter().zip(other.0.iter()).all(|(left, right)| {
+            compare_value_refs(left.as_value_ref(), right.as_value_ref()) == Ordering::Equal
+        })
+    }
+}
+
+impl Eq for GroupKey {}
+
+impl Hash for GroupKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for value in &self.0 {
+            hash_owned_value(value, state);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum OwnedValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+impl OwnedValue {
+    fn from_value_ref(value: ValueRef<'_>) -> Self {
+        match value {
+            ValueRef::Null => Self::Null,
+            ValueRef::Integer(value) => Self::Integer(value),
+            ValueRef::Real(value) => Self::Real(value),
+            ValueRef::Text(bytes) => Self::Text(bytes.to_vec()),
+            ValueRef::Blob(bytes) => Self::Blob(bytes.to_vec()),
+        }
+    }
+
+    fn from_lit(lit: &ValueLit) -> Self {
+        match lit {
+            ValueLit::Null => Self::Null,
+            ValueLit::Integer(value) => Self::Integer(*value),
+            ValueLit::Real(value) => Self::Real(*value),
+            ValueLit::Text(bytes) => Self::Text(bytes.clone()),
+        }
+    }
+
+    fn from_eval_value(value: EvalValue<'_, '_>) -> Self {
+        match value {
+            EvalValue::Value(value) => Self::from_value_ref(value),
+            EvalValue::Lit(lit) => Self::from_lit(lit),
+        }
+    }
+
+    fn as_value_ref(&self) -> ValueRef<'_> {
+        match self {
+            Self::Null => ValueRef::Null,
+            Self::Integer(value) => ValueRef::Integer(*value),
+            Self::Real(value) => ValueRef::Real(*value),
+            Self::Text(bytes) => ValueRef::Text(bytes),
+            Self::Blob(bytes) => ValueRef::Blob(bytes),
+        }
+    }
+
+    fn to_slot(&self) -> ValueSlot {
+        match self {
+            Self::Null => ValueSlot::Null,
+            Self::Integer(value) => ValueSlot::Integer(*value),
+            Self::Real(value) => ValueSlot::Real(*value),
+            Self::Text(bytes) => {
+                ValueSlot::Text(BytesSpan::Mmap(RawBytes::from_slice(bytes.as_slice())))
+            }
+            Self::Blob(bytes) => {
+                ValueSlot::Blob(BytesSpan::Mmap(RawBytes::from_slice(bytes.as_slice())))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NumericValue {
+    Integer(i64),
+    Real(f64),
+}
+
+impl NumericValue {
+    fn as_f64(self) -> f64 {
+        match self {
+            Self::Integer(value) => value as f64,
+            Self::Real(value) => value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EvalValue<'row, 'expr> {
+    Value(ValueRef<'row>),
+    Lit(&'expr ValueLit),
+}
+
+impl<'row, 'expr> EvalValue<'row, 'expr> {
+    fn is_null(&self) -> bool {
+        matches!(self, Self::Value(ValueRef::Null) | Self::Lit(ValueLit::Null))
+    }
+}
+
+fn numeric_value(value: ValueRef<'_>) -> Option<NumericValue> {
+    match value {
+        ValueRef::Integer(value) => Some(NumericValue::Integer(value)),
+        ValueRef::Real(value) => Some(NumericValue::Real(value)),
+        _ => None,
+    }
+}
+
+fn numeric_value_from_eval(value: EvalValue<'_, '_>) -> Option<NumericValue> {
+    match value {
+        EvalValue::Value(value) => numeric_value(value),
+        EvalValue::Lit(lit) => match lit {
+            ValueLit::Integer(value) => Some(NumericValue::Integer(*value)),
+            ValueLit::Real(value) => Some(NumericValue::Real(*value)),
+            _ => None,
+        },
+    }
+}
+
+fn hash_owned_value<H: Hasher>(value: &OwnedValue, state: &mut H) {
+    match value {
+        OwnedValue::Null => {
+            0u8.hash(state);
+        }
+        OwnedValue::Integer(value) => {
+            1u8.hash(state);
+            hash_numeric(*value as f64, state);
+        }
+        OwnedValue::Real(value) => {
+            1u8.hash(state);
+            hash_numeric(*value, state);
+        }
+        OwnedValue::Text(bytes) => {
+            2u8.hash(state);
+            bytes.hash(state);
+        }
+        OwnedValue::Blob(bytes) => {
+            3u8.hash(state);
+            bytes.hash(state);
+        }
+    }
+}
+
+fn hash_numeric<H: Hasher>(value: f64, state: &mut H) {
+    let normalized = if value.is_nan() {
+        f64::NAN
+    } else if value == 0.0 {
+        0.0
+    } else {
+        value
+    };
+    normalized.to_bits().hash(state);
+}
+
+fn parse_value_expr(expr: &Expr) -> table::Result<ValueExpr> {
+    match expr {
+        Expr::Col(col) => Ok(ValueExpr::Col(*col)),
+        Expr::Lit(lit) => Ok(ValueExpr::Lit(lit.clone())),
+        _ => Err(table::Error::Query(
+            "aggregate expressions support only column and literal operands",
+        )),
+    }
+}
+
+fn eval_value_expr<'row, 'expr>(
+    expr: &'expr ValueExpr,
+    row: &Row<'row>,
+) -> table::Result<EvalValue<'row, 'expr>> {
+    match expr {
+        ValueExpr::Col(col) => row_value(row, *col).map(EvalValue::Value),
+        ValueExpr::Lit(lit) => Ok(EvalValue::Lit(lit)),
+    }
+}
+
+fn row_value<'row>(row: &Row<'row>, col: u16) -> table::Result<ValueRef<'row>> {
+    let idx = col as usize;
+    match row.get(idx) {
+        Some(value) => Ok(value),
+        None => Err(table::Error::InvalidColumnIndex { col, column_count: row.len() }),
     }
 }
 
