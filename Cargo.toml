@@ -61,5 +61,10 @@ name = "join"
 harness = false
 
 [[bench]]
+name = "join_sort_merge"
+harness = false
+
+
+[[bench]]
 name = "aggregate"
 harness = false

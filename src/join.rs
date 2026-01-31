@@ -11,7 +11,7 @@ use crate::index::{self, IndexCursor, IndexScratch};
 use crate::pager::{PageId, Pager};
 use crate::query::{OrderDir, PreparedScan, Row, Scan, ScanScratch};
 use crate::schema::{TableSchema, parse_index_columns, parse_table_schema};
-use crate::table::{self, BytesSpan, RawBytes, ValueRef, ValueSlot};
+use crate::table::{self, ValueRef, ValueSlot};
 
 /// Result type for join operations.
 pub type Result<T> = table::Result<T>;
@@ -606,16 +606,15 @@ impl<'db> PreparedJoin<'db> {
         let mut seq = 0u64;
 
         self.for_each_plan(scratch, &mut |jr| {
-            let left_values: Vec<OwnedValue> =
-                jr.left.values_raw().iter().copied().map(owned_value_from_slot).collect();
-            let right_values: Vec<OwnedValue> =
-                jr.right.values_raw().iter().copied().map(owned_value_from_slot).collect();
+            let left_values = jr.left.values_raw();
+            let right_values = jr.right.values_raw();
 
             for order in order_by {
                 let len = match order.side {
                     JoinSide::Left => left_values.len(),
                     JoinSide::Right => right_values.len(),
                 };
+
                 if order.idx >= len {
                     return Err(Error::InvalidOrderByColumn.into());
                 }
@@ -624,8 +623,8 @@ impl<'db> PreparedJoin<'db> {
             entries.push(JoinSortEntry {
                 left_rowid: jr.left_rowid,
                 right_rowid: jr.right_rowid,
-                left_values,
-                right_values,
+                left_values: left_values.to_vec(),
+                right_values: right_values.to_vec(),
                 seq,
             });
             seq = seq.wrapping_add(1);
@@ -634,14 +633,9 @@ impl<'db> PreparedJoin<'db> {
 
         entries.sort_by(|left, right| compare_join_entries(left, right, order_by));
 
-        let mut left_slots = Vec::new();
-        let mut right_slots = Vec::new();
-
         for entry in entries {
-            build_slots_from_owned(&entry.left_values, &mut left_slots);
-            build_slots_from_owned(&entry.right_values, &mut right_slots);
-            let left_row = self.left_meta.output_row(&left_slots);
-            let right_row = self.right_meta.output_row(&right_slots);
+            let left_row = self.left_meta.output_row(&entry.left_values);
+            let right_row = self.right_meta.output_row(&entry.right_values);
             cb(JoinedRow {
                 left_rowid: entry.left_rowid,
                 right_rowid: entry.right_rowid,
@@ -852,20 +846,11 @@ struct ResolvedOrderBy {
 }
 
 #[derive(Clone, Debug)]
-enum OwnedValue {
-    Null,
-    Integer(i64),
-    Real(f64),
-    Text(Vec<u8>),
-    Blob(Vec<u8>),
-}
-
-#[derive(Clone, Debug)]
 struct JoinSortEntry {
     left_rowid: i64,
     right_rowid: i64,
-    left_values: Vec<OwnedValue>,
-    right_values: Vec<OwnedValue>,
+    left_values: Vec<ValueSlot>,
+    right_values: Vec<ValueSlot>,
     seq: u64,
 }
 
@@ -975,35 +960,6 @@ fn resolve_order_by(
     Ok(Some(resolved.into_boxed_slice()))
 }
 
-fn owned_value_from_slot(slot: ValueSlot) -> OwnedValue {
-    match unsafe { slot.as_value_ref() } {
-        ValueRef::Null => OwnedValue::Null,
-        ValueRef::Integer(value) => OwnedValue::Integer(value),
-        ValueRef::Real(value) => OwnedValue::Real(value),
-        ValueRef::Text(bytes) => OwnedValue::Text(bytes.to_vec()),
-        ValueRef::Blob(bytes) => OwnedValue::Blob(bytes.to_vec()),
-    }
-}
-
-fn build_slots_from_owned(values: &[OwnedValue], out: &mut Vec<ValueSlot>) {
-    out.clear();
-    out.reserve(values.len());
-    for value in values {
-        let slot = match value {
-            OwnedValue::Null => ValueSlot::Null,
-            OwnedValue::Integer(value) => ValueSlot::Integer(*value),
-            OwnedValue::Real(value) => ValueSlot::Real(*value),
-            OwnedValue::Text(bytes) => {
-                ValueSlot::Text(BytesSpan::Scratch(RawBytes::from_slice(bytes)))
-            }
-            OwnedValue::Blob(bytes) => {
-                ValueSlot::Blob(BytesSpan::Scratch(RawBytes::from_slice(bytes)))
-            }
-        };
-        out.push(slot);
-    }
-}
-
 fn compare_join_entries(
     left: &JoinSortEntry,
     right: &JoinSortEntry,
@@ -1014,7 +970,7 @@ fn compare_join_entries(
             JoinSide::Left => (&left.left_values[order.idx], &right.left_values[order.idx]),
             JoinSide::Right => (&left.right_values[order.idx], &right.right_values[order.idx]),
         };
-        let mut cmp = compare_owned_values(left_value, right_value);
+        let mut cmp = compare_value_slots(*left_value, *right_value);
         if matches!(order.dir, OrderDir::Desc) {
             cmp = cmp.reverse();
         }
@@ -1025,12 +981,20 @@ fn compare_join_entries(
     left.seq.cmp(&right.seq)
 }
 
-fn compare_owned_values(left: &OwnedValue, right: &OwnedValue) -> std::cmp::Ordering {
-    let rank = |value: &OwnedValue| match value {
-        OwnedValue::Null => 0u8,
-        OwnedValue::Integer(_) | OwnedValue::Real(_) => 1u8,
-        OwnedValue::Text(_) => 2u8,
-        OwnedValue::Blob(_) => 3u8,
+fn compare_value_slots(left: ValueSlot, right: ValueSlot) -> std::cmp::Ordering {
+    // SAFETY: We are only comparing values that we own or that are in the arena,
+    // so it is safe to dereference them for comparison.
+    let left_ref = unsafe { left.as_value_ref() };
+    let right_ref = unsafe { right.as_value_ref() };
+    compare_value_refs(left_ref, right_ref)
+}
+
+fn compare_value_refs(left: ValueRef<'_>, right: ValueRef<'_>) -> std::cmp::Ordering {
+    let rank = |value: ValueRef<'_>| match value {
+        ValueRef::Null => 0u8,
+        ValueRef::Integer(_) | ValueRef::Real(_) => 1u8,
+        ValueRef::Text(_) => 2u8,
+        ValueRef::Blob(_) => 3u8,
     };
 
     let left_rank = rank(left);
@@ -1040,13 +1004,13 @@ fn compare_owned_values(left: &OwnedValue, right: &OwnedValue) -> std::cmp::Orde
     }
 
     match (left, right) {
-        (OwnedValue::Null, OwnedValue::Null) => std::cmp::Ordering::Equal,
-        (OwnedValue::Integer(l), OwnedValue::Integer(r)) => l.cmp(r),
-        (OwnedValue::Integer(l), OwnedValue::Real(r)) => cmp_f64_total(*l as f64, *r),
-        (OwnedValue::Real(l), OwnedValue::Integer(r)) => cmp_f64_total(*l, *r as f64),
-        (OwnedValue::Real(l), OwnedValue::Real(r)) => cmp_f64_total(*l, *r),
-        (OwnedValue::Text(l), OwnedValue::Text(r)) => l.cmp(r),
-        (OwnedValue::Blob(l), OwnedValue::Blob(r)) => l.cmp(r),
+        (ValueRef::Null, ValueRef::Null) => std::cmp::Ordering::Equal,
+        (ValueRef::Integer(l), ValueRef::Integer(r)) => l.cmp(&r),
+        (ValueRef::Integer(l), ValueRef::Real(r)) => cmp_f64_total(l as f64, r),
+        (ValueRef::Real(l), ValueRef::Integer(r)) => cmp_f64_total(l, r as f64),
+        (ValueRef::Real(l), ValueRef::Real(r)) => cmp_f64_total(l, r),
+        (ValueRef::Text(l), ValueRef::Text(r)) => l.cmp(r),
+        (ValueRef::Blob(l), ValueRef::Blob(r)) => l.cmp(r),
         _ => std::cmp::Ordering::Equal,
     }
 }
