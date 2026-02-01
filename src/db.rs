@@ -1,7 +1,7 @@
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::OnceLock;
 
 use crate::pager::{PageId, Pager};
 use crate::query::{Scan, ScanScratch};
@@ -12,7 +12,7 @@ use crate::table::ValueRef;
 /// Read-only handle to a SQLite database file.
 pub struct Db {
     pager: Pager,
-    schema: OnceLock<SchemaCache>,
+    schema: OnceCell<SchemaCache>,
 }
 
 #[derive(Clone)]
@@ -109,7 +109,7 @@ impl Db {
         let file =
             File::open(path).map_err(|err| table::Error::Pager(crate::pager::Error::Io(err)))?;
         let pager = Pager::new(file)?;
-        Ok(Self { pager, schema: OnceLock::new() })
+        Ok(Self { pager, schema: OnceCell::new() })
     }
 
     /// Look up a table by name using `sqlite_schema`.
