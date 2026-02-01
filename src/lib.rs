@@ -5,7 +5,12 @@ pub mod pager;
 pub mod query;
 pub mod table;
 
+mod btree;
+mod compare;
 pub mod db;
+mod error;
+mod ident;
+pub mod introspect;
 mod schema;
 
 pub use db::{CellScan, Db, Index, Table};

@@ -1,8 +1,9 @@
 use std::marker::PhantomData;
 use std::{fmt, mem, ptr, str};
 
+use crate::btree::{self, BTreeKind};
 use crate::decoder::Decoder;
-use crate::join::JoinError;
+use crate::error::JoinError;
 use crate::pager::{PageId, PageRef, Pager};
 
 /// Result type for table operations.
@@ -1703,13 +1704,13 @@ where
         }
 
         let page = pager.page(page_id)?;
-        let header = parse_header(&page)?;
-        let cell_ptrs = cell_ptrs(&page, &header)?;
+        let header = btree::parse_table_header(&page)?;
+        let cell_ptrs = btree::cell_ptrs(&page, &header)?;
 
         match header.kind {
             BTreeKind::TableLeaf => {
                 for idx in 0..header.cell_count as usize {
-                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
                     let (rowid, payload) = read_scan_cell(pager, &page, offset)?;
                     match payload {
                         PayloadRef::Inline(bytes) => {
@@ -1733,7 +1734,7 @@ where
 
                 let page_len = page.usable_bytes().len();
                 for idx in (0..header.cell_count as usize).rev() {
-                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
                     if offset as usize >= page_len {
                         return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
                     }
@@ -1747,6 +1748,9 @@ where
                     let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
                     stack.push(child);
                 }
+            }
+            BTreeKind::IndexLeaf | BTreeKind::IndexInterior => {
+                unreachable!("index btree header returned for table page")
             }
         }
     }
@@ -1840,8 +1844,8 @@ pub fn lookup_rowid_cell<'row>(
         }
 
         let page = pager.page(page_id)?;
-        let header = parse_header(&page)?;
-        let cell_ptrs = cell_ptrs(&page, &header)?;
+        let header = btree::parse_table_header(&page)?;
+        let cell_ptrs = btree::cell_ptrs(&page, &header)?;
 
         match header.kind {
             BTreeKind::TableLeaf => {
@@ -1851,7 +1855,7 @@ pub fn lookup_rowid_cell<'row>(
 
                 while lo < hi {
                     let mid = (lo + hi) / 2;
-                    let offset = cell_ptr_at(cell_ptrs, mid)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, mid)?;
                     let rowid = read_table_leaf_rowid(&page, offset)?;
                     if rowid < target_rowid {
                         lo = mid + 1;
@@ -1861,7 +1865,7 @@ pub fn lookup_rowid_cell<'row>(
                 }
 
                 if lo < cell_count {
-                    let offset = cell_ptr_at(cell_ptrs, lo)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, lo)?;
                     let rowid = read_table_leaf_rowid(&page, offset)?;
                     if rowid == target_rowid {
                         let cell = read_table_cell_ref_from_bytes(pager, page_id, offset)?;
@@ -1878,7 +1882,7 @@ pub fn lookup_rowid_cell<'row>(
 
                 while lo < hi {
                     let mid = (lo + hi) / 2;
-                    let offset = cell_ptr_at(cell_ptrs, mid)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, mid)?;
                     let (_child, key) = read_table_interior_cell(&page, offset)?;
                     if target_rowid <= key {
                         hi = mid;
@@ -1888,7 +1892,7 @@ pub fn lookup_rowid_cell<'row>(
                 }
 
                 if lo < cell_count {
-                    let offset = cell_ptr_at(cell_ptrs, lo)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, lo)?;
                     let (child, _key) = read_table_interior_cell(&page, offset)?;
                     page_id = child;
                 } else {
@@ -1898,6 +1902,9 @@ pub fn lookup_rowid_cell<'row>(
                     page_id = PageId::try_new(right_most)
                         .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
                 }
+            }
+            BTreeKind::IndexLeaf | BTreeKind::IndexInterior => {
+                unreachable!("index btree header returned for table page")
             }
         }
     }
@@ -1949,13 +1956,13 @@ where
         }
 
         let page = pager.page(page_id)?;
-        let header = parse_header(&page)?;
-        let cell_ptrs = cell_ptrs(&page, &header)?;
+        let header = btree::parse_table_header(&page)?;
+        let cell_ptrs = btree::cell_ptrs(&page, &header)?;
 
         match header.kind {
             BTreeKind::TableLeaf => {
                 for idx in 0..header.cell_count as usize {
-                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
                     let (rowid, payload) = read_scan_cell(pager, &page, offset)?;
                     f(rowid, page_id, payload)?;
                 }
@@ -1969,7 +1976,7 @@ where
 
                 let page_len = page.usable_bytes().len();
                 for idx in (0..header.cell_count as usize).rev() {
-                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
                     if offset as usize >= page_len {
                         return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
                     }
@@ -1983,6 +1990,9 @@ where
                     let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
                     stack.push(child);
                 }
+            }
+            BTreeKind::IndexLeaf | BTreeKind::IndexInterior => {
+                unreachable!("index btree header returned for table page")
             }
         }
     }
@@ -2017,13 +2027,13 @@ where
         }
 
         let page = pager.page(page_id)?;
-        let header = parse_header(&page)?;
-        let cell_ptrs = cell_ptrs(&page, &header)?;
+        let header = btree::parse_table_header(&page)?;
+        let cell_ptrs = btree::cell_ptrs(&page, &header)?;
 
         match header.kind {
             BTreeKind::TableLeaf => {
                 for idx in 0..header.cell_count as usize {
-                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
                     let cell = read_table_cell_ref(pager, page_id, &page, offset)?;
                     f(cell)?;
                 }
@@ -2037,7 +2047,7 @@ where
 
                 let page_len = page.usable_bytes().len();
                 for idx in (0..header.cell_count as usize).rev() {
-                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
                     if offset as usize >= page_len {
                         return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
                     }
@@ -2051,6 +2061,9 @@ where
                     let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
                     stack.push(child);
                 }
+            }
+            BTreeKind::IndexLeaf | BTreeKind::IndexInterior => {
+                unreachable!("index btree header returned for table page")
             }
         }
     }
@@ -2076,13 +2089,13 @@ where
         }
 
         let page = pager.page(page_id)?;
-        let header = parse_header(&page)?;
-        let cell_ptrs = cell_ptrs(&page, &header)?;
+        let header = btree::parse_table_header(&page)?;
+        let cell_ptrs = btree::cell_ptrs(&page, &header)?;
 
         match header.kind {
             BTreeKind::TableLeaf => {
                 for idx in 0..header.cell_count as usize {
-                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
                     let cell = read_table_cell_ref(pager, page_id, &page, offset)?;
                     if let Some(value) = f(cell)? {
                         return Ok(Some(value));
@@ -2098,7 +2111,7 @@ where
 
                 let page_len = page.usable_bytes().len();
                 for idx in (0..header.cell_count as usize).rev() {
-                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
                     if offset as usize >= page_len {
                         return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
                     }
@@ -2112,6 +2125,9 @@ where
                     let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
                     stack.push(child);
                 }
+            }
+            BTreeKind::IndexLeaf | BTreeKind::IndexInterior => {
+                unreachable!("index btree header returned for table page")
             }
         }
     }
@@ -3411,93 +3427,6 @@ fn read_exact_bytes_at<'row>(bytes: &'row [u8], pos: &mut usize, len: usize) -> 
     }
     *pos = end;
     Ok(unsafe { bytes.get_unchecked(start..end) })
-}
-
-#[derive(Clone, Copy, Debug)]
-enum BTreeKind {
-    TableLeaf,
-    TableInterior,
-}
-
-struct BTreeHeader {
-    kind: BTreeKind,
-    cell_count: u16,
-    cell_ptrs_start: usize,
-    right_most_child: Option<u32>,
-}
-
-#[inline]
-fn parse_header(page: &PageRef<'_>) -> Result<BTreeHeader> {
-    let offset = page.offset();
-    if offset >= page.usable_size() {
-        return Err(Error::Corrupted(Corruption::PageHeaderOffsetOutOfBounds));
-    }
-
-    let bytes = page.usable_bytes();
-    if offset + 8 > bytes.len() {
-        return Err(Error::Corrupted(Corruption::PageHeaderTruncated));
-    }
-
-    let page_type = bytes[offset];
-    let _first_freeblock = u16::from_be_bytes([bytes[offset + 1], bytes[offset + 2]]);
-    let cell_count = u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]);
-    let _start_of_cell_content = u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]);
-    let _fragmented_free_bytes = bytes[offset + 7];
-
-    let kind = match page_type {
-        0x0D => BTreeKind::TableLeaf,
-        0x05 => BTreeKind::TableInterior,
-        _ => return Err(Error::UnsupportedPageType(page_type)),
-    };
-
-    let right_most_child = match kind {
-        BTreeKind::TableInterior => {
-            if offset + 12 > bytes.len() {
-                return Err(Error::Corrupted(Corruption::PageHeaderTruncated));
-            }
-            Some(u32::from_be_bytes([
-                bytes[offset + 8],
-                bytes[offset + 9],
-                bytes[offset + 10],
-                bytes[offset + 11],
-            ]))
-        }
-        BTreeKind::TableLeaf => None,
-    };
-
-    let header_size = match kind {
-        BTreeKind::TableLeaf => 8,
-        BTreeKind::TableInterior => 12,
-    };
-    let cell_ptrs_start = offset
-        .checked_add(header_size)
-        .ok_or(Error::Corrupted(Corruption::CellPointerArrayOverflow))?;
-
-    Ok(BTreeHeader { kind, cell_count, cell_ptrs_start, right_most_child })
-}
-
-#[inline]
-fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &BTreeHeader) -> Result<&'a [u8]> {
-    let cell_ptrs_len = header.cell_count as usize * 2;
-    let cell_ptrs_end = header
-        .cell_ptrs_start
-        .checked_add(cell_ptrs_len)
-        .ok_or(Error::Corrupted(Corruption::CellPointerArrayOverflow))?;
-    let bytes = page.usable_bytes();
-    if cell_ptrs_end > bytes.len() {
-        return Err(Error::Corrupted(Corruption::CellPointerArrayOutOfBounds));
-    }
-    Ok(&bytes[header.cell_ptrs_start..cell_ptrs_end])
-}
-
-#[inline(always)]
-fn cell_ptr_at(cell_ptrs: &[u8], idx: usize) -> Result<u16> {
-    let offset =
-        idx.checked_mul(2).ok_or(Error::Corrupted(Corruption::CellPointerArrayOverflow))?;
-    if offset + 1 >= cell_ptrs.len() {
-        return Err(Error::Corrupted(Corruption::CellPointerArrayOutOfBounds));
-    }
-    Ok(u16::from_be_bytes([cell_ptrs[offset], cell_ptrs[offset + 1]]))
 }
 
 #[inline]

@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
+use crate::introspect::{SchemaRow, scan_sqlite_schema, scan_sqlite_schema_until};
 use crate::pager::{PageId, Pager};
 use crate::query::{Scan, ScanScratch};
 use crate::schema::parse_table_schema;
 use crate::table;
-use crate::table::ValueRef;
 
 /// Read-only handle to a SQLite database file.
 pub struct Db {
@@ -29,60 +29,17 @@ struct SchemaCache {
 impl SchemaCache {
     fn load(pager: &Pager) -> table::Result<Self> {
         let mut tables = HashMap::new();
-        table::scan_table_cells_with_scratch(pager, PageId::ROOT, |cell| {
-            let payload = cell.payload();
-            let mut handle_row = |row: table::RowView<'_>| -> table::Result<()> {
-                let row_type = match row.get(0)? {
-                    Some(ValueRef::Text(bytes)) => std::str::from_utf8(bytes).ok(),
-                    _ => None,
-                };
-                if row_type.is_none_or(|value| !value.eq_ignore_ascii_case("table")) {
-                    return Ok(());
-                }
-                let name = match row.get(1)? {
-                    Some(ValueRef::Text(bytes)) => match std::str::from_utf8(bytes) {
-                        Ok(value) => value,
-                        Err(_) => return Ok(()),
-                    },
-                    _ => return Ok(()),
-                };
-                let rootpage = match row.get(3)? {
-                    Some(ValueRef::Integer(value)) => value,
-                    _ => return Ok(()),
-                };
-                let Ok(rootpage) = u32::try_from(rootpage) else {
-                    return Ok(());
-                };
-                let Some(root) = PageId::try_new(rootpage) else {
-                    return Ok(());
-                };
-                let sql = match row.get(4)? {
-                    Some(ValueRef::Text(bytes)) => std::str::from_utf8(bytes).ok(),
-                    _ => None,
-                };
-                let column_count = sql.and_then(|sql| {
-                    let schema = parse_table_schema(sql);
-                    if schema.columns.is_empty() { None } else { Some(schema.columns.len()) }
-                });
-
-                let info = TableInfo { name: name.to_owned(), root, column_count };
-                tables.insert(name.to_ascii_lowercase(), info);
-                Ok(())
-            };
-
-            match payload {
-                table::PayloadRef::Inline(bytes) => {
-                    let row = table::RowView::from_inline(bytes)?;
-                    handle_row(row)?;
-                }
-                table::PayloadRef::Overflow(_) => {
-                    let payload_buf = payload.to_vec()?;
-                    let row = table::RowView::from_inline(&payload_buf)?;
-                    handle_row(row)?;
-                }
+        scan_sqlite_schema_until::<(), _>(pager, |row| {
+            if !row.kind.eq_ignore_ascii_case("table") {
+                return Ok(None::<()>);
             }
-
-            Ok(())
+            let column_count = row.sql.as_str().and_then(|sql| {
+                let schema = parse_table_schema(sql);
+                if schema.columns.is_empty() { None } else { Some(schema.columns.len()) }
+            });
+            let info = TableInfo { name: row.name.to_owned(), root: row.root, column_count };
+            tables.insert(row.name.to_ascii_lowercase(), info);
+            Ok(None::<()>)
         })?;
 
         Ok(Self { tables })
@@ -136,6 +93,22 @@ impl Db {
 
     pub(crate) fn pager(&self) -> &Pager {
         &self.pager
+    }
+
+    /// Visit rows in `sqlite_schema` with a borrowed view of each row.
+    pub fn scan_schema<F>(&self, f: F) -> table::Result<()>
+    where
+        F: for<'row> FnMut(SchemaRow<'row>) -> table::Result<()>,
+    {
+        scan_sqlite_schema(self.pager(), f)
+    }
+
+    /// Visit rows in `sqlite_schema` until the callback returns `Some`.
+    pub fn scan_schema_until<T, F>(&self, f: F) -> table::Result<Option<T>>
+    where
+        F: for<'row> FnMut(SchemaRow<'row>) -> table::Result<Option<T>>,
+    {
+        scan_sqlite_schema_until(self.pager(), f)
     }
 
     fn schema_cache(&self) -> table::Result<&SchemaCache> {

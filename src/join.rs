@@ -7,7 +7,11 @@ use bumpalo::Bump;
 use hashbrown::HashMap as HbHashMap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
+use crate::compare::compare_value_refs;
+pub use crate::error::JoinError;
+use crate::ident::{is_ident_char, is_ident_start};
 use crate::index::{self, IndexCursor, IndexScratch};
+use crate::introspect::{SchemaSql, scan_sqlite_schema_until};
 use crate::pager::{PageId, Pager};
 use crate::query::{OrderDir, PreparedScan, Row, Scan, ScanScratch};
 use crate::schema::{TableSchema, parse_index_columns, parse_table_schema};
@@ -16,43 +20,8 @@ use crate::table::{self, ValueRef, ValueSlot};
 /// Result type for join operations.
 pub type Result<T> = table::Result<T>;
 
-/// Join-specific errors.
-#[non_exhaustive]
-#[derive(Debug)]
-pub enum Error {
-    UnsupportedJoinKeyType,
-    IndexKeyNotComparable,
-    MissingIndexRowId,
-    HashMemoryLimitExceeded,
-    MissingJoinCondition,
-    InvalidOrderByColumn,
-    UnsupportedJoinType,
-    UnsupportedJoinStrategy,
-    LeftJoinMissingRightColumns,
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnsupportedJoinKeyType => f.write_str("Unsupported join key type"),
-            Self::IndexKeyNotComparable => f.write_str("Index key is not comparable to join key"),
-            Self::MissingIndexRowId => f.write_str("Index record does not end with a rowid"),
-            Self::HashMemoryLimitExceeded => f.write_str("Hash join memory limit exceeded"),
-            Self::MissingJoinCondition => f.write_str("Join condition is missing"),
-            Self::InvalidOrderByColumn => f.write_str("ORDER BY column is not available"),
-            Self::UnsupportedJoinType => f.write_str("Join type is not supported"),
-            Self::UnsupportedJoinStrategy => f.write_str("Join strategy is not supported"),
-            Self::LeftJoinMissingRightColumns => {
-                f.write_str("Left join could not determine right-side column count")
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
 /// Alias for join errors.
-pub type JoinError = Error;
+pub type Error = JoinError;
 
 /// Supported join types.
 #[non_exhaustive]
@@ -989,41 +958,6 @@ fn compare_value_slots(left: ValueSlot, right: ValueSlot) -> std::cmp::Ordering 
     compare_value_refs(left_ref, right_ref)
 }
 
-fn compare_value_refs(left: ValueRef<'_>, right: ValueRef<'_>) -> std::cmp::Ordering {
-    let rank = |value: ValueRef<'_>| match value {
-        ValueRef::Null => 0u8,
-        ValueRef::Integer(_) | ValueRef::Real(_) => 1u8,
-        ValueRef::Text(_) => 2u8,
-        ValueRef::Blob(_) => 3u8,
-    };
-
-    let left_rank = rank(left);
-    let right_rank = rank(right);
-    if left_rank != right_rank {
-        return left_rank.cmp(&right_rank);
-    }
-
-    match (left, right) {
-        (ValueRef::Null, ValueRef::Null) => std::cmp::Ordering::Equal,
-        (ValueRef::Integer(l), ValueRef::Integer(r)) => l.cmp(&r),
-        (ValueRef::Integer(l), ValueRef::Real(r)) => cmp_f64_total(l as f64, r),
-        (ValueRef::Real(l), ValueRef::Integer(r)) => cmp_f64_total(l, r as f64),
-        (ValueRef::Real(l), ValueRef::Real(r)) => cmp_f64_total(l, r),
-        (ValueRef::Text(l), ValueRef::Text(r)) => l.cmp(r),
-        (ValueRef::Blob(l), ValueRef::Blob(r)) => l.cmp(r),
-        _ => std::cmp::Ordering::Equal,
-    }
-}
-
-fn cmp_f64_total(left: f64, right: f64) -> std::cmp::Ordering {
-    match (left.is_nan(), right.is_nan()) {
-        (true, true) => std::cmp::Ordering::Equal,
-        (true, false) => std::cmp::Ordering::Greater,
-        (false, true) => std::cmp::Ordering::Less,
-        (false, false) => left.partial_cmp(&right).unwrap_or(std::cmp::Ordering::Equal),
-    }
-}
-
 fn covering_map_for_index(
     right_scan: &PreparedScan<'_>,
     index_cols: Option<&[u16]>,
@@ -1820,51 +1754,6 @@ fn index_cols_to_indices(schema: &TableSchema, index_cols: &[String]) -> Option<
     Some(mapped)
 }
 
-fn decode_column_value<'row>(
-    payload: table::PayloadRef<'row>,
-    col: u16,
-    scratch: &'row mut Vec<u8>,
-) -> Result<Option<ValueRef<'row>>> {
-    let Some(slot) = table::decode_record_column(payload, col, scratch)? else {
-        return Ok(None);
-    };
-    let scratch_bytes = scratch.as_slice();
-    let value = unsafe { slot.as_value_ref_with_scratch(scratch_bytes) };
-    Ok(Some(value))
-}
-
-fn decode_text_owned(
-    payload: table::PayloadRef<'_>,
-    col: u16,
-    scratch: &mut Vec<u8>,
-) -> Result<Option<String>> {
-    match decode_column_value(payload, col, scratch)? {
-        Some(ValueRef::Text(bytes)) => {
-            Ok(std::str::from_utf8(bytes).ok().map(|value| value.to_owned()))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn decode_integer(
-    payload: table::PayloadRef<'_>,
-    col: u16,
-    scratch: &mut Vec<u8>,
-) -> Result<Option<i64>> {
-    match decode_column_value(payload, col, scratch)? {
-        Some(ValueRef::Integer(value)) => Ok(Some(value)),
-        _ => Ok(None),
-    }
-}
-
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
-}
-
-fn is_ident_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 fn index_sql_is_unique(sql: &str) -> bool {
     let bytes = sql.as_bytes();
     let mut i = 0usize;
@@ -1886,34 +1775,18 @@ fn index_sql_is_unique(sql: &str) -> bool {
 }
 
 fn find_table_info(pager: &Pager, table_root: PageId) -> Result<Option<(String, String)>> {
-    let target_root = table_root.into_inner() as i64;
-    let mut stack = Vec::with_capacity(64);
-    let mut scratch = Vec::new();
-    table::scan_table_cells_with_scratch_and_stack_until(pager, PageId::ROOT, &mut stack, |cell| {
-        let payload = cell.payload();
-        let row_type = match decode_text_owned(payload, 0, &mut scratch)? {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-        if !row_type.eq_ignore_ascii_case("table") {
+    scan_sqlite_schema_until(pager, |row| {
+        if !row.kind.eq_ignore_ascii_case("table") {
             return Ok(None);
         }
-        let rootpage = match decode_integer(payload, 3, &mut scratch)? {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-        if rootpage != target_root {
+        if row.root != table_root {
             return Ok(None);
         }
-        let name = match decode_text_owned(payload, 1, &mut scratch)? {
-            Some(value) => value,
-            None => return Ok(None),
+        let sql = match row.sql {
+            SchemaSql::Text(sql) => sql,
+            SchemaSql::Null | SchemaSql::InvalidUtf8 => return Ok(None),
         };
-        let sql = match decode_text_owned(payload, 4, &mut scratch)? {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-        Ok(Some((name, sql)))
+        Ok(Some((row.name.to_owned(), sql.to_owned())))
     })
 }
 
@@ -1940,72 +1813,46 @@ fn discover_index_for_join(
 
     let mut autoindexes = Vec::new();
     let mut best: Option<IndexInfo> = None;
-    let mut stack = Vec::with_capacity(64);
-    let mut scratch = Vec::new();
-    let found = table::scan_table_cells_with_scratch_and_stack_until(
-        pager,
-        PageId::ROOT,
-        &mut stack,
-        |cell| {
-            let payload = cell.payload();
-            let row_type = match decode_text_owned(payload, 0, &mut scratch)? {
-                Some(value) => value,
-                None => return Ok(None),
-            };
-            if !row_type.eq_ignore_ascii_case("index") {
-                return Ok(None);
-            }
-            let tbl_name = match decode_text_owned(payload, 2, &mut scratch)? {
-                Some(value) => value,
-                None => return Ok(None),
-            };
-            if !tbl_name.eq_ignore_ascii_case(&table_name) {
-                return Ok(None);
-            }
-            let rootpage = match decode_integer(payload, 3, &mut scratch)?
-                .and_then(|value| u32::try_from(value).ok())
-            {
-                Some(value) => value,
-                None => return Ok(None),
-            };
-            match decode_column_value(payload, 4, &mut scratch)? {
-                Some(ValueRef::Text(bytes)) => {
-                    let sql = match std::str::from_utf8(bytes) {
-                        Ok(value) => value,
-                        Err(_) => return Ok(None),
+    let found = scan_sqlite_schema_until(pager, |row| {
+        if !row.kind.eq_ignore_ascii_case("index") {
+            return Ok(None);
+        }
+        if !row.tbl_name.eq_ignore_ascii_case(&table_name) {
+            return Ok(None);
+        }
+        match row.sql {
+            SchemaSql::Text(sql) => {
+                let Some(index_cols) = parse_index_columns(sql) else {
+                    return Ok(None);
+                };
+                let unique_by_key = index_sql_is_unique(sql)
+                    && index_cols.len() == 1
+                    && index_cols[0].eq_ignore_ascii_case(join_col_name);
+                let Some(index_cols) = index_cols_to_indices(&schema, &index_cols) else {
+                    return Ok(None);
+                };
+                if index_cols.first().copied() == Some(join_col) {
+                    let info = IndexInfo {
+                        root: row.root,
+                        key_col: 0,
+                        cols: Some(index_cols),
+                        unique_by_key,
                     };
-                    let Some(index_cols) = parse_index_columns(sql) else {
-                        return Ok(None);
-                    };
-                    let unique_by_key = index_sql_is_unique(sql)
-                        && index_cols.len() == 1
-                        && index_cols[0].eq_ignore_ascii_case(join_col_name);
-                    let Some(index_cols) = index_cols_to_indices(&schema, &index_cols) else {
-                        return Ok(None);
-                    };
-                    if index_cols.first().copied() == Some(join_col) {
-                        let info = IndexInfo {
-                            root: PageId::new(rootpage),
-                            key_col: 0,
-                            cols: Some(index_cols),
-                            unique_by_key,
-                        };
-                        if unique_by_key {
-                            return Ok(Some(info));
-                        }
-                        if best.is_none() {
-                            best = Some(info);
-                        }
+                    if unique_by_key {
+                        return Ok(Some(info));
+                    }
+                    if best.is_none() {
+                        best = Some(info);
                     }
                 }
-                Some(ValueRef::Null) | None => {
-                    autoindexes.push(PageId::new(rootpage));
-                }
-                _ => {}
             }
-            Ok(None)
-        },
-    )?;
+            SchemaSql::Null => {
+                autoindexes.push(row.root);
+            }
+            SchemaSql::InvalidUtf8 => {}
+        }
+        Ok(None)
+    })?;
 
     if let Some(index) = found {
         return Ok(Some(index));
@@ -2040,56 +1887,30 @@ fn discover_index_cols_for_root(
         Unsupported,
     }
 
-    let mut stack = Vec::with_capacity(64);
-    let mut scratch = Vec::new();
-    let outcome = table::scan_table_cells_with_scratch_and_stack_until(
-        pager,
-        PageId::ROOT,
-        &mut stack,
-        |cell| {
-            let payload = cell.payload();
-            let row_type = match decode_text_owned(payload, 0, &mut scratch)? {
-                Some(value) => value,
-                None => return Ok(None),
-            };
-            if !row_type.eq_ignore_ascii_case("index") {
-                return Ok(None);
+    let outcome = scan_sqlite_schema_until(pager, |row| {
+        if !row.kind.eq_ignore_ascii_case("index") {
+            return Ok(None);
+        }
+        if !row.tbl_name.eq_ignore_ascii_case(&table_name) {
+            return Ok(None);
+        }
+        if row.root != index_root {
+            return Ok(None);
+        }
+        match row.sql {
+            SchemaSql::Text(sql) => {
+                let Some(index_cols) = parse_index_columns(sql) else {
+                    return Ok(Some(IndexColsOutcome::Unsupported));
+                };
+                let Some(mapped) = index_cols_to_indices(&schema, &index_cols) else {
+                    return Ok(Some(IndexColsOutcome::Unsupported));
+                };
+                Ok(Some(IndexColsOutcome::Explicit(mapped)))
             }
-            let tbl_name = match decode_text_owned(payload, 2, &mut scratch)? {
-                Some(value) => value,
-                None => return Ok(None),
-            };
-            if !tbl_name.eq_ignore_ascii_case(&table_name) {
-                return Ok(None);
-            }
-            let rootpage = match decode_integer(payload, 3, &mut scratch)?
-                .and_then(|value| u32::try_from(value).ok())
-            {
-                Some(value) => value,
-                None => return Ok(None),
-            };
-            if PageId::new(rootpage) != index_root {
-                return Ok(None);
-            }
-            match decode_column_value(payload, 4, &mut scratch)? {
-                Some(ValueRef::Text(bytes)) => {
-                    let sql = match std::str::from_utf8(bytes) {
-                        Ok(value) => value,
-                        Err(_) => return Ok(Some(IndexColsOutcome::Unsupported)),
-                    };
-                    let Some(index_cols) = parse_index_columns(sql) else {
-                        return Ok(Some(IndexColsOutcome::Unsupported));
-                    };
-                    let Some(mapped) = index_cols_to_indices(&schema, &index_cols) else {
-                        return Ok(Some(IndexColsOutcome::Unsupported));
-                    };
-                    Ok(Some(IndexColsOutcome::Explicit(mapped)))
-                }
-                Some(ValueRef::Null) | None => Ok(Some(IndexColsOutcome::Autoindex)),
-                _ => Ok(Some(IndexColsOutcome::Unsupported)),
-            }
-        },
-    )?;
+            SchemaSql::Null => Ok(Some(IndexColsOutcome::Autoindex)),
+            SchemaSql::InvalidUtf8 => Ok(Some(IndexColsOutcome::Unsupported)),
+        }
+    })?;
 
     match outcome {
         Some(IndexColsOutcome::Explicit(cols)) => return Ok(Some(cols)),

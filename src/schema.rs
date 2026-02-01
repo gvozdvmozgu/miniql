@@ -1,3 +1,5 @@
+use crate::ident::{is_ident_char, is_ident_start};
+
 #[derive(Clone, Debug)]
 pub(crate) struct TableSchema {
     pub(crate) columns: Vec<String>,
@@ -490,12 +492,4 @@ fn find_on_paren(sql: &str) -> Option<usize> {
         i += 1;
     }
     None
-}
-
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
-}
-
-fn is_ident_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
 }
