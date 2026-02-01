@@ -1270,8 +1270,14 @@ impl<'row> RecordDecoder<'row> {
                 if *serial_pos >= serial_bytes.len() {
                     return Err(Error::SchemaMismatch { expected: self.expected_cols, got: col });
                 }
-                let serial =
-                    read_varint_at(serial_bytes, serial_pos, Corruption::RecordHeaderTruncated)?;
+                let pos = *serial_pos;
+                let b0 = unsafe { *serial_bytes.get_unchecked(pos) };
+                let serial = if b0 < 0x80 {
+                    *serial_pos = pos + 1;
+                    u64::from(b0)
+                } else {
+                    read_varint_at(serial_bytes, serial_pos, Corruption::RecordHeaderTruncated)?
+                };
                 self.idx += 1;
                 Ok((col, serial))
             }
