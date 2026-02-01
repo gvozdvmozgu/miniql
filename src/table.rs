@@ -1032,15 +1032,22 @@ enum RecordCursor<'row> {
     Overflow { cursor: OverflowCursor<'row> },
 }
 
+enum SerialMode<'row> {
+    Collected,
+    InlineStream { serial_bytes: &'row [u8], serial_pos: usize },
+}
+
 /// Typed record decoder that validates serial types and decodes directly into
 /// Rust types.
 pub struct RecordDecoder<'row> {
     serials: Vec<u64>,
     scratch: Vec<u8>,
     cursor: RecordCursor<'row>,
+    serial_mode: SerialMode<'row>,
     idx: usize,
-    column_count: usize,
+    column_count: Option<usize>,
     borrow_policy: BorrowPolicy,
+    expected_cols: usize,
 }
 
 impl<'row> RecordDecoder<'row> {
@@ -1048,22 +1055,51 @@ impl<'row> RecordDecoder<'row> {
         payload: PayloadRef<'row>,
         mut scratch: RecordScratch,
         options: TypedScanOptions,
+        expected_cols: usize,
     ) -> Result<Self> {
+        const INLINE_FAST_COLS: usize = 8;
+
         scratch.serials.clear();
         scratch.bytes.clear();
 
-        let (total_value_len, text_blob_len, cursor) = match payload {
+        let (total_value_len, text_blob_len, cursor, serial_mode, column_count) = match payload {
+            PayloadRef::Inline(bytes)
+                if options.borrow_policy == BorrowPolicy::PreferBorrow
+                    && expected_cols <= INLINE_FAST_COLS =>
+            {
+                let (header_len, serial_bytes) = parse_record_header_inline(bytes)?;
+                let cursor = RecordCursor::Inline { payload: bytes, pos: header_len };
+                (
+                    0usize,
+                    0usize,
+                    cursor,
+                    SerialMode::InlineStream { serial_bytes, serial_pos: 0 },
+                    None,
+                )
+            }
             PayloadRef::Inline(bytes) => {
                 let (header_len, total_value_len, text_blob_len) =
                     parse_record_header_bytes(bytes, &mut scratch.serials)?;
                 let cursor = RecordCursor::Inline { payload: bytes, pos: header_len };
-                (total_value_len, text_blob_len, cursor)
+                (
+                    total_value_len,
+                    text_blob_len,
+                    cursor,
+                    SerialMode::Collected,
+                    Some(scratch.serials.len()),
+                )
             }
             PayloadRef::Overflow(payload) => {
                 let (cursor, total_value_len, text_blob_len) =
                     parse_record_header_overflow(payload, &mut scratch.serials)?;
                 let cursor = RecordCursor::Overflow { cursor };
-                (total_value_len, text_blob_len, cursor)
+                (
+                    total_value_len,
+                    text_blob_len,
+                    cursor,
+                    SerialMode::Collected,
+                    Some(scratch.serials.len()),
+                )
             }
         };
 
@@ -1078,14 +1114,15 @@ impl<'row> RecordDecoder<'row> {
             scratch.bytes.reserve(scratch_needed - scratch.bytes.capacity());
         }
 
-        let column_count = scratch.serials.len();
         Ok(Self {
             serials: scratch.serials,
             scratch: scratch.bytes,
             cursor,
+            serial_mode,
             idx: 0,
             column_count,
             borrow_policy: options.borrow_policy,
+            expected_cols,
         })
     }
 
@@ -1096,24 +1133,26 @@ impl<'row> RecordDecoder<'row> {
     /// Number of columns in the record.
     #[inline]
     pub fn column_count(&self) -> usize {
-        self.column_count
+        if let Some(count) = self.column_count {
+            return count;
+        }
+        match &self.serial_mode {
+            SerialMode::Collected => self.serials.len(),
+            SerialMode::InlineStream { serial_bytes, .. } => {
+                count_serials(serial_bytes).unwrap_or(0)
+            }
+        }
     }
 
     /// Number of remaining columns.
     #[inline]
     pub fn remaining(&self) -> usize {
-        self.column_count.saturating_sub(self.idx)
+        self.column_count().saturating_sub(self.idx)
     }
 
     /// Read and decode the next column.
     pub fn read<T: DecodeField<'row>>(&mut self) -> Result<T> {
-        if self.idx >= self.serials.len() {
-            return Err(Error::SchemaMismatch { expected: self.serials.len(), got: self.idx + 1 });
-        }
-
-        let col = self.idx;
-        let serial = self.serials[col];
-        self.idx += 1;
+        let (col, serial) = self.next_serial()?;
 
         let len = serial_type_len_checked(serial, col)?;
         let span = match &mut self.cursor {
@@ -1136,12 +1175,7 @@ impl<'row> RecordDecoder<'row> {
 
     /// Skip the next column without decoding.
     pub fn skip(&mut self) -> Result<()> {
-        if self.idx >= self.serials.len() {
-            return Err(Error::SchemaMismatch { expected: self.serials.len(), got: self.idx + 1 });
-        }
-        let col = self.idx;
-        let serial = self.serials[col];
-        self.idx += 1;
+        let (col, serial) = self.next_serial()?;
 
         let len = serial_type_len_checked(serial, col)?;
         match &mut self.cursor {
@@ -1160,22 +1194,25 @@ impl<'row> RecordDecoder<'row> {
     }
 
     fn skip_remaining(&mut self) -> Result<()> {
-        while self.idx < self.serials.len() {
+        while self.has_remaining_serials() {
             self.skip()?;
         }
         Ok(())
     }
 
-    fn ensure_column_count(&self, expected: usize, mode: ColumnMode) -> Result<()> {
+    fn ensure_column_count(&mut self, expected: usize, mode: ColumnMode) -> Result<()> {
+        let Some(count) = self.column_count else {
+            return Ok(());
+        };
         match mode {
             ColumnMode::Strict => {
-                if self.column_count != expected {
-                    return Err(Error::SchemaMismatch { expected, got: self.column_count });
+                if count != expected {
+                    return Err(Error::SchemaMismatch { expected, got: count });
                 }
             }
             ColumnMode::AllowExtraColumns => {
-                if self.column_count < expected {
-                    return Err(Error::SchemaMismatch { expected, got: self.column_count });
+                if count < expected {
+                    return Err(Error::SchemaMismatch { expected, got: count });
                 }
             }
         }
@@ -1188,6 +1225,11 @@ impl<'row> RecordDecoder<'row> {
         }
         if matches!(mode, ColumnMode::AllowExtraColumns) {
             self.skip_remaining()?;
+        } else if let SerialMode::InlineStream { serial_bytes, serial_pos } = &self.serial_mode
+            && *serial_pos < serial_bytes.len()
+        {
+            let got = count_serials(serial_bytes).unwrap_or(self.idx + 1);
+            return Err(Error::SchemaMismatch { expected, got });
         }
         Ok(())
     }
@@ -1203,6 +1245,37 @@ impl<'row> RecordDecoder<'row> {
         self.scratch.extend_from_slice(bytes);
         let slice = &self.scratch[start..start + len];
         Ok(BytesSpan::scratch(slice))
+    }
+
+    fn has_remaining_serials(&self) -> bool {
+        match &self.serial_mode {
+            SerialMode::Collected => self.idx < self.serials.len(),
+            SerialMode::InlineStream { serial_bytes, serial_pos } => {
+                *serial_pos < serial_bytes.len()
+            }
+        }
+    }
+
+    fn next_serial(&mut self) -> Result<(usize, u64)> {
+        let col = self.idx;
+        match &mut self.serial_mode {
+            SerialMode::Collected => {
+                let Some(serial) = self.serials.get(col) else {
+                    return Err(Error::SchemaMismatch { expected: self.expected_cols, got: col });
+                };
+                self.idx += 1;
+                Ok((col, *serial))
+            }
+            SerialMode::InlineStream { serial_bytes, serial_pos } => {
+                if *serial_pos >= serial_bytes.len() {
+                    return Err(Error::SchemaMismatch { expected: self.expected_cols, got: col });
+                }
+                let serial =
+                    read_varint_at(serial_bytes, serial_pos, Corruption::RecordHeaderTruncated)?;
+                self.idx += 1;
+                Ok((col, serial))
+            }
+        }
     }
 }
 
@@ -1317,11 +1390,15 @@ where
         let rowid = cell.rowid();
         let page_id = cell.page_id();
         let payload = cell.payload();
-        let mut decoder =
-            match RecordDecoder::new_with_scratch(payload, mem::take(&mut scratch), options) {
-                Ok(decoder) => decoder,
-                Err(err) => return Err(Error::RowDecode { rowid, page_id, source: Box::new(err) }),
-            };
+        let mut decoder = match RecordDecoder::new_with_scratch(
+            payload,
+            mem::take(&mut scratch),
+            options,
+            D::COLS,
+        ) {
+            Ok(decoder) => decoder,
+            Err(err) => return Err(Error::RowDecode { rowid, page_id, source: Box::new(err) }),
+        };
 
         if let Err(err) = decoder.ensure_column_count(D::COLS, options.column_mode) {
             return Err(Error::RowDecode { rowid, page_id, source: Box::new(err) });
@@ -1347,6 +1424,36 @@ fn serial_type_len_checked(serial: u64, col: usize) -> Result<usize> {
         10 | 11 => Err(Error::UnsupportedSerialTypeAt { col, serial }),
         _ => Ok(serial_type_len_fast(serial)),
     }
+}
+
+fn parse_record_header_inline(payload: &[u8]) -> Result<(usize, &[u8])> {
+    let mut header_pos = 0usize;
+    let first = *payload.first().ok_or(Error::Corrupted(Corruption::RecordHeaderTruncated))?;
+    let header_len = if first < 0x80 {
+        header_pos = 1;
+        first as usize
+    } else {
+        read_varint_at(payload, &mut header_pos, Corruption::RecordHeaderTruncated)? as usize
+    };
+    if header_len < header_pos || header_len > payload.len() {
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
+    }
+    Ok((header_len, &payload[header_pos..header_len]))
+}
+
+fn count_serials(serial_bytes: &[u8]) -> Result<usize> {
+    let mut pos = 0usize;
+    let mut count = 0usize;
+    while pos < serial_bytes.len() {
+        let b = unsafe { *serial_bytes.get_unchecked(pos) };
+        if b < 0x80 {
+            pos += 1;
+        } else {
+            read_varint_at(serial_bytes, &mut pos, Corruption::RecordHeaderTruncated)?;
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 
 fn parse_record_header_bytes(
