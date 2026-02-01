@@ -1173,6 +1173,63 @@ impl<'row> RecordDecoder<'row> {
         T::decode(serial, source)
     }
 
+    /// Read and decode the next column as an i64 without allocating
+    /// `FieldSource`.
+    pub fn read_i64(&mut self) -> Result<i64> {
+        let (col, serial) = self.next_serial()?;
+        match serial {
+            1..=6 => {
+                let len = match serial {
+                    1 => 1,
+                    2 => 2,
+                    3 => 3,
+                    4 => 4,
+                    5 => 6,
+                    _ => 8,
+                };
+                match &mut self.cursor {
+                    RecordCursor::Inline { payload, pos } => read_signed_be_at(payload, pos, len),
+                    RecordCursor::Overflow { cursor } => cursor.read_signed_be(len),
+                }
+            }
+            8 => Ok(0),
+            9 => Ok(1),
+            10 | 11 => Err(Error::UnsupportedSerialTypeAt { col, serial }),
+            _ => Err(Error::TypeMismatchSerial {
+                col,
+                expected: ValueKind::Integer,
+                got_serial: serial,
+            }),
+        }
+    }
+
+    /// Read and decode the next column as UTF-8 text without allocating
+    /// `FieldSource`.
+    pub fn read_text(&mut self) -> Result<&'row str> {
+        let (col, serial) = self.next_serial()?;
+        match serial {
+            10 | 11 => Err(Error::UnsupportedSerialTypeAt { col, serial }),
+            serial if serial >= 13 && serial & 1 == 1 => {
+                let len = ((serial - 13) / 2) as usize;
+                let span = self.read_span(len)?;
+                let span = if self.borrow_policy == BorrowPolicy::AlwaysCopy {
+                    self.copy_span_to_scratch(span, len)?
+                } else {
+                    span
+                };
+                let scratch = RawBytes::from_slice(&self.scratch);
+                let scratch = unsafe { scratch.as_slice() };
+                let bytes = unsafe { span.as_slice_with_scratch(scratch) };
+                str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8 { col, err })
+            }
+            _ => Err(Error::TypeMismatchSerial {
+                col,
+                expected: ValueKind::Text,
+                got_serial: serial,
+            }),
+        }
+    }
+
     /// Skip the next column without decoding.
     pub fn skip(&mut self) -> Result<()> {
         let (col, serial) = self.next_serial()?;
@@ -1245,6 +1302,16 @@ impl<'row> RecordDecoder<'row> {
         self.scratch.extend_from_slice(bytes);
         let slice = &self.scratch[start..start + len];
         Ok(BytesSpan::scratch(slice))
+    }
+
+    fn read_span(&mut self, len: usize) -> Result<BytesSpan> {
+        match &mut self.cursor {
+            RecordCursor::Inline { payload, pos } => {
+                let slice = read_exact_bytes_at(payload, pos, len)?;
+                Ok(BytesSpan::mmap(slice))
+            }
+            RecordCursor::Overflow { cursor } => cursor.take_span(len, &mut self.scratch),
+        }
     }
 
     fn has_remaining_serials(&self) -> bool {
@@ -1392,10 +1459,9 @@ where
     F: for<'row> FnMut(i64, D::Row<'row>) -> Result<()>,
 {
     let mut scratch = RecordScratch::default();
-    scan_table_cells_with_scratch(pager, page_id, |cell| {
-        let rowid = cell.rowid();
-        let page_id = cell.page_id();
-        let payload = cell.payload();
+    let mut stack = Vec::with_capacity(64);
+    stack.push(page_id);
+    scan_table_payloads_with_stack(pager, &mut stack, &mut |rowid, page_id, payload| {
         let mut decoder = match RecordDecoder::new_with_scratch(
             payload,
             mem::take(&mut scratch),
@@ -1805,6 +1871,65 @@ where
     stack.clear();
     stack.push(page_id);
     scan_table_page_cells_until_with_stack(pager, stack, &mut f)
+}
+
+fn scan_table_payloads_with_stack<'pager, F>(
+    pager: &'pager Pager,
+    stack: &mut Vec<PageId>,
+    f: &mut F,
+) -> Result<()>
+where
+    F: for<'row> FnMut(i64, PageId, PayloadRef<'row>) -> Result<()>,
+{
+    let max_pages = pager.page_count().max(1);
+    let mut seen_pages = 0u32;
+
+    while let Some(page_id) = stack.pop() {
+        seen_pages += 1;
+        if seen_pages > max_pages {
+            return Err(Error::Corrupted(Corruption::BtreePageCycleDetected));
+        }
+
+        let page = pager.page(page_id)?;
+        let header = parse_header(&page)?;
+        let cell_ptrs = cell_ptrs(&page, &header)?;
+
+        match header.kind {
+            BTreeKind::TableLeaf => {
+                for idx in 0..header.cell_count as usize {
+                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    let (rowid, payload) = read_scan_cell(pager, &page, offset)?;
+                    f(rowid, page_id, payload)?;
+                }
+            }
+            BTreeKind::TableInterior => {
+                if let Some(right_most) = header.right_most_child {
+                    let right_most = PageId::try_new(right_most)
+                        .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
+                    stack.push(right_most);
+                }
+
+                let page_len = page.usable_bytes().len();
+                for idx in (0..header.cell_count as usize).rev() {
+                    let offset = cell_ptr_at(cell_ptrs, idx)?;
+                    if offset as usize >= page_len {
+                        return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
+                    }
+
+                    let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
+                    let child =
+                        read_u32_checked(&mut decoder, Corruption::CellChildPointerTruncated)?;
+                    let child = PageId::try_new(child)
+                        .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
+
+                    let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn scan_table_page_cells<'pager, F>(pager: &'pager Pager, page_id: PageId, f: &mut F) -> Result<()>

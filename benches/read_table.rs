@@ -25,8 +25,8 @@ impl DecodeRecord for UserRowSpec {
     fn decode<'row>(decoder: &mut RecordDecoder<'row>) -> table::Result<Self::Row<'row>> {
         Ok(UserRow {
             _null: decoder.read::<Null>()?,
-            name: decoder.read::<&'row str>()?,
-            age: decoder.read::<i64>()?,
+            name: decoder.read_text()?,
+            age: decoder.read_i64()?,
         })
     }
 }
@@ -43,7 +43,7 @@ impl DecodeRecord for OverflowRowSpec {
     const COLS: usize = 2;
 
     fn decode<'row>(decoder: &mut RecordDecoder<'row>) -> table::Result<Self::Row<'row>> {
-        Ok(OverflowRow { id: decoder.read::<i64>()?, text: decoder.read::<&'row str>()? })
+        Ok(OverflowRow { id: decoder.read_i64()?, text: decoder.read_text()? })
     }
 }
 
