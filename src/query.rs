@@ -8,7 +8,9 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::pager::{PageId, Pager};
-use crate::table::{self, BytesSpan, RawBytes, ValueRef, ValueSlot};
+use crate::table::{
+    self, BytesSpan, Corruption, QueryError, RawBytes, ValueKind, ValueRef, ValueSlot,
+};
 
 /// Filter expression tree used by `Scan::filter`.
 #[derive(Debug, Clone)]
@@ -409,12 +411,14 @@ impl<'row> Row<'row> {
             Some(ValueRef::Integer(value)) => Ok(value),
             Some(other) => Err(table::Error::TypeMismatch {
                 col: i,
-                expected: "INTEGER",
+                expected: ValueKind::Integer,
                 got: value_kind(other),
             }),
-            None => {
-                Err(table::Error::TypeMismatch { col: i, expected: "INTEGER", got: "<missing>" })
-            }
+            None => Err(table::Error::TypeMismatch {
+                col: i,
+                expected: ValueKind::Integer,
+                got: ValueKind::Missing,
+            }),
         }
     }
 
@@ -422,10 +426,16 @@ impl<'row> Row<'row> {
     pub fn get_f64(&self, i: usize) -> table::Result<f64> {
         match self.get(i) {
             Some(ValueRef::Real(value)) => Ok(value),
-            Some(other) => {
-                Err(table::Error::TypeMismatch { col: i, expected: "REAL", got: value_kind(other) })
-            }
-            None => Err(table::Error::TypeMismatch { col: i, expected: "REAL", got: "<missing>" }),
+            Some(other) => Err(table::Error::TypeMismatch {
+                col: i,
+                expected: ValueKind::Real,
+                got: value_kind(other),
+            }),
+            None => Err(table::Error::TypeMismatch {
+                col: i,
+                expected: ValueKind::Real,
+                got: ValueKind::Missing,
+            }),
         }
     }
 
@@ -433,10 +443,16 @@ impl<'row> Row<'row> {
     pub fn get_text(&self, i: usize) -> table::Result<&'row str> {
         match self.get(i) {
             Some(ValueRef::Text(bytes)) => Ok(std::str::from_utf8(bytes)?),
-            Some(other) => {
-                Err(table::Error::TypeMismatch { col: i, expected: "TEXT", got: value_kind(other) })
-            }
-            None => Err(table::Error::TypeMismatch { col: i, expected: "TEXT", got: "<missing>" }),
+            Some(other) => Err(table::Error::TypeMismatch {
+                col: i,
+                expected: ValueKind::Text,
+                got: value_kind(other),
+            }),
+            None => Err(table::Error::TypeMismatch {
+                col: i,
+                expected: ValueKind::Text,
+                got: ValueKind::Missing,
+            }),
         }
     }
 
@@ -447,10 +463,14 @@ impl<'row> Row<'row> {
             Some(ValueRef::Blob(bytes)) => Ok(bytes),
             Some(other) => Err(table::Error::TypeMismatch {
                 col: i,
-                expected: "BYTES",
+                expected: ValueKind::Bytes,
                 got: value_kind(other),
             }),
-            None => Err(table::Error::TypeMismatch { col: i, expected: "BYTES", got: "<missing>" }),
+            None => Err(table::Error::TypeMismatch {
+                col: i,
+                expected: ValueKind::Bytes,
+                got: ValueKind::Missing,
+            }),
         }
     }
 }
@@ -734,9 +754,7 @@ impl<'db> PreparedScan<'db> {
 
         if let Some(expected) = self.column_count_hint.get().copied() {
             if expected != count {
-                return Err(table::Error::Corrupted(
-                    "row column count does not match table schema",
-                ));
+                return Err(table::Error::Corrupted(Corruption::RowColumnCountMismatch));
             }
         } else {
             if let Some(err) = validate_columns(&self.referenced_cols, count) {
@@ -779,12 +797,10 @@ impl<'db> PreparedScan<'db> {
         apply_filters: bool,
     ) -> table::Result<Option<Row<'row>>> {
         let Some(needed_cols) = self.needed_cols.as_deref() else {
-            return Err(table::Error::Corrupted("covering index requires column projection"));
+            return Err(table::Error::Corrupted(Corruption::CoveringIndexRequiresColumnProjection));
         };
         if needed_cols.len() != needed_map.len() {
-            return Err(table::Error::Corrupted(
-                "covering index column map does not match needed columns",
-            ));
+            return Err(table::Error::Corrupted(Corruption::CoveringIndexColumnMapMismatch));
         }
 
         let _count = table::decode_record_project_into_mapped(
@@ -889,12 +905,12 @@ impl<'db> PreparedScan<'db> {
                     cb(rowid, row)?;
                     seen += 1;
                     if seen >= limit {
-                        return Err(table::Error::Corrupted("__limit_reached__"));
+                        return Err(table::Error::Corrupted(Corruption::LimitReached));
                     }
                     Ok(())
                 })
                 .or_else(|e| {
-                    if matches!(&e, table::Error::Corrupted(msg) if *msg == "__limit_reached__") {
+                    if matches!(&e, table::Error::Corrupted(Corruption::LimitReached)) {
                         Ok(())
                     } else {
                         Err(e)
@@ -939,9 +955,7 @@ impl<'db> PreparedScan<'db> {
             // Validate column count once
             if let Some(expected) = self.column_count_hint.get().copied() {
                 if expected != count {
-                    return Err(table::Error::Corrupted(
-                        "row column count does not match table schema",
-                    ));
+                    return Err(table::Error::Corrupted(Corruption::RowColumnCountMismatch));
                 }
             } else {
                 if let Some(err) = validate_columns(&self.referenced_cols, count) {
@@ -1007,9 +1021,7 @@ impl<'db> PreparedScan<'db> {
             // Validate column count once
             if let Some(expected) = self.column_count_hint.get().copied() {
                 if expected != count {
-                    return Err(table::Error::Corrupted(
-                        "row column count does not match table schema",
-                    ));
+                    return Err(table::Error::Corrupted(Corruption::RowColumnCountMismatch));
                 }
             } else {
                 if let Some(err) = validate_columns(&self.referenced_cols, count) {
@@ -1089,9 +1101,7 @@ impl<'db> PreparedScan<'db> {
             // Validate column count once
             if let Some(expected) = self.column_count_hint.get().copied() {
                 if expected != count {
-                    return Err(table::Error::Corrupted(
-                        "row column count does not match table schema",
-                    ));
+                    return Err(table::Error::Corrupted(Corruption::RowColumnCountMismatch));
                 }
             } else {
                 if let Some(err) = validate_columns(&self.referenced_cols, count) {
@@ -1186,9 +1196,7 @@ impl<'db> PreparedScan<'db> {
             // Validate column count once
             if let Some(expected) = self.column_count_hint.get().copied() {
                 if expected != count {
-                    return Err(table::Error::Corrupted(
-                        "row column count does not match table schema",
-                    ));
+                    return Err(table::Error::Corrupted(Corruption::RowColumnCountMismatch));
                 }
             } else {
                 if let Some(err) = validate_columns(&self.referenced_cols, count) {
@@ -1351,7 +1359,7 @@ impl<'db> Aggregate<'db> {
         let Aggregate { scan, group_by, select, having } = self;
 
         if select.is_empty() {
-            return Err(table::Error::Query("aggregate projection cannot be empty"));
+            return Err(table::Error::Query(QueryError::AggregateProjectionEmpty));
         }
 
         let mut group_by_values = Vec::with_capacity(group_by.len());
@@ -1368,14 +1376,12 @@ impl<'db> Aggregate<'db> {
                 AggExpr::Value(inner) => {
                     let value_expr = parse_value_expr(&inner)?;
                     if group_by_values.is_empty() {
-                        return Err(table::Error::Query(
-                            "non-aggregate expression requires GROUP BY",
-                        ));
+                        return Err(table::Error::Query(QueryError::NonAggregateRequiresGroupBy));
                     }
                     let Some(idx) = group_by_values.iter().position(|value| value == &value_expr)
                     else {
                         return Err(table::Error::Query(
-                            "non-aggregate expression must appear in GROUP BY",
+                            QueryError::NonAggregateMustAppearInGroupBy,
                         ));
                     };
                     select_plan.push(SelectItemPlan::GroupKey(idx));
@@ -1431,9 +1437,7 @@ impl<'db> Aggregate<'db> {
         }
 
         if !has_agg && group_by_values.is_empty() {
-            return Err(table::Error::Query(
-                "aggregate query requires GROUP BY or aggregate functions",
-            ));
+            return Err(table::Error::Query(QueryError::AggregateRequiresGroupByOrFunctions));
         }
 
         let having = if let Some(expr) = having {
@@ -1510,7 +1514,7 @@ impl<'db> PreparedAggregate<'db> {
 
             let group = groups
                 .get_mut(group_idx)
-                .ok_or(table::Error::Corrupted("aggregate group index out of bounds"))?;
+                .ok_or(table::Error::Corrupted(Corruption::AggregateGroupIndexOutOfBounds))?;
             for state in &mut group.aggs {
                 state.step(&row)?;
             }
@@ -1532,7 +1536,7 @@ impl<'db> PreparedAggregate<'db> {
                 match item {
                     SelectItemPlan::GroupKey(idx) => {
                         let value = group.keys.get(*idx).cloned().ok_or(
-                            table::Error::Corrupted("aggregate group key index out of bounds"),
+                            table::Error::Corrupted(Corruption::AggregateGroupKeyIndexOutOfBounds),
                         )?;
                         output_values.push(value);
                     }
@@ -1540,7 +1544,9 @@ impl<'db> PreparedAggregate<'db> {
                         let value = group
                             .aggs
                             .get(*idx)
-                            .ok_or(table::Error::Corrupted("aggregate state index out of bounds"))?
+                            .ok_or(table::Error::Corrupted(
+                                Corruption::AggregateStateIndexOutOfBounds,
+                            ))?
                             .finalize();
                         output_values.push(value);
                     }
@@ -1907,9 +1913,7 @@ fn parse_value_expr(expr: &Expr) -> table::Result<ValueExpr> {
     match expr {
         Expr::Col(col) => Ok(ValueExpr::Col(*col)),
         Expr::Lit(lit) => Ok(ValueExpr::Lit(lit.clone())),
-        _ => Err(table::Error::Query(
-            "aggregate expressions support only column and literal operands",
-        )),
+        _ => Err(table::Error::Query(QueryError::AggregateExprOnlyColOrLit)),
     }
 }
 
@@ -2137,7 +2141,7 @@ fn compile_expr(expr: &Expr, needed_cols: Option<&[u16]>) -> table::Result<Compi
         match needed_cols {
             Some(cols) => cols
                 .binary_search(&col)
-                .map_err(|_| table::Error::Corrupted("predicate column not decoded")),
+                .map_err(|_| table::Error::Corrupted(Corruption::PredicateColumnNotDecoded)),
             None => Ok(col as usize),
         }
     };
@@ -2228,13 +2232,13 @@ fn raw_to_ref_with_scratch<'row>(value: ValueSlot, scratch_bytes: &'row [u8]) ->
 }
 
 #[inline]
-fn value_kind(value: ValueRef<'_>) -> &'static str {
+fn value_kind(value: ValueRef<'_>) -> ValueKind {
     match value {
-        ValueRef::Null => "NULL",
-        ValueRef::Integer(_) => "INTEGER",
-        ValueRef::Real(_) => "REAL",
-        ValueRef::Text(_) => "TEXT",
-        ValueRef::Blob(_) => "BLOB",
+        ValueRef::Null => ValueKind::Null,
+        ValueRef::Integer(_) => ValueKind::Integer,
+        ValueRef::Real(_) => ValueKind::Real,
+        ValueRef::Text(_) => ValueKind::Text,
+        ValueRef::Blob(_) => ValueKind::Blob,
     }
 }
 

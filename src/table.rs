@@ -9,6 +9,170 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Corruption {
+    LimitReached,
+    AggregateGroupIndexOutOfBounds,
+    AggregateGroupKeyIndexOutOfBounds,
+    AggregateStateIndexOutOfBounds,
+    BtreePageCycleDetected,
+    CellKeyTruncated,
+    CellChildPointerTruncated,
+    CellOffsetOutOfBounds,
+    CellPointerArrayOutOfBounds,
+    CellPointerArrayOverflow,
+    CellPayloadLengthTruncated,
+    CellRowIdTruncated,
+    ChildPageIdZero,
+    CoveringIndexRequiresColumnProjection,
+    CoveringIndexColumnMapMismatch,
+    IndexCursorNotPositioned,
+    IndexCursorPastEnd,
+    IndexRecordHasNoColumns,
+    InteriorIndexPageHasNoCells,
+    InvalidRecordHeaderLength,
+    MappedColumnIndexOutOfBounds,
+    MissingChildPointer,
+    MissingRightMostChildPointer,
+    OverflowPageTooSmall,
+    OverflowPageUsableSizeTooSmall,
+    OverflowPointerOutOfBounds,
+    PageHeaderOffsetOutOfBounds,
+    PageHeaderTruncated,
+    PayloadExtendsPastPageBoundary,
+    PayloadIsTooLarge,
+    PayloadLengthUnderflow,
+    PredicateColumnNotDecoded,
+    RecordHeaderTruncated,
+    RecordPayloadShorterThanDeclared,
+    RowColumnCountMismatch,
+    ScanOverflowPayloadUnsupported,
+    UsableSizeUnderflow,
+}
+
+impl Corruption {
+    fn message(self) -> &'static str {
+        match self {
+            Self::LimitReached => "__limit_reached__",
+            Self::AggregateGroupIndexOutOfBounds => "aggregate group index out of bounds",
+            Self::AggregateGroupKeyIndexOutOfBounds => "aggregate group key index out of bounds",
+            Self::AggregateStateIndexOutOfBounds => "aggregate state index out of bounds",
+            Self::BtreePageCycleDetected => "btree page cycle detected",
+            Self::CellKeyTruncated => "cell key truncated",
+            Self::CellChildPointerTruncated => "cell child pointer truncated",
+            Self::CellOffsetOutOfBounds => "cell offset out of bounds",
+            Self::CellPointerArrayOutOfBounds => "cell pointer array out of bounds",
+            Self::CellPointerArrayOverflow => "cell pointer array overflow",
+            Self::CellPayloadLengthTruncated => "cell payload length truncated",
+            Self::CellRowIdTruncated => "cell rowid truncated",
+            Self::ChildPageIdZero => "child page id is zero",
+            Self::CoveringIndexRequiresColumnProjection => {
+                "covering index requires column projection"
+            }
+            Self::CoveringIndexColumnMapMismatch => {
+                "covering index column map does not match needed columns"
+            }
+            Self::IndexCursorNotPositioned => "index cursor not positioned",
+            Self::IndexCursorPastEnd => "index cursor past end",
+            Self::IndexRecordHasNoColumns => "index record has no columns",
+            Self::InteriorIndexPageHasNoCells => "interior index page has no cells",
+            Self::InvalidRecordHeaderLength => "invalid record header length",
+            Self::MappedColumnIndexOutOfBounds => "mapped column index out of bounds",
+            Self::MissingChildPointer => "missing child pointer",
+            Self::MissingRightMostChildPointer => "missing right-most child pointer",
+            Self::OverflowPageTooSmall => "overflow page too small",
+            Self::OverflowPageUsableSizeTooSmall => "overflow page usable size too small",
+            Self::OverflowPointerOutOfBounds => "overflow pointer out of bounds",
+            Self::PageHeaderOffsetOutOfBounds => "page header offset out of bounds",
+            Self::PageHeaderTruncated => "page header truncated",
+            Self::PayloadExtendsPastPageBoundary => "payload extends past page boundary",
+            Self::PayloadIsTooLarge => "payload is too large",
+            Self::PayloadLengthUnderflow => "payload length underflow",
+            Self::PredicateColumnNotDecoded => "predicate column not decoded",
+            Self::RecordHeaderTruncated => "record header truncated",
+            Self::RecordPayloadShorterThanDeclared => "record payload shorter than declared",
+            Self::RowColumnCountMismatch => "row column count does not match table schema",
+            Self::ScanOverflowPayloadUnsupported => "scan does not support overflow payloads",
+            Self::UsableSizeUnderflow => "usable size underflow",
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryError {
+    AggregateProjectionEmpty,
+    NonAggregateRequiresGroupBy,
+    NonAggregateMustAppearInGroupBy,
+    AggregateRequiresGroupByOrFunctions,
+    AggregateExprOnlyColOrLit,
+}
+
+impl QueryError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::AggregateProjectionEmpty => "aggregate projection cannot be empty",
+            Self::NonAggregateRequiresGroupBy => "non-aggregate expression requires GROUP BY",
+            Self::NonAggregateMustAppearInGroupBy => {
+                "non-aggregate expression must appear in GROUP BY"
+            }
+            Self::AggregateRequiresGroupByOrFunctions => {
+                "aggregate query requires GROUP BY or aggregate functions"
+            }
+            Self::AggregateExprOnlyColOrLit => {
+                "aggregate expressions support only column and literal operands"
+            }
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScratchKind {
+    Bytes,
+    Serials,
+    Offsets,
+    Values,
+}
+
+impl ScratchKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::Serials => "serials",
+            Self::Offsets => "offsets",
+            Self::Values => "values",
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    Null,
+    Integer,
+    Real,
+    Text,
+    Blob,
+    Bytes,
+    Missing,
+}
+
+impl ValueKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Null => "NULL",
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+            Self::Bytes => "BYTES",
+            Self::Missing => "<missing>",
+        }
+    }
+}
+
 /// Table decoding and validation errors.
 #[non_exhaustive]
 #[derive(Debug)]
@@ -16,13 +180,13 @@ pub enum Error {
     Pager(crate::pager::Error),
     UnsupportedPageType(u8),
     UnsupportedSerialType(u64),
-    Corrupted(&'static str),
-    Query(&'static str),
+    Corrupted(Corruption),
+    Query(QueryError),
     InvalidColumnIndex { col: u16, column_count: usize },
-    ScratchTooSmall { kind: &'static str, needed: usize, capacity: usize },
-    TypeMismatch { col: usize, expected: &'static str, got: &'static str },
+    ScratchTooSmall { kind: ScratchKind, needed: usize, capacity: usize },
+    TypeMismatch { col: usize, expected: ValueKind, got: ValueKind },
     Utf8(str::Utf8Error),
-    TableNotFound(String),
+    TableNotFound,
     PayloadTooLarge(usize),
     OverflowChainTruncated,
     OverflowLoopDetected,
@@ -37,21 +201,28 @@ impl fmt::Display for Error {
             Self::UnsupportedSerialType(serial) => {
                 write!(f, "Unsupported record serial type: {serial}")
             }
-            Self::Corrupted(msg) => write!(f, "Corrupted table page: {msg}"),
-            Self::Query(msg) => write!(f, "Query error: {msg}"),
+            Self::Corrupted(kind) => write!(f, "Corrupted table page: {}", kind.message()),
+            Self::Query(kind) => write!(f, "Query error: {}", kind.message()),
             Self::InvalidColumnIndex { col, column_count } => {
                 write!(f, "Invalid column index {col} (column count {column_count})")
             }
             Self::ScratchTooSmall { kind, needed, capacity } => {
-                write!(f, "Scratch buffer too small ({kind}): need {needed}, capacity {capacity}")
+                write!(
+                    f,
+                    "Scratch buffer too small ({}): need {needed}, capacity {capacity}",
+                    kind.as_str()
+                )
             }
             Self::TypeMismatch { col, expected, got } => {
-                write!(f, "Type mismatch at column {col}: expected {expected}, got {got}")
+                write!(
+                    f,
+                    "Type mismatch at column {col}: expected {}, got {}",
+                    expected.as_str(),
+                    got.as_str()
+                )
             }
             Self::Utf8(err) => write!(f, "{err}"),
-            Self::TableNotFound(name) => {
-                write!(f, "Table '{name}' not found in sqlite_schema")
-            }
+            Self::TableNotFound => f.write_str("Table not found in sqlite_schema"),
             Self::PayloadTooLarge(size) => write!(f, "Payload too large: {size} bytes"),
             Self::OverflowChainTruncated => f.write_str("Overflow chain is truncated"),
             Self::OverflowLoopDetected => f.write_str("Overflow chain contains a loop"),
@@ -366,15 +537,15 @@ impl<'row> RowView<'row> {
     #[inline]
     pub fn from_inline(payload: &'row [u8]) -> Result<Self> {
         let mut header_pos = 0usize;
-        let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+        let first = *payload.first().ok_or(Error::Corrupted(Corruption::RecordHeaderTruncated))?;
         let header_len = if first < 0x80 {
             header_pos = 1;
             first as usize
         } else {
-            read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+            read_varint_at(payload, &mut header_pos, Corruption::RecordHeaderTruncated)? as usize
         };
         if header_len < header_pos || header_len > payload.len() {
-            return Err(Error::Corrupted("invalid record header length"));
+            return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
         }
 
         let serial_bytes = &payload[header_pos..header_len];
@@ -431,7 +602,11 @@ impl<'row> RowView<'row> {
                 serial_pos += 1;
                 b as u64
             } else {
-                read_varint_at(self.serial_bytes, &mut serial_pos, "record header truncated")?
+                read_varint_at(
+                    self.serial_bytes,
+                    &mut serial_pos,
+                    Corruption::RecordHeaderTruncated,
+                )?
             };
 
             if current_col == col_idx {
@@ -454,7 +629,7 @@ impl<'row> RowView<'row> {
             Some(ValueRef::Integer(v)) => Ok(v),
             Some(other) => Err(Error::TypeMismatch {
                 col: col_idx,
-                expected: "INTEGER",
+                expected: ValueKind::Integer,
                 got: value_ref_kind(other),
             }),
             None => Err(Error::InvalidColumnIndex {
@@ -471,7 +646,7 @@ impl<'row> RowView<'row> {
             Some(ValueRef::Text(bytes)) => Ok(str::from_utf8(bytes)?),
             Some(other) => Err(Error::TypeMismatch {
                 col: col_idx,
-                expected: "TEXT",
+                expected: ValueKind::Text,
                 got: value_ref_kind(other),
             }),
             None => Err(Error::InvalidColumnIndex {
@@ -488,7 +663,7 @@ impl<'row> RowView<'row> {
             Some(ValueRef::Text(bytes)) | Some(ValueRef::Blob(bytes)) => Ok(bytes),
             Some(other) => Err(Error::TypeMismatch {
                 col: col_idx,
-                expected: "BYTES",
+                expected: ValueKind::Bytes,
                 got: value_ref_kind(other),
             }),
             None => Err(Error::InvalidColumnIndex {
@@ -549,7 +724,11 @@ impl RowCache {
                 serial_pos += 1;
                 b as u64
             } else {
-                read_varint_at(row.serial_bytes, &mut serial_pos, "record header truncated")?
+                read_varint_at(
+                    row.serial_bytes,
+                    &mut serial_pos,
+                    Corruption::RecordHeaderTruncated,
+                )?
             };
 
             self.serials.push(serial);
@@ -594,7 +773,7 @@ impl<'row, 'cache> CachedRowView<'row, 'cache> {
             Some(ValueRef::Integer(v)) => Ok(v),
             Some(other) => Err(Error::TypeMismatch {
                 col: col_idx,
-                expected: "INTEGER",
+                expected: ValueKind::Integer,
                 got: value_ref_kind(other),
             }),
             None => Err(Error::InvalidColumnIndex {
@@ -611,7 +790,7 @@ impl<'row, 'cache> CachedRowView<'row, 'cache> {
             Some(ValueRef::Text(bytes)) => Ok(str::from_utf8(bytes)?),
             Some(other) => Err(Error::TypeMismatch {
                 col: col_idx,
-                expected: "TEXT",
+                expected: ValueKind::Text,
                 got: value_ref_kind(other),
             }),
             None => Err(Error::InvalidColumnIndex {
@@ -628,7 +807,7 @@ impl<'row, 'cache> CachedRowView<'row, 'cache> {
             Some(ValueRef::Text(bytes)) | Some(ValueRef::Blob(bytes)) => Ok(bytes),
             Some(other) => Err(Error::TypeMismatch {
                 col: col_idx,
-                expected: "BYTES",
+                expected: ValueKind::Bytes,
                 got: value_ref_kind(other),
             }),
             None => Err(Error::InvalidColumnIndex {
@@ -640,13 +819,13 @@ impl<'row, 'cache> CachedRowView<'row, 'cache> {
 }
 
 #[inline]
-fn value_ref_kind(value: ValueRef<'_>) -> &'static str {
+fn value_ref_kind(value: ValueRef<'_>) -> ValueKind {
     match value {
-        ValueRef::Null => "NULL",
-        ValueRef::Integer(_) => "INTEGER",
-        ValueRef::Real(_) => "REAL",
-        ValueRef::Text(_) => "TEXT",
-        ValueRef::Blob(_) => "BLOB",
+        ValueRef::Null => ValueKind::Null,
+        ValueRef::Integer(_) => ValueKind::Integer,
+        ValueRef::Real(_) => ValueKind::Real,
+        ValueRef::Text(_) => ValueKind::Text,
+        ValueRef::Blob(_) => ValueKind::Blob,
     }
 }
 
@@ -709,7 +888,7 @@ where
     while let Some(page_id) = stack.pop() {
         seen_pages += 1;
         if seen_pages > max_pages {
-            return Err(Error::Corrupted("btree page cycle detected"));
+            return Err(Error::Corrupted(Corruption::BtreePageCycleDetected));
         }
 
         let page = pager.page(page_id)?;
@@ -728,7 +907,7 @@ where
                         }
                         PayloadRef::Overflow(_) => {
                             return Err(Error::Corrupted(
-                                "scan does not support overflow payloads",
+                                Corruption::ScanOverflowPayloadUnsupported,
                             ));
                         }
                     }
@@ -737,7 +916,7 @@ where
             BTreeKind::TableInterior => {
                 if let Some(right_most) = header.right_most_child {
                     let right_most = PageId::try_new(right_most)
-                        .ok_or(Error::Corrupted("child page id is zero"))?;
+                        .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
                     stack.push(right_most);
                 }
 
@@ -745,15 +924,16 @@ where
                 for idx in (0..header.cell_count as usize).rev() {
                     let offset = cell_ptr_at(cell_ptrs, idx)?;
                     if offset as usize >= page_len {
-                        return Err(Error::Corrupted("cell offset out of bounds"));
+                        return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
                     }
 
                     let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
-                    let child = read_u32_checked(&mut decoder, "cell child pointer truncated")?;
                     let child =
-                        PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
+                        read_u32_checked(&mut decoder, Corruption::CellChildPointerTruncated)?;
+                    let child = PageId::try_new(child)
+                        .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
 
-                    let _ = read_varint_checked(&mut decoder, "cell key truncated")?;
+                    let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
                     stack.push(child);
                 }
             }
@@ -772,7 +952,7 @@ fn read_scan_cell<'row>(
 ) -> Result<(i64, PayloadRef<'row>)> {
     let usable = page.usable_bytes();
     if offset as usize >= usable.len() {
-        return Err(Error::Corrupted("cell offset out of bounds"));
+        return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
     }
 
     let mut pos = offset as usize;
@@ -782,23 +962,24 @@ fn read_scan_cell<'row>(
         let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) } as i64;
         (payload_length, rowid)
     } else {
-        let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
-        let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+        let payload_length =
+            read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?;
+        let rowid = read_varint_at(usable, &mut pos, Corruption::CellRowIdTruncated)? as i64;
         (payload_length, rowid)
     };
-    let payload_length =
-        usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
+    let payload_length = usize::try_from(payload_length)
+        .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
     if payload_length > MAX_PAYLOAD_BYTES {
         return Err(Error::PayloadTooLarge(payload_length));
     }
 
     let start = pos;
     let usable_size = page.usable_size();
-    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted("usable size underflow"))?;
+    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted(Corruption::UsableSizeUnderflow))?;
     if payload_length <= x {
         let end = start + payload_length;
         if end > usable.len() {
-            return Err(Error::Corrupted("payload extends past page boundary"));
+            return Err(Error::Corrupted(Corruption::PayloadExtendsPastPageBoundary));
         }
         return Ok((rowid, PayloadRef::Inline(&usable[start..end])));
     }
@@ -807,12 +988,12 @@ fn read_scan_cell<'row>(
     let local_len = local_payload_len(usable_size, payload_length)?;
     let end_local = start + local_len;
     if end_local > usable.len() {
-        return Err(Error::Corrupted("payload extends past page boundary"));
+        return Err(Error::Corrupted(Corruption::PayloadExtendsPastPageBoundary));
     }
 
     let overflow_end = end_local + 4;
     if overflow_end > usable.len() {
-        return Err(Error::Corrupted("overflow pointer out of bounds"));
+        return Err(Error::Corrupted(Corruption::OverflowPointerOutOfBounds));
     }
     let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
     if overflow_page == 0 {
@@ -844,7 +1025,7 @@ pub fn lookup_rowid_cell<'row>(
     loop {
         seen_pages += 1;
         if seen_pages > max_pages {
-            return Err(Error::Corrupted("btree page cycle detected"));
+            return Err(Error::Corrupted(Corruption::BtreePageCycleDetected));
         }
 
         let page = pager.page(page_id)?;
@@ -902,9 +1083,9 @@ pub fn lookup_rowid_cell<'row>(
                 } else {
                     let right_most = header
                         .right_most_child
-                        .ok_or(Error::Corrupted("missing right-most child pointer"))?;
+                        .ok_or(Error::Corrupted(Corruption::MissingRightMostChildPointer))?;
                     page_id = PageId::try_new(right_most)
-                        .ok_or(Error::Corrupted("child page id is zero"))?;
+                        .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
                 }
             }
         }
@@ -962,7 +1143,7 @@ where
     while let Some(page_id) = stack.pop() {
         seen_pages += 1;
         if seen_pages > max_pages {
-            return Err(Error::Corrupted("btree page cycle detected"));
+            return Err(Error::Corrupted(Corruption::BtreePageCycleDetected));
         }
 
         let page = pager.page(page_id)?;
@@ -980,7 +1161,7 @@ where
             BTreeKind::TableInterior => {
                 if let Some(right_most) = header.right_most_child {
                     let right_most = PageId::try_new(right_most)
-                        .ok_or(Error::Corrupted("child page id is zero"))?;
+                        .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
                     stack.push(right_most);
                 }
 
@@ -988,15 +1169,16 @@ where
                 for idx in (0..header.cell_count as usize).rev() {
                     let offset = cell_ptr_at(cell_ptrs, idx)?;
                     if offset as usize >= page_len {
-                        return Err(Error::Corrupted("cell offset out of bounds"));
+                        return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
                     }
 
                     let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
-                    let child = read_u32_checked(&mut decoder, "cell child pointer truncated")?;
                     let child =
-                        PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
+                        read_u32_checked(&mut decoder, Corruption::CellChildPointerTruncated)?;
+                    let child = PageId::try_new(child)
+                        .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
 
-                    let _ = read_varint_checked(&mut decoder, "cell key truncated")?;
+                    let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
                     stack.push(child);
                 }
             }
@@ -1020,7 +1202,7 @@ where
     while let Some(page_id) = stack.pop() {
         seen_pages += 1;
         if seen_pages > max_pages {
-            return Err(Error::Corrupted("btree page cycle detected"));
+            return Err(Error::Corrupted(Corruption::BtreePageCycleDetected));
         }
 
         let page = pager.page(page_id)?;
@@ -1040,7 +1222,7 @@ where
             BTreeKind::TableInterior => {
                 if let Some(right_most) = header.right_most_child {
                     let right_most = PageId::try_new(right_most)
-                        .ok_or(Error::Corrupted("child page id is zero"))?;
+                        .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
                     stack.push(right_most);
                 }
 
@@ -1048,15 +1230,16 @@ where
                 for idx in (0..header.cell_count as usize).rev() {
                     let offset = cell_ptr_at(cell_ptrs, idx)?;
                     if offset as usize >= page_len {
-                        return Err(Error::Corrupted("cell offset out of bounds"));
+                        return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
                     }
 
                     let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
-                    let child = read_u32_checked(&mut decoder, "cell child pointer truncated")?;
                     let child =
-                        PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
+                        read_u32_checked(&mut decoder, Corruption::CellChildPointerTruncated)?;
+                    let child = PageId::try_new(child)
+                        .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
 
-                    let _ = read_varint_checked(&mut decoder, "cell key truncated")?;
+                    let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
                     stack.push(child);
                 }
             }
@@ -1075,7 +1258,7 @@ fn read_table_cell_ref<'row>(
 ) -> Result<CellRef<'row>> {
     let usable = page.usable_bytes();
     if offset as usize >= usable.len() {
-        return Err(Error::Corrupted("cell offset out of bounds"));
+        return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
     }
 
     let mut pos = offset as usize;
@@ -1087,23 +1270,24 @@ fn read_table_cell_ref<'row>(
         let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) } as i64;
         (payload_length, rowid)
     } else {
-        let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
-        let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+        let payload_length =
+            read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?;
+        let rowid = read_varint_at(usable, &mut pos, Corruption::CellRowIdTruncated)? as i64;
         (payload_length, rowid)
     };
-    let payload_length =
-        usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
+    let payload_length = usize::try_from(payload_length)
+        .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
     if payload_length > MAX_PAYLOAD_BYTES {
         return Err(Error::PayloadTooLarge(payload_length));
     }
 
     let start = pos;
     let usable_size = page.usable_size();
-    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted("usable size underflow"))?;
+    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted(Corruption::UsableSizeUnderflow))?;
     if payload_length <= x {
         let end = start + payload_length;
         if end > usable.len() {
-            return Err(Error::Corrupted("payload extends past page boundary"));
+            return Err(Error::Corrupted(Corruption::PayloadExtendsPastPageBoundary));
         }
         return Ok(CellRef {
             rowid,
@@ -1116,12 +1300,12 @@ fn read_table_cell_ref<'row>(
     let local_len = local_payload_len(usable_size, payload_length)?;
     let end_local = start + local_len;
     if end_local > usable.len() {
-        return Err(Error::Corrupted("payload extends past page boundary"));
+        return Err(Error::Corrupted(Corruption::PayloadExtendsPastPageBoundary));
     }
 
     let overflow_end = end_local + 4;
     if overflow_end > usable.len() {
-        return Err(Error::Corrupted("overflow pointer out of bounds"));
+        return Err(Error::Corrupted(Corruption::OverflowPointerOutOfBounds));
     }
     let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
     if overflow_page == 0 {
@@ -1142,7 +1326,7 @@ pub(crate) fn read_table_cell_ref_from_bytes<'row>(
     let usable = &page_bytes[..usable_end];
 
     if offset as usize >= usable.len() {
-        return Err(Error::Corrupted("cell offset out of bounds"));
+        return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
     }
 
     let mut pos = offset as usize;
@@ -1154,23 +1338,24 @@ pub(crate) fn read_table_cell_ref_from_bytes<'row>(
         let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) } as i64;
         (payload_length, rowid)
     } else {
-        let payload_length = read_varint_at(usable, &mut pos, "cell payload length truncated")?;
-        let rowid = read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64;
+        let payload_length =
+            read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?;
+        let rowid = read_varint_at(usable, &mut pos, Corruption::CellRowIdTruncated)? as i64;
         (payload_length, rowid)
     };
-    let payload_length =
-        usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
+    let payload_length = usize::try_from(payload_length)
+        .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
     if payload_length > MAX_PAYLOAD_BYTES {
         return Err(Error::PayloadTooLarge(payload_length));
     }
 
     let start = pos;
     let usable_size = pager.header().usable_size;
-    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted("usable size underflow"))?;
+    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted(Corruption::UsableSizeUnderflow))?;
     if payload_length <= x {
         let end = start + payload_length;
         if end > usable.len() {
-            return Err(Error::Corrupted("payload extends past page boundary"));
+            return Err(Error::Corrupted(Corruption::PayloadExtendsPastPageBoundary));
         }
         return Ok(CellRef {
             rowid,
@@ -1183,12 +1368,12 @@ pub(crate) fn read_table_cell_ref_from_bytes<'row>(
     let local_len = local_payload_len(usable_size, payload_length)?;
     let end_local = start + local_len;
     if end_local > usable.len() {
-        return Err(Error::Corrupted("payload extends past page boundary"));
+        return Err(Error::Corrupted(Corruption::PayloadExtendsPastPageBoundary));
     }
 
     let overflow_end = end_local + 4;
     if overflow_end > usable.len() {
-        return Err(Error::Corrupted("overflow pointer out of bounds"));
+        return Err(Error::Corrupted(Corruption::OverflowPointerOutOfBounds));
     }
     let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
     if overflow_page == 0 {
@@ -1202,7 +1387,7 @@ pub(crate) fn read_table_cell_ref_from_bytes<'row>(
 fn read_table_leaf_rowid(page: &PageRef<'_>, offset: u16) -> Result<i64> {
     let usable = page.usable_bytes();
     if offset as usize >= usable.len() {
-        return Err(Error::Corrupted("cell offset out of bounds"));
+        return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
     }
 
     let mut pos = offset as usize;
@@ -1212,10 +1397,10 @@ fn read_table_leaf_rowid(page: &PageRef<'_>, offset: u16) -> Result<i64> {
         // in-bounds.
         unsafe { read_varint_unchecked_at(usable, &mut pos) }
     } else {
-        read_varint_at(usable, &mut pos, "cell payload length truncated")?
+        read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?
     };
-    let payload_length =
-        usize::try_from(payload_length).map_err(|_| Error::Corrupted("payload is too large"))?;
+    let payload_length = usize::try_from(payload_length)
+        .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
     if payload_length > MAX_PAYLOAD_BYTES {
         return Err(Error::PayloadTooLarge(payload_length));
     }
@@ -1224,7 +1409,7 @@ fn read_table_leaf_rowid(page: &PageRef<'_>, offset: u16) -> Result<i64> {
         // in-bounds.
         (unsafe { read_varint_unchecked_at(usable, &mut pos) }) as i64
     } else {
-        read_varint_at(usable, &mut pos, "cell rowid truncated")? as i64
+        read_varint_at(usable, &mut pos, Corruption::CellRowIdTruncated)? as i64
     };
     Ok(rowid)
 }
@@ -1233,7 +1418,7 @@ fn read_table_interior_cell(page: &PageRef<'_>, offset: u16) -> Result<(PageId, 
     let usable = page.usable_bytes();
     let start = offset as usize;
     if start + 4 > usable.len() {
-        return Err(Error::Corrupted("cell offset out of bounds"));
+        return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
     }
 
     let child = u32::from_be_bytes([
@@ -1242,9 +1427,9 @@ fn read_table_interior_cell(page: &PageRef<'_>, offset: u16) -> Result<(PageId, 
         usable[start + 2],
         usable[start + 3],
     ]);
-    let child = PageId::try_new(child).ok_or(Error::Corrupted("child page id is zero"))?;
+    let child = PageId::try_new(child).ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
     let mut pos = start + 4;
-    let key = read_varint_at(usable, &mut pos, "cell key truncated")? as i64;
+    let key = read_varint_at(usable, &mut pos, Corruption::CellKeyTruncated)? as i64;
     Ok((child, key))
 }
 
@@ -1261,8 +1446,9 @@ pub(crate) fn assemble_overflow_payload(
     overflow_buf.reserve(payload_len);
     overflow_buf.extend_from_slice(local_bytes);
 
-    let mut remaining =
-        payload_len.checked_sub(local_len).ok_or(Error::Corrupted("payload length underflow"))?;
+    let mut remaining = payload_len
+        .checked_sub(local_len)
+        .ok_or(Error::Corrupted(Corruption::PayloadLengthUnderflow))?;
 
     let mut visited = 0u32;
     let max_pages = pager.page_count().max(1);
@@ -1276,13 +1462,13 @@ pub(crate) fn assemble_overflow_payload(
         let page_id = PageId::try_new(overflow_page).ok_or(Error::OverflowChainTruncated)?;
         let page_bytes = pager.page_bytes(page_id)?;
         if page_bytes.len() < 4 {
-            return Err(Error::Corrupted("overflow page too small"));
+            return Err(Error::Corrupted(Corruption::OverflowPageTooSmall));
         }
 
         let next_page = u32::from_be_bytes(page_bytes[0..4].try_into().unwrap());
         let usable = pager.header().usable_size.min(page_bytes.len());
         if usable < 4 {
-            return Err(Error::Corrupted("overflow page usable size too small"));
+            return Err(Error::Corrupted(Corruption::OverflowPageUsableSizeTooSmall));
         }
         let content = &page_bytes[4..usable];
         let take = remaining.min(content.len());
@@ -1305,7 +1491,7 @@ pub(crate) fn assemble_overflow_payload(
     Ok(())
 }
 
-fn push_checked<T>(out: &mut Vec<T>, value: T, kind: &'static str) -> Result<()> {
+fn push_checked<T>(out: &mut Vec<T>, value: T, kind: ScratchKind) -> Result<()> {
     if out.len() == out.capacity() {
         let needed = out.len().saturating_add(1);
         return Err(Error::ScratchTooSmall { kind, needed, capacity: out.capacity() });
@@ -1317,7 +1503,11 @@ fn push_checked<T>(out: &mut Vec<T>, value: T, kind: &'static str) -> Result<()>
 fn ensure_bytes_capacity(bytes: &Vec<u8>, additional: usize) -> Result<()> {
     let needed = bytes.len().saturating_add(additional);
     if needed > bytes.capacity() {
-        return Err(Error::ScratchTooSmall { kind: "bytes", needed, capacity: bytes.capacity() });
+        return Err(Error::ScratchTooSmall {
+            kind: ScratchKind::Bytes,
+            needed,
+            capacity: bytes.capacity(),
+        });
     }
     Ok(())
 }
@@ -1335,7 +1525,7 @@ struct OverflowCursor<'row> {
 impl<'row> OverflowCursor<'row> {
     fn new(payload: &'row OverflowPayload<'row>, offset: usize) -> Result<Self> {
         if offset > payload.total_len {
-            return Err(Error::Corrupted("record payload shorter than declared"));
+            return Err(Error::Corrupted(Corruption::RecordPayloadShorterThanDeclared));
         }
 
         let mut cursor = Self {
@@ -1359,7 +1549,7 @@ impl<'row> OverflowCursor<'row> {
         self.segment_start + self.segment.len()
     }
 
-    fn ensure_segment(&mut self, msg: &'static str) -> Result<()> {
+    fn ensure_segment(&mut self, msg: Corruption) -> Result<()> {
         if self.pos < self.segment_end() {
             return Ok(());
         }
@@ -1381,13 +1571,13 @@ impl<'row> OverflowCursor<'row> {
         let page_id = PageId::try_new(self.next_overflow).ok_or(Error::OverflowChainTruncated)?;
         let page_bytes = self.payload.pager.page_bytes(page_id)?;
         if page_bytes.len() < 4 {
-            return Err(Error::Corrupted("overflow page too small"));
+            return Err(Error::Corrupted(Corruption::OverflowPageTooSmall));
         }
 
         let next_page = u32::from_be_bytes(page_bytes[0..4].try_into().unwrap());
         let usable = self.payload.pager.header().usable_size.min(page_bytes.len());
         if usable < 4 {
-            return Err(Error::Corrupted("overflow page usable size too small"));
+            return Err(Error::Corrupted(Corruption::OverflowPageUsableSizeTooSmall));
         }
         let content = &page_bytes[4..usable];
 
@@ -1397,7 +1587,7 @@ impl<'row> OverflowCursor<'row> {
         Ok(())
     }
 
-    fn read_byte(&mut self, msg: &'static str) -> Result<u8> {
+    fn read_byte(&mut self, msg: Corruption) -> Result<u8> {
         self.ensure_segment(msg)?;
         if self.pos >= self.segment_end() {
             return Err(Error::Corrupted(msg));
@@ -1408,7 +1598,7 @@ impl<'row> OverflowCursor<'row> {
         Ok(byte)
     }
 
-    fn read_varint(&mut self, msg: &'static str) -> Result<u64> {
+    fn read_varint(&mut self, msg: Corruption) -> Result<u64> {
         let first = self.read_byte(msg)?;
         if first & 0x80 == 0 {
             return Ok(u64::from(first));
@@ -1427,7 +1617,7 @@ impl<'row> OverflowCursor<'row> {
         Ok((result << 8) | u64::from(byte))
     }
 
-    fn read_bytes_into(&mut self, out: &mut [u8], msg: &'static str) -> Result<()> {
+    fn read_bytes_into(&mut self, out: &mut [u8], msg: Corruption) -> Result<()> {
         let mut written = 0usize;
         while written < out.len() {
             self.ensure_segment(msg)?;
@@ -1447,7 +1637,7 @@ impl<'row> OverflowCursor<'row> {
     fn read_signed_be(&mut self, len: usize) -> Result<i64> {
         let mut buf = [0u8; 8];
         let start = 8 - len;
-        self.read_bytes_into(&mut buf[start..], "record payload shorter than declared")?;
+        self.read_bytes_into(&mut buf[start..], Corruption::RecordPayloadShorterThanDeclared)?;
         let value = u64::from_be_bytes(buf);
         let shift = (8 - len) * 8;
         Ok(((value << shift) as i64) >> shift)
@@ -1455,7 +1645,7 @@ impl<'row> OverflowCursor<'row> {
 
     fn read_u64_be(&mut self) -> Result<u64> {
         let mut buf = [0u8; 8];
-        self.read_bytes_into(&mut buf, "record payload shorter than declared")?;
+        self.read_bytes_into(&mut buf, Corruption::RecordPayloadShorterThanDeclared)?;
         Ok(u64::from_be_bytes(buf))
     }
 
@@ -1464,7 +1654,7 @@ impl<'row> OverflowCursor<'row> {
             return Ok(BytesSpan::mmap(&[]));
         }
 
-        self.ensure_segment("record payload shorter than declared")?;
+        self.ensure_segment(Corruption::RecordPayloadShorterThanDeclared)?;
         let available = self.segment_end() - self.pos;
         if len <= available {
             let offset = self.pos - self.segment_start;
@@ -1477,7 +1667,7 @@ impl<'row> OverflowCursor<'row> {
         let start = bytes.len();
         let mut remaining = len;
         while remaining > 0 {
-            self.ensure_segment("record payload shorter than declared")?;
+            self.ensure_segment(Corruption::RecordPayloadShorterThanDeclared)?;
             let available = self.segment_end() - self.pos;
             if available == 0 {
                 continue;
@@ -1495,7 +1685,7 @@ impl<'row> OverflowCursor<'row> {
 
     fn skip(&mut self, mut len: usize) -> Result<()> {
         while len > 0 {
-            self.ensure_segment("record payload shorter than declared")?;
+            self.ensure_segment(Corruption::RecordPayloadShorterThanDeclared)?;
             let available = self.segment_end() - self.pos;
             if available == 0 {
                 continue;
@@ -1522,20 +1712,20 @@ fn decode_record_project_into_overflow(
     offsets.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
-    let header_len = serial_cursor.read_varint("record header truncated")? as usize;
+    let header_len = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)? as usize;
     let header_pos = serial_cursor.position();
     if header_len < header_pos || header_len > payload.total_len {
-        return Err(Error::Corrupted("invalid record header length"));
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
     }
 
     let mut value_pos = header_len;
     while serial_cursor.position() < header_len {
-        let serial = serial_cursor.read_varint("record header truncated")?;
+        let serial = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)?;
         if serial_cursor.position() > header_len {
-            return Err(Error::Corrupted("record header truncated"));
+            return Err(Error::Corrupted(Corruption::RecordHeaderTruncated));
         }
-        push_checked(serials, serial, "serials")?;
-        push_checked(offsets, value_pos as u32, "offsets")?;
+        push_checked(serials, serial, ScratchKind::Serials)?;
+        push_checked(offsets, value_pos as u32, ScratchKind::Offsets)?;
         value_pos += serial_type_len_fast(serial);
     }
 
@@ -1547,7 +1737,7 @@ fn decode_record_project_into_overflow(
             let col_idx = idx as u16;
             if Some(col_idx) == next_needed {
                 let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, bytes)?;
-                push_checked(out, raw, "values")?;
+                push_checked(out, raw, ScratchKind::Values)?;
                 next_needed = needed_iter.next();
             } else {
                 skip_value_at_cursor(serial, &mut value_cursor)?;
@@ -1556,7 +1746,7 @@ fn decode_record_project_into_overflow(
     } else {
         for serial in serials.iter().copied() {
             let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, bytes)?;
-            push_checked(out, raw, "values")?;
+            push_checked(out, raw, ScratchKind::Values)?;
         }
     }
 
@@ -1608,15 +1798,15 @@ pub(crate) fn record_column_count(payload: PayloadRef<'_>) -> Result<usize> {
 
 fn record_column_count_bytes(payload: &[u8]) -> Result<usize> {
     let mut header_pos = 0usize;
-    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let first = *payload.first().ok_or(Error::Corrupted(Corruption::RecordHeaderTruncated))?;
     let header_len = if first < 0x80 {
         header_pos = 1;
         first as usize
     } else {
-        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+        read_varint_at(payload, &mut header_pos, Corruption::RecordHeaderTruncated)? as usize
     };
     if header_len < header_pos || header_len > payload.len() {
-        return Err(Error::Corrupted("invalid record header length"));
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
     }
 
     let serial_bytes = &payload[header_pos..header_len];
@@ -1627,7 +1817,7 @@ fn record_column_count_bytes(payload: &[u8]) -> Result<usize> {
         if b < 0x80 {
             serial_pos += 1;
         } else {
-            read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?;
+            read_varint_at(serial_bytes, &mut serial_pos, Corruption::RecordHeaderTruncated)?;
         }
         count += 1;
     }
@@ -1637,17 +1827,17 @@ fn record_column_count_bytes(payload: &[u8]) -> Result<usize> {
 
 fn record_column_count_overflow(payload: &OverflowPayload<'_>) -> Result<usize> {
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
-    let header_len = serial_cursor.read_varint("record header truncated")? as usize;
+    let header_len = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)? as usize;
     let header_pos = serial_cursor.position();
     if header_len < header_pos || header_len > payload.total_len {
-        return Err(Error::Corrupted("invalid record header length"));
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
     }
 
     let mut count = 0usize;
     while serial_cursor.position() < header_len {
-        let _serial = serial_cursor.read_varint("record header truncated")?;
+        let _serial = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)?;
         if serial_cursor.position() > header_len {
-            return Err(Error::Corrupted("record header truncated"));
+            return Err(Error::Corrupted(Corruption::RecordHeaderTruncated));
         }
         count += 1;
     }
@@ -1668,15 +1858,15 @@ fn decode_record_project_into_bytes(
     offsets.clear();
 
     let mut header_pos = 0usize;
-    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let first = *payload.first().ok_or(Error::Corrupted(Corruption::RecordHeaderTruncated))?;
     let header_len = if first < 0x80 {
         header_pos = 1;
         first as usize
     } else {
-        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+        read_varint_at(payload, &mut header_pos, Corruption::RecordHeaderTruncated)? as usize
     };
     if header_len < header_pos || header_len > payload.len() {
-        return Err(Error::Corrupted("invalid record header length"));
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
     }
 
     let serial_bytes = &payload[header_pos..header_len];
@@ -1702,7 +1892,7 @@ fn decode_record_project_into_bytes(
                 serial_pos += 1;
                 b as u64
             } else {
-                read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
+                read_varint_at(serial_bytes, &mut serial_pos, Corruption::RecordHeaderTruncated)?
             };
             serials.push(serial);
             offsets.push(value_pos as u32);
@@ -1731,7 +1921,7 @@ fn decode_record_project_into_bytes(
         // Check capacity once before decoding
         if out.capacity() < needed_cols.len() {
             return Err(Error::ScratchTooSmall {
-                kind: "values",
+                kind: ScratchKind::Values,
                 needed: needed_cols.len(),
                 capacity: out.capacity(),
             });
@@ -1773,7 +1963,7 @@ fn decode_record_project_into_bytes(
         let estimated_cols = serial_bytes.len();
         if out.capacity() < estimated_cols {
             return Err(Error::ScratchTooSmall {
-                kind: "values",
+                kind: ScratchKind::Values,
                 needed: estimated_cols,
                 capacity: out.capacity(),
             });
@@ -1789,7 +1979,7 @@ fn decode_record_project_into_bytes(
                 serial_pos += 1;
                 b as u64
             } else {
-                read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
+                read_varint_at(serial_bytes, &mut serial_pos, Corruption::RecordHeaderTruncated)?
             };
 
             // Decode value immediately - no capacity check needed
@@ -1843,15 +2033,15 @@ fn decode_record_project_into_bytes_mapped(
     out.resize(needed_map.len(), ValueSlot::Null);
 
     let mut header_pos = 0usize;
-    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let first = *payload.first().ok_or(Error::Corrupted(Corruption::RecordHeaderTruncated))?;
     let header_len = if first < 0x80 {
         header_pos = 1;
         first as usize
     } else {
-        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+        read_varint_at(payload, &mut header_pos, Corruption::RecordHeaderTruncated)? as usize
     };
     if header_len < header_pos || header_len > payload.len() {
-        return Err(Error::Corrupted("invalid record header length"));
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
     }
 
     let serial_bytes = &payload[header_pos..header_len];
@@ -1867,7 +2057,7 @@ fn decode_record_project_into_bytes_mapped(
             serial_pos += 1;
             b as u64
         } else {
-            read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
+            read_varint_at(serial_bytes, &mut serial_pos, Corruption::RecordHeaderTruncated)?
         };
         let col_idx = column_count as u16;
         if let Some((needed_col, out_idx)) = next_needed
@@ -1875,7 +2065,7 @@ fn decode_record_project_into_bytes_mapped(
         {
             let value = decode_value_ref_at(serial, payload, &mut value_pos)?;
             if out_idx >= out.len() {
-                return Err(Error::Corrupted("mapped column index out of bounds"));
+                return Err(Error::Corrupted(Corruption::MappedColumnIndexOutOfBounds));
             }
             out[out_idx] = value;
             next_needed = needed_iter.next();
@@ -1903,20 +2093,20 @@ fn decode_record_project_into_overflow_mapped(
     offsets.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
-    let header_len = serial_cursor.read_varint("record header truncated")? as usize;
+    let header_len = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)? as usize;
     let header_pos = serial_cursor.position();
     if header_len < header_pos || header_len > payload.total_len {
-        return Err(Error::Corrupted("invalid record header length"));
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
     }
 
     let mut value_pos = header_len;
     while serial_cursor.position() < header_len {
-        let serial = serial_cursor.read_varint("record header truncated")?;
+        let serial = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)?;
         if serial_cursor.position() > header_len {
-            return Err(Error::Corrupted("record header truncated"));
+            return Err(Error::Corrupted(Corruption::RecordHeaderTruncated));
         }
-        push_checked(serials, serial, "serials")?;
-        push_checked(offsets, value_pos as u32, "offsets")?;
+        push_checked(serials, serial, ScratchKind::Serials)?;
+        push_checked(offsets, value_pos as u32, ScratchKind::Offsets)?;
         value_pos += serial_type_len_fast(serial);
     }
 
@@ -1931,7 +2121,7 @@ fn decode_record_project_into_overflow_mapped(
         {
             let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, bytes)?;
             if out_idx >= out.len() {
-                return Err(Error::Corrupted("mapped column index out of bounds"));
+                return Err(Error::Corrupted(Corruption::MappedColumnIndexOutOfBounds));
             }
             out[out_idx] = raw;
             next_needed = needed_iter.next();
@@ -1965,24 +2155,24 @@ pub(crate) fn decode_record_first_column(
 }
 
 fn decode_record_first_column_bytes(payload: &[u8]) -> Result<Option<ValueSlot>> {
-    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let first = *payload.first().ok_or(Error::Corrupted(Corruption::RecordHeaderTruncated))?;
     let mut header_pos = 0usize;
     let header_len = if first < 0x80 {
         header_pos = 1;
         first as usize
     } else {
-        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+        read_varint_at(payload, &mut header_pos, Corruption::RecordHeaderTruncated)? as usize
     };
     if header_len < header_pos || header_len > payload.len() {
-        return Err(Error::Corrupted("invalid record header length"));
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
     }
     if header_pos >= header_len {
         return Ok(None);
     }
 
-    let serial = read_varint_at(payload, &mut header_pos, "record header truncated")?;
+    let serial = read_varint_at(payload, &mut header_pos, Corruption::RecordHeaderTruncated)?;
     if header_pos > header_len {
-        return Err(Error::Corrupted("record header truncated"));
+        return Err(Error::Corrupted(Corruption::RecordHeaderTruncated));
     }
 
     let mut value_pos = header_len;
@@ -1997,18 +2187,18 @@ fn decode_record_first_column_overflow(
     bytes.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
-    let header_len = serial_cursor.read_varint("record header truncated")? as usize;
+    let header_len = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)? as usize;
     let header_pos = serial_cursor.position();
     if header_len < header_pos || header_len > payload.total_len {
-        return Err(Error::Corrupted("invalid record header length"));
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
     }
     if header_pos >= header_len {
         return Ok(None);
     }
 
-    let serial = serial_cursor.read_varint("record header truncated")?;
+    let serial = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)?;
     if serial_cursor.position() > header_len {
-        return Err(Error::Corrupted("record header truncated"));
+        return Err(Error::Corrupted(Corruption::RecordHeaderTruncated));
     }
 
     let mut value_cursor = OverflowCursor::new(payload, header_len)?;
@@ -2017,16 +2207,16 @@ fn decode_record_first_column_overflow(
 }
 
 fn decode_record_column_bytes(payload: &[u8], col: u16) -> Result<Option<ValueSlot>> {
-    let first = *payload.first().ok_or(Error::Corrupted("record header truncated"))?;
+    let first = *payload.first().ok_or(Error::Corrupted(Corruption::RecordHeaderTruncated))?;
     let mut header_pos = 0usize;
     let header_len = if first < 0x80 {
         header_pos = 1;
         first as usize
     } else {
-        read_varint_at(payload, &mut header_pos, "record header truncated")? as usize
+        read_varint_at(payload, &mut header_pos, Corruption::RecordHeaderTruncated)? as usize
     };
     if header_len < header_pos || header_len > payload.len() {
-        return Err(Error::Corrupted("invalid record header length"));
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
     }
 
     let serial_bytes = &payload[header_pos..header_len];
@@ -2042,7 +2232,7 @@ fn decode_record_column_bytes(payload: &[u8], col: u16) -> Result<Option<ValueSl
             serial_pos += 1;
             b as u64
         } else {
-            read_varint_at(serial_bytes, &mut serial_pos, "record header truncated")?
+            read_varint_at(serial_bytes, &mut serial_pos, Corruption::RecordHeaderTruncated)?
         };
 
         if idx == target {
@@ -2064,10 +2254,10 @@ fn decode_record_column_overflow(
     bytes.clear();
 
     let mut serial_cursor = OverflowCursor::new(payload, 0)?;
-    let header_len = serial_cursor.read_varint("record header truncated")? as usize;
+    let header_len = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)? as usize;
     let header_pos = serial_cursor.position();
     if header_len < header_pos || header_len > payload.total_len {
-        return Err(Error::Corrupted("invalid record header length"));
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
     }
 
     let mut value_cursor = OverflowCursor::new(payload, header_len)?;
@@ -2075,9 +2265,9 @@ fn decode_record_column_overflow(
     let mut idx = 0usize;
 
     while serial_cursor.position() < header_len {
-        let serial = serial_cursor.read_varint("record header truncated")?;
+        let serial = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)?;
         if serial_cursor.position() > header_len {
-            return Err(Error::Corrupted("record header truncated"));
+            return Err(Error::Corrupted(Corruption::RecordHeaderTruncated));
         }
 
         if idx == target {
@@ -2096,7 +2286,7 @@ fn skip_value_at(serial_type: u64, bytes: &[u8], pos: &mut usize) -> Result<()> 
     let len = serial_type_len(serial_type)?;
     let end = *pos + len;
     if end > bytes.len() {
-        return Err(Error::Corrupted("record payload shorter than declared"));
+        return Err(Error::Corrupted(Corruption::RecordPayloadShorterThanDeclared));
     }
     *pos = end;
     Ok(())
@@ -2189,7 +2379,7 @@ fn read_signed_be_at(bytes: &[u8], pos: &mut usize, len: usize) -> Result<i64> {
     let p = *pos;
     let end = p + len;
     if end > bytes.len() {
-        return Err(Error::Corrupted("record payload shorter than declared"));
+        return Err(Error::Corrupted(Corruption::RecordPayloadShorterThanDeclared));
     }
     *pos = end;
 
@@ -2237,7 +2427,7 @@ fn read_u64_be_at(bytes: &[u8], pos: &mut usize) -> Result<u64> {
     let p = *pos;
     let end = p + 8;
     if end > bytes.len() {
-        return Err(Error::Corrupted("record payload shorter than declared"));
+        return Err(Error::Corrupted(Corruption::RecordPayloadShorterThanDeclared));
     }
     *pos = end;
     unsafe {
@@ -2246,16 +2436,16 @@ fn read_u64_be_at(bytes: &[u8], pos: &mut usize) -> Result<u64> {
     }
 }
 
-fn read_u32_checked(decoder: &mut Decoder<'_>, msg: &'static str) -> Result<u32> {
+fn read_u32_checked(decoder: &mut Decoder<'_>, msg: Corruption) -> Result<u32> {
     decoder.try_read_u32().ok_or(Error::Corrupted(msg))
 }
 
-fn read_varint_checked(decoder: &mut Decoder<'_>, msg: &'static str) -> Result<u64> {
+fn read_varint_checked(decoder: &mut Decoder<'_>, msg: Corruption) -> Result<u64> {
     decoder.try_read_varint().ok_or(Error::Corrupted(msg))
 }
 
 #[inline]
-pub(crate) fn read_varint_at(bytes: &[u8], pos: &mut usize, msg: &'static str) -> Result<u64> {
+pub(crate) fn read_varint_at(bytes: &[u8], pos: &mut usize, msg: Corruption) -> Result<u64> {
     let mut idx = *pos;
     if idx >= bytes.len() {
         return Err(Error::Corrupted(msg));
@@ -2347,7 +2537,7 @@ fn read_exact_bytes_at<'row>(bytes: &'row [u8], pos: &mut usize, len: usize) -> 
     let start = *pos;
     let end = start + len;
     if end > bytes.len() {
-        return Err(Error::Corrupted("record payload shorter than declared"));
+        return Err(Error::Corrupted(Corruption::RecordPayloadShorterThanDeclared));
     }
     *pos = end;
     Ok(unsafe { bytes.get_unchecked(start..end) })
@@ -2370,12 +2560,12 @@ struct BTreeHeader {
 fn parse_header(page: &PageRef<'_>) -> Result<BTreeHeader> {
     let offset = page.offset();
     if offset >= page.usable_size() {
-        return Err(Error::Corrupted("page header offset out of bounds"));
+        return Err(Error::Corrupted(Corruption::PageHeaderOffsetOutOfBounds));
     }
 
     let bytes = page.usable_bytes();
     if offset + 8 > bytes.len() {
-        return Err(Error::Corrupted("page header truncated"));
+        return Err(Error::Corrupted(Corruption::PageHeaderTruncated));
     }
 
     let page_type = bytes[offset];
@@ -2393,7 +2583,7 @@ fn parse_header(page: &PageRef<'_>) -> Result<BTreeHeader> {
     let right_most_child = match kind {
         BTreeKind::TableInterior => {
             if offset + 12 > bytes.len() {
-                return Err(Error::Corrupted("page header truncated"));
+                return Err(Error::Corrupted(Corruption::PageHeaderTruncated));
             }
             Some(u32::from_be_bytes([
                 bytes[offset + 8],
@@ -2409,8 +2599,9 @@ fn parse_header(page: &PageRef<'_>) -> Result<BTreeHeader> {
         BTreeKind::TableLeaf => 8,
         BTreeKind::TableInterior => 12,
     };
-    let cell_ptrs_start =
-        offset.checked_add(header_size).ok_or(Error::Corrupted("cell pointer array overflow"))?;
+    let cell_ptrs_start = offset
+        .checked_add(header_size)
+        .ok_or(Error::Corrupted(Corruption::CellPointerArrayOverflow))?;
 
     Ok(BTreeHeader { kind, cell_count, cell_ptrs_start, right_most_child })
 }
@@ -2421,19 +2612,20 @@ fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &BTreeHeader) -> Result<&'a [u8]
     let cell_ptrs_end = header
         .cell_ptrs_start
         .checked_add(cell_ptrs_len)
-        .ok_or(Error::Corrupted("cell pointer array overflow"))?;
+        .ok_or(Error::Corrupted(Corruption::CellPointerArrayOverflow))?;
     let bytes = page.usable_bytes();
     if cell_ptrs_end > bytes.len() {
-        return Err(Error::Corrupted("cell pointer array out of bounds"));
+        return Err(Error::Corrupted(Corruption::CellPointerArrayOutOfBounds));
     }
     Ok(&bytes[header.cell_ptrs_start..cell_ptrs_end])
 }
 
 #[inline(always)]
 fn cell_ptr_at(cell_ptrs: &[u8], idx: usize) -> Result<u16> {
-    let offset = idx.checked_mul(2).ok_or(Error::Corrupted("cell pointer array overflow"))?;
+    let offset =
+        idx.checked_mul(2).ok_or(Error::Corrupted(Corruption::CellPointerArrayOverflow))?;
     if offset + 1 >= cell_ptrs.len() {
-        return Err(Error::Corrupted("cell pointer array out of bounds"));
+        return Err(Error::Corrupted(Corruption::CellPointerArrayOutOfBounds));
     }
     Ok(u16::from_be_bytes([cell_ptrs[offset], cell_ptrs[offset + 1]]))
 }
@@ -2445,8 +2637,8 @@ pub(crate) fn local_payload_len(usable_size: usize, payload_len: usize) -> Resul
     }
 
     let u = usable_size;
-    let x = u.checked_sub(35).ok_or(Error::Corrupted("usable size underflow"))?;
-    let m_base = u.checked_sub(12).ok_or(Error::Corrupted("usable size underflow"))?;
+    let x = u.checked_sub(35).ok_or(Error::Corrupted(Corruption::UsableSizeUnderflow))?;
+    let m_base = u.checked_sub(12).ok_or(Error::Corrupted(Corruption::UsableSizeUnderflow))?;
     let m = (m_base * 32 / 255).saturating_sub(23);
 
     if payload_len <= x {

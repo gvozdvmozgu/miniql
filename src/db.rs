@@ -115,7 +115,7 @@ impl Db {
     /// Look up a table by name using `sqlite_schema`.
     pub fn table(&self, name: &str) -> table::Result<Table<'_>> {
         let cache = self.schema_cache()?;
-        let info = cache.table(name).ok_or_else(|| table::Error::TableNotFound(name.to_owned()))?;
+        let info = cache.table(name).ok_or(table::Error::TableNotFound)?;
         Ok(Table {
             db: self,
             root: info.root,

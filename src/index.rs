@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::join::Error;
 use crate::pager::{PageId, PageRef, Pager};
-use crate::table::{self, ValueRef};
+use crate::table::{self, Corruption, ValueRef};
 
 /// Result type for index operations.
 pub type Result<T> = table::Result<T>;
@@ -101,7 +101,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         loop {
             seen_pages += 1;
             if seen_pages > max_pages {
-                return Err(table::Error::Corrupted("btree page cycle detected"));
+                return Err(table::Error::Corrupted(Corruption::BtreePageCycleDetected));
             }
 
             let page = self.pager.page(page_id)?;
@@ -130,8 +130,9 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                         let mid = (lo + hi) / 2;
                         let offset = cell_ptr_at(cell_ptrs, mid)?;
                         let cell = read_index_interior_cell(self.pager, &page, offset)?;
-                        let child =
-                            cell.child().ok_or(table::Error::Corrupted("missing child pointer"))?;
+                        let child = cell
+                            .child()
+                            .ok_or(table::Error::Corrupted(Corruption::MissingChildPointer))?;
                         let key = decode_key_from_payload(
                             self.key_col,
                             cell.payload(),
@@ -149,15 +150,15 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
 
                     if lo < cell_count {
                         let child = candidate_child
-                            .ok_or(table::Error::Corrupted("missing child pointer"))?;
+                            .ok_or(table::Error::Corrupted(Corruption::MissingChildPointer))?;
                         self.scratch.stack.push(StackEntry { page_id, child_slot: lo });
                         page_id = child;
                     } else {
-                        let right_most = header
-                            .right_most_child
-                            .ok_or(table::Error::Corrupted("missing right-most child pointer"))?;
+                        let right_most = header.right_most_child.ok_or(table::Error::Corrupted(
+                            Corruption::MissingRightMostChildPointer,
+                        ))?;
                         let right_most = PageId::try_new(right_most)
-                            .ok_or(table::Error::Corrupted("child page id is zero"))?;
+                            .ok_or(table::Error::Corrupted(Corruption::ChildPageIdZero))?;
                         self.scratch.stack.push(StackEntry { page_id, child_slot: cell_count });
                         page_id = right_most;
                     }
@@ -233,13 +234,13 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
     /// Return the rowid at the current cursor position.
     pub fn current_rowid(&mut self) -> Result<i64> {
         let Some(leaf) = self.leaf else {
-            return Err(table::Error::Corrupted("index cursor not positioned"));
+            return Err(table::Error::Corrupted(Corruption::IndexCursorNotPositioned));
         };
 
         let page = self.pager.page(leaf.page_id)?;
         let header = parse_header(&page)?;
         if leaf.cell_index >= header.cell_count as usize {
-            return Err(table::Error::Corrupted("index cursor past end"));
+            return Err(table::Error::Corrupted(Corruption::IndexCursorPastEnd));
         }
         let cell_ptrs = cell_ptrs(&page, &header)?;
         let offset = cell_ptr_at(cell_ptrs, leaf.cell_index)?;
@@ -266,13 +267,13 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         F: for<'row> FnOnce(table::PayloadRef<'row>, i64) -> Result<T>,
     {
         let Some(leaf) = self.leaf else {
-            return Err(table::Error::Corrupted("index cursor not positioned"));
+            return Err(table::Error::Corrupted(Corruption::IndexCursorNotPositioned));
         };
 
         let page = self.pager.page(leaf.page_id)?;
         let header = parse_header(&page)?;
         if leaf.cell_index >= header.cell_count as usize {
-            return Err(table::Error::Corrupted("index cursor past end"));
+            return Err(table::Error::Corrupted(Corruption::IndexCursorPastEnd));
         }
         let cell_ptrs = cell_ptrs(&page, &header)?;
         let offset = cell_ptr_at(cell_ptrs, leaf.cell_index)?;
@@ -325,13 +326,13 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
 
     fn compare_current_key(&mut self, target: ValueRef<'_>) -> Result<Ordering> {
         let Some(leaf) = self.leaf else {
-            return Err(table::Error::Corrupted("index cursor not positioned"));
+            return Err(table::Error::Corrupted(Corruption::IndexCursorNotPositioned));
         };
 
         let page = self.pager.page(leaf.page_id)?;
         let header = parse_header(&page)?;
         if leaf.cell_index >= header.cell_count as usize {
-            return Err(table::Error::Corrupted("index cursor past end"));
+            return Err(table::Error::Corrupted(Corruption::IndexCursorPastEnd));
         }
         let cell_ptrs = cell_ptrs(&page, &header)?;
         let offset = cell_ptr_at(cell_ptrs, leaf.cell_index)?;
@@ -370,7 +371,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         loop {
             seen_pages += 1;
             if seen_pages > max_pages {
-                return Err(table::Error::Corrupted("btree page cycle detected"));
+                return Err(table::Error::Corrupted(Corruption::BtreePageCycleDetected));
             }
 
             let page = self.pager.page(page_id)?;
@@ -381,11 +382,12 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
 
             let cell_ptrs = cell_ptrs(&page, &header)?;
             if header.cell_count == 0 {
-                return Err(table::Error::Corrupted("interior index page has no cells"));
+                return Err(table::Error::Corrupted(Corruption::InteriorIndexPageHasNoCells));
             }
             let offset = cell_ptr_at(cell_ptrs, 0)?;
             let cell = read_index_interior_cell(self.pager, &page, offset)?;
-            let child = cell.child().ok_or(table::Error::Corrupted("missing child pointer"))?;
+            let child =
+                cell.child().ok_or(table::Error::Corrupted(Corruption::MissingChildPointer))?;
             self.scratch.stack.push(StackEntry { page_id, child_slot: 0 });
             page_id = child;
         }
@@ -408,7 +410,7 @@ pub(crate) fn index_key_len(
     loop {
         seen_pages += 1;
         if seen_pages > max_pages {
-            return Err(table::Error::Corrupted("btree page cycle detected"));
+            return Err(table::Error::Corrupted(Corruption::BtreePageCycleDetected));
         }
 
         let page = pager.page(page_id)?;
@@ -418,7 +420,7 @@ pub(crate) fn index_key_len(
             return match header.kind {
                 IndexKind::Leaf => Ok(None),
                 IndexKind::Interior => {
-                    Err(table::Error::Corrupted("interior index page has no cells"))
+                    Err(table::Error::Corrupted(Corruption::InteriorIndexPageHasNoCells))
                 }
             };
         }
@@ -430,7 +432,7 @@ pub(crate) fn index_key_len(
                 let cell = read_index_leaf_cell(pager, &page, offset)?;
                 let count = table::record_column_count(cell.payload())?;
                 if count == 0 {
-                    return Err(table::Error::Corrupted("index record has no columns"));
+                    return Err(table::Error::Corrupted(Corruption::IndexRecordHasNoColumns));
                 }
                 return Ok(Some(count.saturating_sub(1)));
             }
@@ -438,7 +440,8 @@ pub(crate) fn index_key_len(
                 let cell_ptrs = cell_ptrs(&page, &header)?;
                 let offset = cell_ptr_at(cell_ptrs, 0)?;
                 let cell = read_index_interior_cell(pager, &page, offset)?;
-                page_id = cell.child().ok_or(table::Error::Corrupted("missing child pointer"))?;
+                page_id =
+                    cell.child().ok_or(table::Error::Corrupted(Corruption::MissingChildPointer))?;
             }
         }
     }
@@ -511,12 +514,12 @@ struct IndexHeader {
 fn parse_header(page: &PageRef<'_>) -> Result<IndexHeader> {
     let offset = page.offset();
     if offset >= page.usable_size() {
-        return Err(table::Error::Corrupted("page header offset out of bounds"));
+        return Err(table::Error::Corrupted(Corruption::PageHeaderOffsetOutOfBounds));
     }
 
     let bytes = page.usable_bytes();
     if offset + 8 > bytes.len() {
-        return Err(table::Error::Corrupted("page header truncated"));
+        return Err(table::Error::Corrupted(Corruption::PageHeaderTruncated));
     }
 
     let page_type = bytes[offset];
@@ -534,7 +537,7 @@ fn parse_header(page: &PageRef<'_>) -> Result<IndexHeader> {
     let right_most_child = match kind {
         IndexKind::Interior => {
             if offset + 12 > bytes.len() {
-                return Err(table::Error::Corrupted("page header truncated"));
+                return Err(table::Error::Corrupted(Corruption::PageHeaderTruncated));
             }
             Some(u32::from_be_bytes([
                 bytes[offset + 8],
@@ -552,7 +555,7 @@ fn parse_header(page: &PageRef<'_>) -> Result<IndexHeader> {
     };
     let cell_ptrs_start = offset
         .checked_add(header_size)
-        .ok_or(table::Error::Corrupted("cell pointer array overflow"))?;
+        .ok_or(table::Error::Corrupted(Corruption::CellPointerArrayOverflow))?;
 
     Ok(IndexHeader { kind, cell_count, cell_ptrs_start, right_most_child })
 }
@@ -562,10 +565,10 @@ fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &IndexHeader) -> Result<&'a [u8]
     let cell_ptrs_end = header
         .cell_ptrs_start
         .checked_add(cell_ptrs_len)
-        .ok_or(table::Error::Corrupted("cell pointer array overflow"))?;
+        .ok_or(table::Error::Corrupted(Corruption::CellPointerArrayOverflow))?;
     let bytes = page.usable_bytes();
     if cell_ptrs_end > bytes.len() {
-        return Err(table::Error::Corrupted("cell pointer array out of bounds"));
+        return Err(table::Error::Corrupted(Corruption::CellPointerArrayOutOfBounds));
     }
     Ok(&bytes[header.cell_ptrs_start..cell_ptrs_end])
 }
@@ -573,9 +576,9 @@ fn cell_ptrs<'a>(page: &'a PageRef<'_>, header: &IndexHeader) -> Result<&'a [u8]
 #[inline(always)]
 fn cell_ptr_at(cell_ptrs: &[u8], idx: usize) -> Result<u16> {
     let offset =
-        idx.checked_mul(2).ok_or(table::Error::Corrupted("cell pointer array overflow"))?;
+        idx.checked_mul(2).ok_or(table::Error::Corrupted(Corruption::CellPointerArrayOverflow))?;
     if offset + 1 >= cell_ptrs.len() {
-        return Err(table::Error::Corrupted("cell pointer array out of bounds"));
+        return Err(table::Error::Corrupted(Corruption::CellPointerArrayOutOfBounds));
     }
     Ok(u16::from_be_bytes([cell_ptrs[offset], cell_ptrs[offset + 1]]))
 }
@@ -605,24 +608,25 @@ fn read_index_cell<'row>(
     let usable = page.usable_bytes();
     let mut pos = offset as usize;
     if pos >= usable.len() {
-        return Err(table::Error::Corrupted("cell offset out of bounds"));
+        return Err(table::Error::Corrupted(Corruption::CellOffsetOutOfBounds));
     }
 
     let child = if has_child {
         if pos + 4 > usable.len() {
-            return Err(table::Error::Corrupted("cell child pointer truncated"));
+            return Err(table::Error::Corrupted(Corruption::CellChildPointerTruncated));
         }
         let child =
             u32::from_be_bytes([usable[pos], usable[pos + 1], usable[pos + 2], usable[pos + 3]]);
         pos += 4;
-        Some(PageId::try_new(child).ok_or(table::Error::Corrupted("child page id is zero"))?)
+        Some(PageId::try_new(child).ok_or(table::Error::Corrupted(Corruption::ChildPageIdZero))?)
     } else {
         None
     };
 
-    let payload_length = table::read_varint_at(usable, &mut pos, "cell payload length truncated")?;
+    let payload_length =
+        table::read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?;
     let payload_length = usize::try_from(payload_length)
-        .map_err(|_| table::Error::Corrupted("payload is too large"))?;
+        .map_err(|_| table::Error::Corrupted(Corruption::PayloadIsTooLarge))?;
     if payload_length > MAX_PAYLOAD_BYTES {
         return Err(table::Error::PayloadTooLarge(payload_length));
     }
@@ -630,11 +634,13 @@ fn read_index_cell<'row>(
     let start = pos;
 
     let usable_size = page.usable_size();
-    let x = usable_size.checked_sub(35).ok_or(table::Error::Corrupted("usable size underflow"))?;
+    let x = usable_size
+        .checked_sub(35)
+        .ok_or(table::Error::Corrupted(Corruption::UsableSizeUnderflow))?;
     if payload_length <= x {
         let end = start + payload_length;
         if end > usable.len() {
-            return Err(table::Error::Corrupted("payload extends past page boundary"));
+            return Err(table::Error::Corrupted(Corruption::PayloadExtendsPastPageBoundary));
         }
         return Ok(IndexCellRef { child, payload: table::PayloadRef::Inline(&usable[start..end]) });
     }
@@ -642,12 +648,12 @@ fn read_index_cell<'row>(
     let local_len = table::local_payload_len(usable_size, payload_length)?;
     let end_local = start + local_len;
     if end_local > usable.len() {
-        return Err(table::Error::Corrupted("payload extends past page boundary"));
+        return Err(table::Error::Corrupted(Corruption::PayloadExtendsPastPageBoundary));
     }
 
     let overflow_end = end_local + 4;
     if overflow_end > usable.len() {
-        return Err(table::Error::Corrupted("overflow pointer out of bounds"));
+        return Err(table::Error::Corrupted(Corruption::OverflowPointerOutOfBounds));
     }
     let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
     if overflow_page == 0 {
@@ -672,11 +678,11 @@ fn child_page_for_slot(
         let cell_ptrs = cell_ptrs(page, header)?;
         let offset = cell_ptr_at(cell_ptrs, child_slot)?;
         let cell = read_index_interior_cell(pager, page, offset)?;
-        cell.child().ok_or(table::Error::Corrupted("missing child pointer"))
+        cell.child().ok_or(table::Error::Corrupted(Corruption::MissingChildPointer))
     } else {
         let right_most = header
             .right_most_child
-            .ok_or(table::Error::Corrupted("missing right-most child pointer"))?;
-        PageId::try_new(right_most).ok_or(table::Error::Corrupted("child page id is zero"))
+            .ok_or(table::Error::Corrupted(Corruption::MissingRightMostChildPointer))?;
+        PageId::try_new(right_most).ok_or(table::Error::Corrupted(Corruption::ChildPageIdZero))
     }
 }
