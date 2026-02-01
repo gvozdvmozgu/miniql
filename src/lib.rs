@@ -19,4 +19,8 @@ pub use query::{
     ScanScratch, ValueLit, asc, avg, col, count, count_star, desc, group, lit_bytes, lit_f64,
     lit_i64, lit_null, max, min, sum,
 };
-pub use table::{CachedRowView, CellRef, Error, PayloadRef, Result, RowCache, RowView, ValueRef};
+pub use table::{
+    BorrowPolicy, CachedRowView, CellRef, ColumnMode, DecodeField, DecodeRecord, Error,
+    FieldSource, Null, PayloadRef, RecordDecoder, Result, RowCache, RowView, TypedScanOptions,
+    ValueRef,
+};

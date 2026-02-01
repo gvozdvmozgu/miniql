@@ -1,4 +1,5 @@
-use std::{fmt, ptr, str};
+use std::marker::PhantomData;
+use std::{fmt, mem, ptr, str};
 
 use crate::decoder::Decoder;
 use crate::join::JoinError;
@@ -180,17 +181,22 @@ pub enum Error {
     Pager(crate::pager::Error),
     UnsupportedPageType(u8),
     UnsupportedSerialType(u64),
+    UnsupportedSerialTypeAt { col: usize, serial: u64 },
     Corrupted(Corruption),
     Query(QueryError),
     InvalidColumnIndex { col: u16, column_count: usize },
     ScratchTooSmall { kind: ScratchKind, needed: usize, capacity: usize },
     TypeMismatch { col: usize, expected: ValueKind, got: ValueKind },
+    TypeMismatchSerial { col: usize, expected: ValueKind, got_serial: u64 },
+    SchemaMismatch { expected: usize, got: usize },
     Utf8(str::Utf8Error),
+    InvalidUtf8 { col: usize, err: str::Utf8Error },
     TableNotFound,
     PayloadTooLarge(usize),
     OverflowChainTruncated,
     OverflowLoopDetected,
     Join(JoinError),
+    RowDecode { rowid: i64, page_id: PageId, source: Box<Error> },
 }
 
 impl fmt::Display for Error {
@@ -200,6 +206,9 @@ impl fmt::Display for Error {
             Self::UnsupportedPageType(kind) => write!(f, "Unsupported page type: 0x{kind:02X}"),
             Self::UnsupportedSerialType(serial) => {
                 write!(f, "Unsupported record serial type: {serial}")
+            }
+            Self::UnsupportedSerialTypeAt { col, serial } => {
+                write!(f, "Unsupported record serial type at column {col}: {serial}")
             }
             Self::Corrupted(kind) => write!(f, "Corrupted table page: {}", kind.message()),
             Self::Query(kind) => write!(f, "Query error: {}", kind.message()),
@@ -221,12 +230,41 @@ impl fmt::Display for Error {
                     got.as_str()
                 )
             }
+            Self::TypeMismatchSerial { col, expected, got_serial } => {
+                if let Some(kind) = serial_type_kind(*got_serial) {
+                    write!(
+                        f,
+                        "Type mismatch at column {col}: expected {}, got {} (serial {got_serial})",
+                        expected.as_str(),
+                        kind.as_str(),
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Type mismatch at column {col}: expected {}, got serial {got_serial}",
+                        expected.as_str()
+                    )
+                }
+            }
+            Self::SchemaMismatch { expected, got } => {
+                write!(f, "Schema mismatch: expected {expected} columns, got {got}")
+            }
             Self::Utf8(err) => write!(f, "{err}"),
+            Self::InvalidUtf8 { col, err } => {
+                write!(f, "Invalid UTF-8 at column {col}: {err}")
+            }
             Self::TableNotFound => f.write_str("Table not found in sqlite_schema"),
             Self::PayloadTooLarge(size) => write!(f, "Payload too large: {size} bytes"),
             Self::OverflowChainTruncated => f.write_str("Overflow chain is truncated"),
             Self::OverflowLoopDetected => f.write_str("Overflow chain contains a loop"),
             Self::Join(err) => write!(f, "{err}"),
+            Self::RowDecode { rowid, page_id, source } => {
+                write!(
+                    f,
+                    "Row decode error (rowid {rowid}, page {}): {source}",
+                    page_id.into_inner()
+                )
+            }
         }
     }
 }
@@ -236,7 +274,9 @@ impl std::error::Error for Error {
         match self {
             Self::Pager(err) => Some(err),
             Self::Utf8(err) => Some(err),
+            Self::InvalidUtf8 { err, .. } => Some(err),
             Self::Join(err) => Some(err),
+            Self::RowDecode { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -829,6 +869,24 @@ fn value_ref_kind(value: ValueRef<'_>) -> ValueKind {
     }
 }
 
+#[inline]
+fn serial_type_kind(serial: u64) -> Option<ValueKind> {
+    match serial {
+        0 => Some(ValueKind::Null),
+        1 | 2 | 3 | 4 | 5 | 6 | 8 | 9 => Some(ValueKind::Integer),
+        7 => Some(ValueKind::Real),
+        10 | 11 => None,
+        serial if serial >= 12 => {
+            if serial & 1 == 0 {
+                Some(ValueKind::Blob)
+            } else {
+                Some(ValueKind::Text)
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Decode a value directly from inline payload (no intermediate ValueSlot).
 #[inline]
 fn decode_value_ref_inline(
@@ -854,6 +912,522 @@ fn decode_value_ref_inline(
             if serial & 1 == 0 { ValueRef::Blob(slice) } else { ValueRef::Text(slice) }
         }
     })
+}
+
+/// Marker type for NULL fields in typed decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Null;
+
+/// Borrow policy for typed decoding of TEXT/BLOB fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorrowPolicy {
+    /// Borrow from the record payload when possible.
+    PreferBorrow,
+    /// Always copy TEXT/BLOB fields into scratch storage.
+    AlwaysCopy,
+}
+
+/// Column count strictness for typed decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnMode {
+    /// Require an exact column count match.
+    Strict,
+    /// Allow extra columns beyond the decoded schema.
+    AllowExtraColumns,
+}
+
+/// Options for typed table scans.
+#[derive(Debug, Clone, Copy)]
+pub struct TypedScanOptions {
+    pub borrow_policy: BorrowPolicy,
+    pub column_mode: ColumnMode,
+}
+
+impl Default for TypedScanOptions {
+    fn default() -> Self {
+        Self { borrow_policy: BorrowPolicy::PreferBorrow, column_mode: ColumnMode::Strict }
+    }
+}
+
+impl TypedScanOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn borrow_policy(mut self, policy: BorrowPolicy) -> Self {
+        self.borrow_policy = policy;
+        self
+    }
+
+    pub fn column_mode(mut self, mode: ColumnMode) -> Self {
+        self.column_mode = mode;
+        self
+    }
+}
+
+/// Source bytes for a decoded field.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldSource<'row> {
+    col: usize,
+    span: BytesSpan,
+    scratch: RawBytes,
+    _marker: PhantomData<&'row [u8]>,
+}
+
+impl<'row> FieldSource<'row> {
+    #[inline]
+    fn new(col: usize, span: BytesSpan, scratch: RawBytes) -> Self {
+        Self { col, span, scratch, _marker: PhantomData }
+    }
+
+    /// Column index (0-based).
+    #[inline]
+    pub fn column(&self) -> usize {
+        self.col
+    }
+
+    /// Return the raw field bytes.
+    #[inline]
+    pub fn bytes(&self) -> &'row [u8] {
+        let scratch = unsafe { self.scratch.as_slice() };
+        unsafe { self.span.as_slice_with_scratch(scratch) }
+    }
+
+    #[inline]
+    pub fn type_mismatch(&self, expected: ValueKind, serial: u64) -> Error {
+        Error::TypeMismatchSerial { col: self.col, expected, got_serial: serial }
+    }
+
+    #[inline]
+    pub fn invalid_utf8(&self, err: str::Utf8Error) -> Error {
+        Error::InvalidUtf8 { col: self.col, err }
+    }
+
+    #[inline]
+    pub fn unsupported_serial(&self, serial: u64) -> Error {
+        Error::UnsupportedSerialTypeAt { col: self.col, serial }
+    }
+}
+
+/// Decode a single field from a record.
+pub trait DecodeField<'row>: Sized {
+    fn decode(serial_type: u64, source: FieldSource<'row>) -> Result<Self>;
+}
+
+/// Decode a typed row from a record.
+pub trait DecodeRecord {
+    type Row<'row>;
+    const COLS: usize;
+    fn decode<'row>(decoder: &mut RecordDecoder<'row>) -> Result<Self::Row<'row>>;
+}
+
+#[derive(Default)]
+struct RecordScratch {
+    serials: Vec<u64>,
+    bytes: Vec<u8>,
+}
+
+enum RecordCursor<'row> {
+    Inline { payload: &'row [u8], pos: usize },
+    Overflow { cursor: OverflowCursor<'row> },
+}
+
+/// Typed record decoder that validates serial types and decodes directly into
+/// Rust types.
+pub struct RecordDecoder<'row> {
+    serials: Vec<u64>,
+    scratch: Vec<u8>,
+    cursor: RecordCursor<'row>,
+    idx: usize,
+    column_count: usize,
+    borrow_policy: BorrowPolicy,
+}
+
+impl<'row> RecordDecoder<'row> {
+    fn new_with_scratch(
+        payload: PayloadRef<'row>,
+        mut scratch: RecordScratch,
+        options: TypedScanOptions,
+    ) -> Result<Self> {
+        scratch.serials.clear();
+        scratch.bytes.clear();
+
+        let (total_value_len, text_blob_len, cursor) = match payload {
+            PayloadRef::Inline(bytes) => {
+                let (header_len, total_value_len, text_blob_len) =
+                    parse_record_header_bytes(bytes, &mut scratch.serials)?;
+                let cursor = RecordCursor::Inline { payload: bytes, pos: header_len };
+                (total_value_len, text_blob_len, cursor)
+            }
+            PayloadRef::Overflow(payload) => {
+                let (cursor, total_value_len, text_blob_len) =
+                    parse_record_header_overflow(payload, &mut scratch.serials)?;
+                let cursor = RecordCursor::Overflow { cursor };
+                (total_value_len, text_blob_len, cursor)
+            }
+        };
+
+        let scratch_needed = match payload {
+            PayloadRef::Inline(_) => match options.borrow_policy {
+                BorrowPolicy::PreferBorrow => 0,
+                BorrowPolicy::AlwaysCopy => text_blob_len,
+            },
+            PayloadRef::Overflow(_) => total_value_len,
+        };
+        if scratch.bytes.capacity() < scratch_needed {
+            scratch.bytes.reserve(scratch_needed - scratch.bytes.capacity());
+        }
+
+        let column_count = scratch.serials.len();
+        Ok(Self {
+            serials: scratch.serials,
+            scratch: scratch.bytes,
+            cursor,
+            idx: 0,
+            column_count,
+            borrow_policy: options.borrow_policy,
+        })
+    }
+
+    fn into_scratch(self) -> RecordScratch {
+        RecordScratch { serials: self.serials, bytes: self.scratch }
+    }
+
+    /// Number of columns in the record.
+    #[inline]
+    pub fn column_count(&self) -> usize {
+        self.column_count
+    }
+
+    /// Number of remaining columns.
+    #[inline]
+    pub fn remaining(&self) -> usize {
+        self.column_count.saturating_sub(self.idx)
+    }
+
+    /// Read and decode the next column.
+    pub fn read<T: DecodeField<'row>>(&mut self) -> Result<T> {
+        if self.idx >= self.serials.len() {
+            return Err(Error::SchemaMismatch { expected: self.serials.len(), got: self.idx + 1 });
+        }
+
+        let col = self.idx;
+        let serial = self.serials[col];
+        self.idx += 1;
+
+        let len = serial_type_len_checked(serial, col)?;
+        let span = match &mut self.cursor {
+            RecordCursor::Inline { payload, pos } => {
+                let slice = read_exact_bytes_at(payload, pos, len)?;
+                BytesSpan::mmap(slice)
+            }
+            RecordCursor::Overflow { cursor } => cursor.take_span(len, &mut self.scratch)?,
+        };
+
+        let span = if self.borrow_policy == BorrowPolicy::AlwaysCopy && serial >= 12 {
+            self.copy_span_to_scratch(span, len)?
+        } else {
+            span
+        };
+
+        let source = FieldSource::new(col, span, RawBytes::from_slice(&self.scratch));
+        T::decode(serial, source)
+    }
+
+    /// Skip the next column without decoding.
+    pub fn skip(&mut self) -> Result<()> {
+        if self.idx >= self.serials.len() {
+            return Err(Error::SchemaMismatch { expected: self.serials.len(), got: self.idx + 1 });
+        }
+        let col = self.idx;
+        let serial = self.serials[col];
+        self.idx += 1;
+
+        let len = serial_type_len_checked(serial, col)?;
+        match &mut self.cursor {
+            RecordCursor::Inline { payload, pos } => {
+                let end = pos.saturating_add(len);
+                if end > payload.len() {
+                    return Err(Error::Corrupted(Corruption::RecordPayloadShorterThanDeclared));
+                }
+                *pos = end;
+            }
+            RecordCursor::Overflow { cursor } => {
+                cursor.skip(len)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn skip_remaining(&mut self) -> Result<()> {
+        while self.idx < self.serials.len() {
+            self.skip()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_column_count(&self, expected: usize, mode: ColumnMode) -> Result<()> {
+        match mode {
+            ColumnMode::Strict => {
+                if self.column_count != expected {
+                    return Err(Error::SchemaMismatch { expected, got: self.column_count });
+                }
+            }
+            ColumnMode::AllowExtraColumns => {
+                if self.column_count < expected {
+                    return Err(Error::SchemaMismatch { expected, got: self.column_count });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, expected: usize, mode: ColumnMode) -> Result<()> {
+        if self.idx != expected {
+            return Err(Error::SchemaMismatch { expected, got: self.idx });
+        }
+        if matches!(mode, ColumnMode::AllowExtraColumns) {
+            self.skip_remaining()?;
+        }
+        Ok(())
+    }
+
+    fn copy_span_to_scratch(&mut self, span: BytesSpan, len: usize) -> Result<BytesSpan> {
+        if matches!(span, BytesSpan::Scratch(_)) {
+            return Ok(span);
+        }
+
+        ensure_bytes_capacity(&self.scratch, len)?;
+        let start = self.scratch.len();
+        let bytes = unsafe { span.as_slice() };
+        self.scratch.extend_from_slice(bytes);
+        let slice = &self.scratch[start..start + len];
+        Ok(BytesSpan::scratch(slice))
+    }
+}
+
+impl<'row> DecodeField<'row> for Null {
+    fn decode(serial_type: u64, source: FieldSource<'row>) -> Result<Self> {
+        if serial_type == 0 {
+            Ok(Null)
+        } else {
+            Err(source.type_mismatch(ValueKind::Null, serial_type))
+        }
+    }
+}
+
+impl<'row> DecodeField<'row> for i64 {
+    fn decode(serial_type: u64, source: FieldSource<'row>) -> Result<Self> {
+        match serial_type {
+            1..=6 => {
+                let bytes = source.bytes();
+                let mut pos = 0usize;
+                let len = bytes.len();
+                read_signed_be_at(bytes, &mut pos, len)
+            }
+            8 => Ok(0),
+            9 => Ok(1),
+            _ => Err(source.type_mismatch(ValueKind::Integer, serial_type)),
+        }
+    }
+}
+
+impl<'row> DecodeField<'row> for f64 {
+    fn decode(serial_type: u64, source: FieldSource<'row>) -> Result<Self> {
+        if serial_type != 7 {
+            return Err(source.type_mismatch(ValueKind::Real, serial_type));
+        }
+        let bytes = source.bytes();
+        let mut pos = 0usize;
+        let raw = read_u64_be_at(bytes, &mut pos)?;
+        Ok(f64::from_bits(raw))
+    }
+}
+
+impl<'row> DecodeField<'row> for &'row str {
+    fn decode(serial_type: u64, source: FieldSource<'row>) -> Result<Self> {
+        if serial_type < 13 || serial_type & 1 == 0 {
+            return Err(source.type_mismatch(ValueKind::Text, serial_type));
+        }
+        let bytes = source.bytes();
+        str::from_utf8(bytes).map_err(|err| source.invalid_utf8(err))
+    }
+}
+
+impl<'row> DecodeField<'row> for &'row [u8] {
+    fn decode(serial_type: u64, source: FieldSource<'row>) -> Result<Self> {
+        if serial_type < 12 || serial_type & 1 == 1 {
+            return Err(source.type_mismatch(ValueKind::Blob, serial_type));
+        }
+        Ok(source.bytes())
+    }
+}
+
+impl<'row> DecodeField<'row> for String {
+    fn decode(serial_type: u64, source: FieldSource<'row>) -> Result<Self> {
+        if serial_type < 13 || serial_type & 1 == 0 {
+            return Err(source.type_mismatch(ValueKind::Text, serial_type));
+        }
+        let bytes = source.bytes();
+        let text = str::from_utf8(bytes).map_err(|err| source.invalid_utf8(err))?;
+        Ok(text.to_owned())
+    }
+}
+
+impl<'row> DecodeField<'row> for Vec<u8> {
+    fn decode(serial_type: u64, source: FieldSource<'row>) -> Result<Self> {
+        if serial_type < 12 || serial_type & 1 == 1 {
+            return Err(source.type_mismatch(ValueKind::Blob, serial_type));
+        }
+        Ok(source.bytes().to_vec())
+    }
+}
+
+impl<'row, T> DecodeField<'row> for Option<T>
+where
+    T: DecodeField<'row>,
+{
+    fn decode(serial_type: u64, source: FieldSource<'row>) -> Result<Self> {
+        if serial_type == 0 { Ok(None) } else { T::decode(serial_type, source).map(Some) }
+    }
+}
+
+/// Scan a table and decode rows into a typed schema.
+pub fn scan_table_typed<D, F>(pager: &Pager, page_id: PageId, f: F) -> Result<()>
+where
+    D: DecodeRecord,
+    F: for<'row> FnMut(i64, D::Row<'row>) -> Result<()>,
+{
+    scan_table_typed_with_options(pager, page_id, TypedScanOptions::default(), f)
+}
+
+/// Scan a table and decode rows into a typed schema with custom options.
+pub fn scan_table_typed_with_options<D, F>(
+    pager: &Pager,
+    page_id: PageId,
+    options: TypedScanOptions,
+    mut f: F,
+) -> Result<()>
+where
+    D: DecodeRecord,
+    F: for<'row> FnMut(i64, D::Row<'row>) -> Result<()>,
+{
+    let mut scratch = RecordScratch::default();
+    scan_table_cells_with_scratch(pager, page_id, |cell| {
+        let rowid = cell.rowid();
+        let page_id = cell.page_id();
+        let payload = cell.payload();
+        let mut decoder =
+            match RecordDecoder::new_with_scratch(payload, mem::take(&mut scratch), options) {
+                Ok(decoder) => decoder,
+                Err(err) => return Err(Error::RowDecode { rowid, page_id, source: Box::new(err) }),
+            };
+
+        if let Err(err) = decoder.ensure_column_count(D::COLS, options.column_mode) {
+            return Err(Error::RowDecode { rowid, page_id, source: Box::new(err) });
+        }
+
+        let row = match D::decode(&mut decoder) {
+            Ok(row) => row,
+            Err(err) => return Err(Error::RowDecode { rowid, page_id, source: Box::new(err) }),
+        };
+
+        if let Err(err) = decoder.finish(D::COLS, options.column_mode) {
+            return Err(Error::RowDecode { rowid, page_id, source: Box::new(err) });
+        }
+
+        scratch = decoder.into_scratch();
+        f(rowid, row)
+    })
+}
+
+#[inline]
+fn serial_type_len_checked(serial: u64, col: usize) -> Result<usize> {
+    match serial {
+        10 | 11 => Err(Error::UnsupportedSerialTypeAt { col, serial }),
+        _ => Ok(serial_type_len_fast(serial)),
+    }
+}
+
+fn parse_record_header_bytes(
+    payload: &[u8],
+    serials: &mut Vec<u64>,
+) -> Result<(usize, usize, usize)> {
+    let mut header_pos = 0usize;
+    let first = *payload.first().ok_or(Error::Corrupted(Corruption::RecordHeaderTruncated))?;
+    let header_len = if first < 0x80 {
+        header_pos = 1;
+        first as usize
+    } else {
+        read_varint_at(payload, &mut header_pos, Corruption::RecordHeaderTruncated)? as usize
+    };
+    if header_len < header_pos || header_len > payload.len() {
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
+    }
+
+    serials.clear();
+    let serial_bytes = &payload[header_pos..header_len];
+    let mut serial_pos = 0usize;
+    let mut total_value_len = 0usize;
+    let mut text_blob_len = 0usize;
+    while serial_pos < serial_bytes.len() {
+        let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
+        let serial = if b < 0x80 {
+            serial_pos += 1;
+            b as u64
+        } else {
+            read_varint_at(serial_bytes, &mut serial_pos, Corruption::RecordHeaderTruncated)?
+        };
+        if serial_pos > serial_bytes.len() {
+            return Err(Error::Corrupted(Corruption::RecordHeaderTruncated));
+        }
+        let col = serials.len();
+        if serial == 10 || serial == 11 {
+            return Err(Error::UnsupportedSerialTypeAt { col, serial });
+        }
+        serials.push(serial);
+        let len = serial_type_len_fast(serial);
+        total_value_len = total_value_len.saturating_add(len);
+        if serial >= 12 {
+            text_blob_len = text_blob_len.saturating_add(len);
+        }
+    }
+
+    Ok((header_len, total_value_len, text_blob_len))
+}
+
+fn parse_record_header_overflow<'row>(
+    payload: OverflowPayload<'row>,
+    serials: &mut Vec<u64>,
+) -> Result<(OverflowCursor<'row>, usize, usize)> {
+    let mut cursor = OverflowCursor::new(payload, 0)?;
+    let header_len = cursor.read_varint(Corruption::RecordHeaderTruncated)? as usize;
+    let header_pos = cursor.position();
+    if header_len < header_pos || header_len > payload.total_len {
+        return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
+    }
+
+    serials.clear();
+    let mut total_value_len = 0usize;
+    let mut text_blob_len = 0usize;
+    while cursor.position() < header_len {
+        let serial = cursor.read_varint(Corruption::RecordHeaderTruncated)?;
+        if cursor.position() > header_len {
+            return Err(Error::Corrupted(Corruption::RecordHeaderTruncated));
+        }
+        let col = serials.len();
+        if serial == 10 || serial == 11 {
+            return Err(Error::UnsupportedSerialTypeAt { col, serial });
+        }
+        serials.push(serial);
+        let len = serial_type_len_fast(serial);
+        total_value_len = total_value_len.saturating_add(len);
+        if serial >= 12 {
+            text_blob_len = text_blob_len.saturating_add(len);
+        }
+    }
+
+    Ok((cursor, total_value_len, text_blob_len))
 }
 
 /// Scan a table with on-demand row decoding.
@@ -1513,7 +2087,7 @@ fn ensure_bytes_capacity(bytes: &Vec<u8>, additional: usize) -> Result<()> {
 }
 
 struct OverflowCursor<'row> {
-    payload: &'row OverflowPayload<'row>,
+    payload: OverflowPayload<'row>,
     pos: usize,
     segment_start: usize,
     segment: &'row [u8],
@@ -1523,7 +2097,7 @@ struct OverflowCursor<'row> {
 }
 
 impl<'row> OverflowCursor<'row> {
-    fn new(payload: &'row OverflowPayload<'row>, offset: usize) -> Result<Self> {
+    fn new(payload: OverflowPayload<'row>, offset: usize) -> Result<Self> {
         if offset > payload.total_len {
             return Err(Error::Corrupted(Corruption::RecordPayloadShorterThanDeclared));
         }
@@ -1711,7 +2285,7 @@ fn decode_record_project_into_overflow(
     serials.clear();
     offsets.clear();
 
-    let mut serial_cursor = OverflowCursor::new(payload, 0)?;
+    let mut serial_cursor = OverflowCursor::new(*payload, 0)?;
     let header_len = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)? as usize;
     let header_pos = serial_cursor.position();
     if header_len < header_pos || header_len > payload.total_len {
@@ -1729,7 +2303,7 @@ fn decode_record_project_into_overflow(
         value_pos += serial_type_len_fast(serial);
     }
 
-    let mut value_cursor = OverflowCursor::new(payload, header_len)?;
+    let mut value_cursor = OverflowCursor::new(*payload, header_len)?;
     if let Some(needed_cols) = needed_cols {
         let mut needed_iter = needed_cols.iter().copied();
         let mut next_needed = needed_iter.next();
@@ -1826,7 +2400,7 @@ fn record_column_count_bytes(payload: &[u8]) -> Result<usize> {
 }
 
 fn record_column_count_overflow(payload: &OverflowPayload<'_>) -> Result<usize> {
-    let mut serial_cursor = OverflowCursor::new(payload, 0)?;
+    let mut serial_cursor = OverflowCursor::new(*payload, 0)?;
     let header_len = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)? as usize;
     let header_pos = serial_cursor.position();
     if header_len < header_pos || header_len > payload.total_len {
@@ -2092,7 +2666,7 @@ fn decode_record_project_into_overflow_mapped(
     serials.clear();
     offsets.clear();
 
-    let mut serial_cursor = OverflowCursor::new(payload, 0)?;
+    let mut serial_cursor = OverflowCursor::new(*payload, 0)?;
     let header_len = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)? as usize;
     let header_pos = serial_cursor.position();
     if header_len < header_pos || header_len > payload.total_len {
@@ -2110,7 +2684,7 @@ fn decode_record_project_into_overflow_mapped(
         value_pos += serial_type_len_fast(serial);
     }
 
-    let mut value_cursor = OverflowCursor::new(payload, header_len)?;
+    let mut value_cursor = OverflowCursor::new(*payload, header_len)?;
     let mut needed_iter = needed_map.iter().copied();
     let mut next_needed = needed_iter.next();
 
@@ -2186,7 +2760,7 @@ fn decode_record_first_column_overflow(
 ) -> Result<Option<ValueSlot>> {
     bytes.clear();
 
-    let mut serial_cursor = OverflowCursor::new(payload, 0)?;
+    let mut serial_cursor = OverflowCursor::new(*payload, 0)?;
     let header_len = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)? as usize;
     let header_pos = serial_cursor.position();
     if header_len < header_pos || header_len > payload.total_len {
@@ -2201,7 +2775,7 @@ fn decode_record_first_column_overflow(
         return Err(Error::Corrupted(Corruption::RecordHeaderTruncated));
     }
 
-    let mut value_cursor = OverflowCursor::new(payload, header_len)?;
+    let mut value_cursor = OverflowCursor::new(*payload, header_len)?;
     let raw = decode_value_ref_at_cursor(serial, &mut value_cursor, bytes)?;
     Ok(Some(raw))
 }
@@ -2253,14 +2827,14 @@ fn decode_record_column_overflow(
 ) -> Result<Option<ValueSlot>> {
     bytes.clear();
 
-    let mut serial_cursor = OverflowCursor::new(payload, 0)?;
+    let mut serial_cursor = OverflowCursor::new(*payload, 0)?;
     let header_len = serial_cursor.read_varint(Corruption::RecordHeaderTruncated)? as usize;
     let header_pos = serial_cursor.position();
     if header_len < header_pos || header_len > payload.total_len {
         return Err(Error::Corrupted(Corruption::InvalidRecordHeaderLength));
     }
 
-    let mut value_cursor = OverflowCursor::new(payload, header_len)?;
+    let mut value_cursor = OverflowCursor::new(*payload, header_len)?;
     let target = col as usize;
     let mut idx = 0usize;
 
