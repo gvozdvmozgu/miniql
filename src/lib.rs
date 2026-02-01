@@ -22,5 +22,5 @@ pub use query::{
 pub use table::{
     BorrowPolicy, CachedRowView, CellRef, ColumnMode, DecodeField, DecodeRecord, Error,
     FieldSource, Null, PayloadRef, RecordDecoder, Result, RowCache, RowView, TypedScanOptions,
-    ValueRef,
+    ValueRef, scan_table_typed_inline, scan_table_typed_inline_with_options,
 };

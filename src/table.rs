@@ -1447,6 +1447,18 @@ where
     scan_table_typed_with_options(pager, page_id, TypedScanOptions::default(), f)
 }
 
+/// Scan a table with typed decoding using the inline-only row view path.
+///
+/// This avoids payload dispatch and rowid varint parsing but does not support
+/// overflow payloads.
+pub fn scan_table_typed_inline<D, F>(pager: &Pager, page_id: PageId, f: F) -> Result<()>
+where
+    D: DecodeRecord,
+    F: for<'row> FnMut(i64, D::Row<'row>) -> Result<()>,
+{
+    scan_table_typed_inline_with_options(pager, page_id, TypedScanOptions::default(), f)
+}
+
 /// Scan a table and decode rows into a typed schema with custom options.
 pub fn scan_table_typed_with_options<D, F>(
     pager: &Pager,
@@ -1462,6 +1474,52 @@ where
     let mut stack = Vec::with_capacity(64);
     stack.push(page_id);
     scan_table_payloads_with_stack(pager, &mut stack, &mut |rowid, page_id, payload| {
+        let mut decoder = match RecordDecoder::new_with_scratch(
+            payload,
+            mem::take(&mut scratch),
+            options,
+            D::COLS,
+        ) {
+            Ok(decoder) => decoder,
+            Err(err) => return Err(Error::RowDecode { rowid, page_id, source: Box::new(err) }),
+        };
+
+        if let Err(err) = decoder.ensure_column_count(D::COLS, options.column_mode) {
+            return Err(Error::RowDecode { rowid, page_id, source: Box::new(err) });
+        }
+
+        let row = match D::decode(&mut decoder) {
+            Ok(row) => row,
+            Err(err) => return Err(Error::RowDecode { rowid, page_id, source: Box::new(err) }),
+        };
+
+        if let Err(err) = decoder.finish(D::COLS, options.column_mode) {
+            return Err(Error::RowDecode { rowid, page_id, source: Box::new(err) });
+        }
+
+        scratch = decoder.into_scratch();
+        f(rowid, row)
+    })
+}
+
+/// Scan a table with typed decoding and custom options using the inline-only
+/// row view path.
+///
+/// This avoids payload dispatch and rowid varint parsing but does not support
+/// overflow payloads.
+pub fn scan_table_typed_inline_with_options<D, F>(
+    pager: &Pager,
+    page_id: PageId,
+    options: TypedScanOptions,
+    mut f: F,
+) -> Result<()>
+where
+    D: DecodeRecord,
+    F: for<'row> FnMut(i64, D::Row<'row>) -> Result<()>,
+{
+    let mut scratch = RecordScratch::default();
+    scan_table(pager, page_id, |rowid, row| {
+        let payload = PayloadRef::Inline(row.payload);
         let mut decoder = match RecordDecoder::new_with_scratch(
             payload,
             mem::take(&mut scratch),
