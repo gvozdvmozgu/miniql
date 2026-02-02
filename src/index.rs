@@ -444,7 +444,9 @@ fn decode_key_from_payload<'row>(
     let Some(raw) = raw else {
         return Err(Error::IndexKeyNotComparable.into());
     };
-    Ok(unsafe { raw.as_value_ref() })
+    // SAFETY: `bytes` is borrowed for `'row`, and the returned ref may point into
+    // it.
+    Ok(unsafe { raw.as_value_ref_with_scratch(bytes.as_slice()) })
 }
 
 fn read_index_leaf_cell<'row>(
