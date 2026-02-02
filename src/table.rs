@@ -2979,7 +2979,9 @@ fn decode_record_project_into_bytes(
             });
         }
 
-        let max_needed_col = needed_cols.iter().map(|&c| c as usize).max().unwrap_or(0);
+        // `needed_cols` is sorted/dedup by `build_plan`, so the max is the last.
+        // Avoids an O(k) scan on every row decode.
+        let max_needed_col = needed_cols.last().copied().unwrap_or(0) as usize;
         let mut needed_iter = needed_cols.iter().copied();
         let mut next_needed = needed_iter.next();
 
