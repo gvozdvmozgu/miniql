@@ -45,7 +45,7 @@ where
                 Ok(None)
             }
             table::PayloadRef::Overflow(_) => {
-                overflow_buf = payload.to_vec()?;
+                payload.copy_into(&mut overflow_buf)?;
                 let row = table::RowView::from_inline(&overflow_buf)?;
                 let row = row.cached(&mut cache)?;
                 if let Some(schema_row) = decode_schema_row(row)? {

@@ -473,6 +473,25 @@ impl<'row> PayloadRef<'row> {
         }
     }
 
+    #[inline]
+    pub(crate) fn copy_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            PayloadRef::Inline(bytes) => {
+                out.clear();
+                out.extend_from_slice(bytes);
+                Ok(())
+            }
+            PayloadRef::Overflow(payload) => assemble_overflow_payload(
+                payload.pager,
+                payload.total_len,
+                payload.local.len(),
+                payload.first_overflow,
+                payload.local,
+                out,
+            ),
+        }
+    }
+
     /// Return the total payload length in bytes.
     pub fn len(&self) -> usize {
         match self {
