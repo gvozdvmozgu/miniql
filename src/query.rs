@@ -1986,32 +1986,16 @@ impl Ord for SortEntry {
 
 fn stabilize_sort_key_value(value: ValueSlot, scratch_bytes: &[u8], arena: &Bump) -> ValueSlot {
     match value {
-        ValueSlot::Text(span) => match span {
-            BytesSpan::Scratch(_) => {
-                let bytes =
-                    match unsafe { ValueSlot::Text(span).as_value_ref_with_scratch(scratch_bytes) }
-                    {
-                        ValueRef::Text(bytes) => bytes,
-                        _ => &[],
-                    };
-                let stored = arena.alloc_slice_copy(bytes);
-                ValueSlot::Text(BytesSpan::Scratch(RawBytes::from_slice(stored)))
-            }
-            _ => ValueSlot::Text(span),
-        },
-        ValueSlot::Blob(span) => match span {
-            BytesSpan::Scratch(_) => {
-                let bytes =
-                    match unsafe { ValueSlot::Blob(span).as_value_ref_with_scratch(scratch_bytes) }
-                    {
-                        ValueRef::Blob(bytes) => bytes,
-                        _ => &[],
-                    };
-                let stored = arena.alloc_slice_copy(bytes);
-                ValueSlot::Blob(BytesSpan::Scratch(RawBytes::from_slice(stored)))
-            }
-            _ => ValueSlot::Blob(span),
-        },
+        ValueSlot::Text(span @ BytesSpan::Scratch(_)) => {
+            let bytes = unsafe { span.as_slice_with_scratch(scratch_bytes) };
+            let stored = arena.alloc_slice_copy(bytes);
+            ValueSlot::Text(BytesSpan::Scratch(RawBytes::from_slice(stored)))
+        }
+        ValueSlot::Blob(span @ BytesSpan::Scratch(_)) => {
+            let bytes = unsafe { span.as_slice_with_scratch(scratch_bytes) };
+            let stored = arena.alloc_slice_copy(bytes);
+            ValueSlot::Blob(BytesSpan::Scratch(RawBytes::from_slice(stored)))
+        }
         other => other,
     }
 }

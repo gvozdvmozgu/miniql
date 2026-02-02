@@ -361,7 +361,7 @@ impl BytesSpan {
     }
 
     #[inline]
-    unsafe fn as_slice_with_scratch(self, scratch_bytes: &[u8]) -> &[u8] {
+    pub(crate) unsafe fn as_slice_with_scratch(self, scratch_bytes: &[u8]) -> &[u8] {
         match self {
             Self::Mmap(raw) => unsafe { raw.as_slice() },
             Self::Scratch(raw) => {
