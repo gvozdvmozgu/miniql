@@ -182,15 +182,8 @@ impl<'db> CellScan<'db> {
         F: for<'row> FnMut(table::CellRef<'row>) -> table::Result<()>,
     {
         let (_, _, _, _, stack) = scratch.split_mut();
-        table::scan_table_cells_with_scratch_and_stack_until::<_, ()>(
-            self.pager,
-            self.root,
-            stack,
-            |cell| {
-                cb(cell)?;
-                Ok(None)
-            },
-        )?;
-        Ok(())
+        table::scan_table_cells_with_scratch_and_stack(self.pager, self.root, stack, |cell| {
+            cb(cell)
+        })
     }
 }
