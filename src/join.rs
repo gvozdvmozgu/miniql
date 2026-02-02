@@ -1432,6 +1432,8 @@ fn hash_join<F>(
 where
     F: for<'row> FnMut(JoinedRow<'row>) -> Result<()>,
 {
+    use hashbrown::hash_map::RawEntryMut;
+
     let mut mem = MemTracker::new(mem_limit);
     hash_state.clear();
     let arena = &hash_state.arena;
@@ -1509,26 +1511,28 @@ where
                     e.insert(RightRowList::new(right_row));
                 }
             },
-            HashKeyRef::Text(bytes) => {
-                if let Some(list) = text.get_mut(bytes) {
-                    let (old, new) = list.push(right_row);
+            HashKeyRef::Text(bytes) => match text.raw_entry_mut().from_key(bytes) {
+                RawEntryMut::Occupied(mut e) => {
+                    let (old, new) = e.get_mut().push(right_row);
                     mem.charge_capacity_growth(old, new, std::mem::size_of::<RightRow>())?;
-                } else {
+                }
+                RawEntryMut::Vacant(e) => {
                     mem.charge(bytes.len())?;
                     let key = BytesKey::from_slice_in(arena, bytes);
-                    text.insert(key, RightRowList::new(right_row));
+                    e.insert(key, RightRowList::new(right_row));
                 }
-            }
-            HashKeyRef::Blob(bytes) => {
-                if let Some(list) = blob.get_mut(bytes) {
-                    let (old, new) = list.push(right_row);
+            },
+            HashKeyRef::Blob(bytes) => match blob.raw_entry_mut().from_key(bytes) {
+                RawEntryMut::Occupied(mut e) => {
+                    let (old, new) = e.get_mut().push(right_row);
                     mem.charge_capacity_growth(old, new, std::mem::size_of::<RightRow>())?;
-                } else {
+                }
+                RawEntryMut::Vacant(e) => {
                     mem.charge(bytes.len())?;
                     let key = BytesKey::from_slice_in(arena, bytes);
-                    blob.insert(key, RightRowList::new(right_row));
+                    e.insert(key, RightRowList::new(right_row));
                 }
-            }
+            },
         }
 
         Ok(None::<()>)
