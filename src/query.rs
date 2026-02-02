@@ -1691,15 +1691,29 @@ impl GroupKeyPtr {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
+    #[inline(always)]
+    fn value_refs_eq_fast(left: ValueRef<'_>, right: ValueRef<'_>) -> bool {
+        match (left, right) {
+            (ValueRef::Null, ValueRef::Null) => true,
+            (ValueRef::Integer(a), ValueRef::Integer(b)) => a == b,
+            (ValueRef::Text(a), ValueRef::Text(b)) => a == b,
+            (ValueRef::Blob(a), ValueRef::Blob(b)) => a == b,
+            // REAL / mixed-type can have subtleties (NaNs, numeric conversions).
+            _ => compare_value_refs(left, right) == Ordering::Equal,
+        }
+    }
+
     #[inline]
     fn matches_refs(&self, refs: &[ValueRef<'_>]) -> bool {
         if self.len != refs.len() {
             return false;
         }
-        self.as_slice()
-            .iter()
-            .zip(refs.iter())
-            .all(|(owned, r)| compare_value_refs(owned.as_value_ref(), *r) == Ordering::Equal)
+        for (owned, r) in self.as_slice().iter().zip(refs.iter()) {
+            if !Self::value_refs_eq_fast(owned.as_value_ref(), *r) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -1708,9 +1722,12 @@ impl PartialEq for GroupKeyPtr {
         if self.len != other.len {
             return false;
         }
-        self.as_slice().iter().zip(other.as_slice().iter()).all(|(left, right)| {
-            compare_value_refs(left.as_value_ref(), right.as_value_ref()) == Ordering::Equal
-        })
+        for (left, right) in self.as_slice().iter().zip(other.as_slice().iter()) {
+            if !Self::value_refs_eq_fast(left.as_value_ref(), right.as_value_ref()) {
+                return false;
+            }
+        }
+        true
     }
 }
 
