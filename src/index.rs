@@ -250,20 +250,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         let cell_ptrs = btree::cell_ptrs(&page, &header)?;
         let offset = btree::cell_ptr_at(cell_ptrs, leaf.cell_index)?;
         let cell = read_index_leaf_cell(self.pager, &page, offset)?;
-        let count = table::record_column_count(cell.payload())?;
-        let last =
-            count.checked_sub(1).ok_or_else(|| table::Error::from(Error::MissingIndexRowId))?;
-        let last = u16::try_from(last).map_err(|_| table::Error::from(Error::MissingIndexRowId))?;
-        let Some(value) =
-            table::decode_record_column(cell.payload(), last, &mut self.scratch.bytes)?
-        else {
-            return Err(Error::MissingIndexRowId.into());
-        };
-
-        match unsafe { value.as_value_ref() } {
-            ValueRef::Integer(rowid) => Ok(rowid),
-            _ => Err(Error::MissingIndexRowId.into()),
-        }
+        decode_index_rowid(cell.payload(), &mut self.scratch.bytes)
     }
 
     /// Execute `f` with the payload and rowid at the current cursor position.
@@ -284,21 +271,7 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         let offset = btree::cell_ptr_at(cell_ptrs, leaf.cell_index)?;
         let cell = read_index_leaf_cell(self.pager, &page, offset)?;
         let payload = cell.payload();
-
-        let count = table::record_column_count(payload)?;
-        let last =
-            count.checked_sub(1).ok_or_else(|| table::Error::from(Error::MissingIndexRowId))?;
-        let last = u16::try_from(last).map_err(|_| table::Error::from(Error::MissingIndexRowId))?;
-        let Some(value) = table::decode_record_column(payload, last, &mut self.scratch.bytes)?
-        else {
-            return Err(Error::MissingIndexRowId.into());
-        };
-
-        let rowid = match unsafe { value.as_value_ref() } {
-            ValueRef::Integer(rowid) => rowid,
-            _ => return Err(Error::MissingIndexRowId.into()),
-        };
-
+        let rowid = decode_index_rowid(payload, &mut self.scratch.bytes)?;
         f(payload, rowid)
     }
 
@@ -575,5 +548,23 @@ fn child_page_for_slot(
             .right_most_child
             .ok_or(table::Error::Corrupted(Corruption::MissingRightMostChildPointer))?;
         PageId::try_new(right_most).ok_or(table::Error::Corrupted(Corruption::ChildPageIdZero))
+    }
+}
+#[inline]
+fn decode_index_rowid<'row>(
+    payload: table::PayloadRef<'row>,
+    scratch_bytes: &mut Vec<u8>,
+) -> Result<i64> {
+    let count = table::record_column_count(payload)?;
+    let last = count.checked_sub(1).ok_or_else(|| table::Error::from(Error::MissingIndexRowId))?;
+    let last = u16::try_from(last).map_err(|_| table::Error::from(Error::MissingIndexRowId))?;
+
+    let Some(slot) = table::decode_record_column(payload, last, scratch_bytes)? else {
+        return Err(Error::MissingIndexRowId.into());
+    };
+
+    match slot {
+        table::ValueSlot::Integer(rowid) => Ok(rowid),
+        _ => Err(Error::MissingIndexRowId.into()),
     }
 }
