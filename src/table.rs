@@ -2,7 +2,6 @@ use std::marker::PhantomData;
 use std::{fmt, mem, ptr, str};
 
 use crate::btree::{self, BTreeKind};
-use crate::decoder::Decoder;
 use crate::error::JoinError;
 use crate::pager::{PageId, PageRef, Pager};
 
@@ -1706,12 +1705,28 @@ where
         let page = pager.page(page_id)?;
         let header = btree::parse_table_header(&page)?;
         let cell_ptrs = btree::cell_ptrs(&page, &header)?;
+        let usable = page.usable_bytes();
+        let usable_len = usable.len();
 
         match header.kind {
             BTreeKind::TableLeaf => {
-                for idx in 0..header.cell_count as usize {
-                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
-                    let (rowid, payload) = read_scan_cell(pager, &page, offset)?;
+                let usable_size = page.usable_size();
+                let x = usable_size
+                    .checked_sub(35)
+                    .ok_or(Error::Corrupted(Corruption::UsableSizeUnderflow))?;
+                let cell_count = header.cell_count as usize;
+                let mut p = 0usize;
+                for _ in 0..cell_count {
+                    // SAFETY: cell_ptrs length is validated as cell_count*2 by btree::cell_ptrs().
+                    let offset = unsafe {
+                        u16::from_be_bytes([
+                            *cell_ptrs.get_unchecked(p),
+                            *cell_ptrs.get_unchecked(p + 1),
+                        ])
+                    };
+                    p += 2;
+                    let (rowid, payload) =
+                        read_scan_cell_usable(pager, usable, usable_size, x, offset)?;
                     match payload {
                         PayloadRef::Inline(bytes) => {
                             let row = RowView::from_inline(bytes)?;
@@ -1732,20 +1747,34 @@ where
                     stack.push(right_most);
                 }
 
-                let page_len = page.usable_bytes().len();
-                for idx in (0..header.cell_count as usize).rev() {
-                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
-                    if offset as usize >= page_len {
+                let cell_count = header.cell_count as usize;
+                let mut p = cell_ptrs.len();
+                for _ in 0..cell_count {
+                    p -= 2;
+                    let offset = unsafe {
+                        u16::from_be_bytes([
+                            *cell_ptrs.get_unchecked(p),
+                            *cell_ptrs.get_unchecked(p + 1),
+                        ])
+                    };
+                    let start = offset as usize;
+                    if start >= usable_len {
                         return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
                     }
-
-                    let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
-                    let child =
-                        read_u32_checked(&mut decoder, Corruption::CellChildPointerTruncated)?;
+                    if start + 4 > usable_len {
+                        return Err(Error::Corrupted(Corruption::CellChildPointerTruncated));
+                    }
+                    let child = u32::from_be_bytes([
+                        unsafe { *usable.get_unchecked(start) },
+                        unsafe { *usable.get_unchecked(start + 1) },
+                        unsafe { *usable.get_unchecked(start + 2) },
+                        unsafe { *usable.get_unchecked(start + 3) },
+                    ]);
                     let child = PageId::try_new(child)
                         .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
 
-                    let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
+                    let mut key_pos = start + 4;
+                    let _ = read_varint_at(usable, &mut key_pos, Corruption::CellKeyTruncated)?;
                     stack.push(child);
                 }
             }
@@ -1758,39 +1787,37 @@ where
     Ok(())
 }
 
-/// Read a cell's rowid and payload without full parsing.
-#[inline]
-fn read_scan_cell<'row>(
+#[inline(always)]
+fn read_scan_cell_usable<'row>(
     pager: &'row Pager,
-    page: &'row PageRef<'_>,
+    usable: &'row [u8],
+    usable_size: usize,
+    x: usize,
     offset: u16,
 ) -> Result<(i64, PayloadRef<'row>)> {
-    let usable = page.usable_bytes();
     if offset as usize >= usable.len() {
         return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
     }
 
     let mut pos = offset as usize;
     let remaining = usable.len().saturating_sub(pos);
-    let (payload_length, rowid) = if remaining >= 18 {
-        let payload_length = unsafe { read_varint_unchecked_at(usable, &mut pos) };
+    let (payload_len_u64, rowid) = if remaining >= 18 {
+        let payload_len = unsafe { read_varint_unchecked_at(usable, &mut pos) };
         let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) } as i64;
-        (payload_length, rowid)
+        (payload_len, rowid)
     } else {
-        let payload_length =
-            read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?;
+        let payload_len = read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?;
         let rowid = read_varint_at(usable, &mut pos, Corruption::CellRowIdTruncated)? as i64;
-        (payload_length, rowid)
+        (payload_len, rowid)
     };
-    let payload_length = usize::try_from(payload_length)
-        .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
-    if payload_length > MAX_PAYLOAD_BYTES {
-        return Err(Error::PayloadTooLarge(payload_length));
+    if payload_len_u64 > MAX_PAYLOAD_BYTES as u64 {
+        let size = usize::try_from(payload_len_u64)
+            .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
+        return Err(Error::PayloadTooLarge(size));
     }
+    let payload_length = payload_len_u64 as usize;
 
     let start = pos;
-    let usable_size = page.usable_size();
-    let x = usable_size.checked_sub(35).ok_or(Error::Corrupted(Corruption::UsableSizeUnderflow))?;
     if payload_length <= x {
         let end = start + payload_length;
         if end > usable.len() {
@@ -1958,12 +1985,28 @@ where
         let page = pager.page(page_id)?;
         let header = btree::parse_table_header(&page)?;
         let cell_ptrs = btree::cell_ptrs(&page, &header)?;
+        let usable = page.usable_bytes();
+        let usable_len = usable.len();
 
         match header.kind {
             BTreeKind::TableLeaf => {
-                for idx in 0..header.cell_count as usize {
-                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
-                    let (rowid, payload) = read_scan_cell(pager, &page, offset)?;
+                let usable_size = page.usable_size();
+                let x = usable_size
+                    .checked_sub(35)
+                    .ok_or(Error::Corrupted(Corruption::UsableSizeUnderflow))?;
+                let cell_count = header.cell_count as usize;
+                let mut p = 0usize;
+                for _ in 0..cell_count {
+                    // SAFETY: cell_ptrs length is validated as cell_count*2 by btree::cell_ptrs().
+                    let offset = unsafe {
+                        u16::from_be_bytes([
+                            *cell_ptrs.get_unchecked(p),
+                            *cell_ptrs.get_unchecked(p + 1),
+                        ])
+                    };
+                    p += 2;
+                    let (rowid, payload) =
+                        read_scan_cell_usable(pager, usable, usable_size, x, offset)?;
                     f(rowid, page_id, payload)?;
                 }
             }
@@ -1974,20 +2017,34 @@ where
                     stack.push(right_most);
                 }
 
-                let page_len = page.usable_bytes().len();
-                for idx in (0..header.cell_count as usize).rev() {
-                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
-                    if offset as usize >= page_len {
+                let cell_count = header.cell_count as usize;
+                let mut p = cell_ptrs.len();
+                for _ in 0..cell_count {
+                    p -= 2;
+                    let offset = unsafe {
+                        u16::from_be_bytes([
+                            *cell_ptrs.get_unchecked(p),
+                            *cell_ptrs.get_unchecked(p + 1),
+                        ])
+                    };
+                    let start = offset as usize;
+                    if start >= usable_len {
                         return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
                     }
-
-                    let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
-                    let child =
-                        read_u32_checked(&mut decoder, Corruption::CellChildPointerTruncated)?;
+                    if start + 4 > usable_len {
+                        return Err(Error::Corrupted(Corruption::CellChildPointerTruncated));
+                    }
+                    let child = u32::from_be_bytes([
+                        unsafe { *usable.get_unchecked(start) },
+                        unsafe { *usable.get_unchecked(start + 1) },
+                        unsafe { *usable.get_unchecked(start + 2) },
+                        unsafe { *usable.get_unchecked(start + 3) },
+                    ]);
                     let child = PageId::try_new(child)
                         .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
 
-                    let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
+                    let mut key_pos = start + 4;
+                    let _ = read_varint_at(usable, &mut key_pos, Corruption::CellKeyTruncated)?;
                     stack.push(child);
                 }
             }
@@ -2029,12 +2086,28 @@ where
         let page = pager.page(page_id)?;
         let header = btree::parse_table_header(&page)?;
         let cell_ptrs = btree::cell_ptrs(&page, &header)?;
+        let usable = page.usable_bytes();
+        let usable_len = usable.len();
 
         match header.kind {
             BTreeKind::TableLeaf => {
-                for idx in 0..header.cell_count as usize {
-                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
-                    let cell = read_table_cell_ref(pager, page_id, &page, offset)?;
+                let usable_size = page.usable_size();
+                let x = usable_size
+                    .checked_sub(35)
+                    .ok_or(Error::Corrupted(Corruption::UsableSizeUnderflow))?;
+                let cell_count = header.cell_count as usize;
+                let mut p = 0usize;
+                for _ in 0..cell_count {
+                    // SAFETY: cell_ptrs length is validated as cell_count*2 by btree::cell_ptrs().
+                    let offset = unsafe {
+                        u16::from_be_bytes([
+                            *cell_ptrs.get_unchecked(p),
+                            *cell_ptrs.get_unchecked(p + 1),
+                        ])
+                    };
+                    p += 2;
+                    let cell =
+                        read_table_cell_ref_usable(pager, page_id, usable, usable_size, x, offset)?;
                     f(cell)?;
                 }
             }
@@ -2045,20 +2118,34 @@ where
                     stack.push(right_most);
                 }
 
-                let page_len = page.usable_bytes().len();
-                for idx in (0..header.cell_count as usize).rev() {
-                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
-                    if offset as usize >= page_len {
+                let cell_count = header.cell_count as usize;
+                let mut p = cell_ptrs.len();
+                for _ in 0..cell_count {
+                    p -= 2;
+                    let offset = unsafe {
+                        u16::from_be_bytes([
+                            *cell_ptrs.get_unchecked(p),
+                            *cell_ptrs.get_unchecked(p + 1),
+                        ])
+                    };
+                    let start = offset as usize;
+                    if start >= usable_len {
                         return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
                     }
-
-                    let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
-                    let child =
-                        read_u32_checked(&mut decoder, Corruption::CellChildPointerTruncated)?;
+                    if start + 4 > usable_len {
+                        return Err(Error::Corrupted(Corruption::CellChildPointerTruncated));
+                    }
+                    let child = u32::from_be_bytes([
+                        unsafe { *usable.get_unchecked(start) },
+                        unsafe { *usable.get_unchecked(start + 1) },
+                        unsafe { *usable.get_unchecked(start + 2) },
+                        unsafe { *usable.get_unchecked(start + 3) },
+                    ]);
                     let child = PageId::try_new(child)
                         .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
 
-                    let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
+                    let mut key_pos = start + 4;
+                    let _ = read_varint_at(usable, &mut key_pos, Corruption::CellKeyTruncated)?;
                     stack.push(child);
                 }
             }
@@ -2091,12 +2178,28 @@ where
         let page = pager.page(page_id)?;
         let header = btree::parse_table_header(&page)?;
         let cell_ptrs = btree::cell_ptrs(&page, &header)?;
+        let usable = page.usable_bytes();
+        let usable_len = usable.len();
 
         match header.kind {
             BTreeKind::TableLeaf => {
-                for idx in 0..header.cell_count as usize {
-                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
-                    let cell = read_table_cell_ref(pager, page_id, &page, offset)?;
+                let usable_size = page.usable_size();
+                let x = usable_size
+                    .checked_sub(35)
+                    .ok_or(Error::Corrupted(Corruption::UsableSizeUnderflow))?;
+                let cell_count = header.cell_count as usize;
+                let mut p = 0usize;
+                for _ in 0..cell_count {
+                    // SAFETY: cell_ptrs length is validated as cell_count*2 by btree::cell_ptrs().
+                    let offset = unsafe {
+                        u16::from_be_bytes([
+                            *cell_ptrs.get_unchecked(p),
+                            *cell_ptrs.get_unchecked(p + 1),
+                        ])
+                    };
+                    p += 2;
+                    let cell =
+                        read_table_cell_ref_usable(pager, page_id, usable, usable_size, x, offset)?;
                     if let Some(value) = f(cell)? {
                         return Ok(Some(value));
                     }
@@ -2109,20 +2212,34 @@ where
                     stack.push(right_most);
                 }
 
-                let page_len = page.usable_bytes().len();
-                for idx in (0..header.cell_count as usize).rev() {
-                    let offset = btree::cell_ptr_at(cell_ptrs, idx)?;
-                    if offset as usize >= page_len {
+                let cell_count = header.cell_count as usize;
+                let mut p = cell_ptrs.len();
+                for _ in 0..cell_count {
+                    p -= 2;
+                    let offset = unsafe {
+                        u16::from_be_bytes([
+                            *cell_ptrs.get_unchecked(p),
+                            *cell_ptrs.get_unchecked(p + 1),
+                        ])
+                    };
+                    let start = offset as usize;
+                    if start >= usable_len {
                         return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
                     }
-
-                    let mut decoder = Decoder::new(page.usable_bytes()).split_at(offset as usize);
-                    let child =
-                        read_u32_checked(&mut decoder, Corruption::CellChildPointerTruncated)?;
+                    if start + 4 > usable_len {
+                        return Err(Error::Corrupted(Corruption::CellChildPointerTruncated));
+                    }
+                    let child = u32::from_be_bytes([
+                        unsafe { *usable.get_unchecked(start) },
+                        unsafe { *usable.get_unchecked(start + 1) },
+                        unsafe { *usable.get_unchecked(start + 2) },
+                        unsafe { *usable.get_unchecked(start + 3) },
+                    ]);
                     let child = PageId::try_new(child)
                         .ok_or(Error::Corrupted(Corruption::ChildPageIdZero))?;
 
-                    let _ = read_varint_checked(&mut decoder, Corruption::CellKeyTruncated)?;
+                    let mut key_pos = start + 4;
+                    let _ = read_varint_at(usable, &mut key_pos, Corruption::CellKeyTruncated)?;
                     stack.push(child);
                 }
             }
@@ -2135,6 +2252,77 @@ where
     Ok(None)
 }
 
+#[inline(always)]
+fn read_table_cell_ref_usable<'row>(
+    pager: &'row Pager,
+    page_id: PageId,
+    usable: &'row [u8],
+    usable_size: usize,
+    x: usize,
+    offset: u16,
+) -> Result<CellRef<'row>> {
+    let off = offset as usize;
+    if off >= usable.len() {
+        return Err(Error::Corrupted(Corruption::CellOffsetOutOfBounds));
+    }
+
+    let mut pos = off;
+    let remaining = usable.len().saturating_sub(off);
+    let (payload_len_u64, rowid_u64) = if remaining >= 18 {
+        // SAFETY: remaining >= 18 guarantees two full varints (max 9 bytes each).
+        let payload_len = unsafe { read_varint_unchecked_at(usable, &mut pos) };
+        let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) };
+        (payload_len, rowid)
+    } else {
+        let payload_len = read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?;
+        let rowid = read_varint_at(usable, &mut pos, Corruption::CellRowIdTruncated)?;
+        (payload_len, rowid)
+    };
+
+    // Hot-path: avoid u64->usize try_from when payload is normal sized.
+    if payload_len_u64 > MAX_PAYLOAD_BYTES as u64 {
+        let size = usize::try_from(payload_len_u64)
+            .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
+        return Err(Error::PayloadTooLarge(size));
+    }
+    let payload_len = payload_len_u64 as usize;
+    let rowid = rowid_u64 as i64;
+
+    let start = pos;
+    if payload_len <= x {
+        let end = start + payload_len;
+        if end > usable.len() {
+            return Err(Error::Corrupted(Corruption::PayloadExtendsPastPageBoundary));
+        }
+        return Ok(CellRef {
+            rowid,
+            payload: PayloadRef::Inline(&usable[start..end]),
+            page_id,
+            cell_offset: offset,
+        });
+    }
+
+    let local_len = local_payload_len(usable_size, payload_len)?;
+    let end_local = start + local_len;
+    if end_local > usable.len() {
+        return Err(Error::Corrupted(Corruption::PayloadExtendsPastPageBoundary));
+    }
+
+    let overflow_end = end_local + 4;
+    if overflow_end > usable.len() {
+        return Err(Error::Corrupted(Corruption::OverflowPointerOutOfBounds));
+    }
+    let overflow_page = u32::from_be_bytes(usable[end_local..overflow_end].try_into().unwrap());
+    if overflow_page == 0 {
+        return Err(Error::OverflowChainTruncated);
+    }
+
+    let payload =
+        OverflowPayload::new(pager, payload_len, &usable[start..end_local], overflow_page);
+    Ok(CellRef { rowid, payload: PayloadRef::Overflow(payload), page_id, cell_offset: offset })
+}
+
+#[allow(dead_code)]
 #[inline]
 fn read_table_cell_ref<'row>(
     pager: &'row Pager,
@@ -2149,23 +2337,23 @@ fn read_table_cell_ref<'row>(
 
     let mut pos = offset as usize;
     let remaining = usable.len().saturating_sub(pos);
-    let (payload_length, rowid) = if remaining >= 18 {
+    let (payload_len_u64, rowid) = if remaining >= 18 {
         // SAFETY: remaining >= 18 guarantees two varints (max 9 bytes each) are
         // in-bounds.
-        let payload_length = unsafe { read_varint_unchecked_at(usable, &mut pos) };
+        let payload_len = unsafe { read_varint_unchecked_at(usable, &mut pos) };
         let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) } as i64;
-        (payload_length, rowid)
+        (payload_len, rowid)
     } else {
-        let payload_length =
-            read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?;
+        let payload_len = read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?;
         let rowid = read_varint_at(usable, &mut pos, Corruption::CellRowIdTruncated)? as i64;
-        (payload_length, rowid)
+        (payload_len, rowid)
     };
-    let payload_length = usize::try_from(payload_length)
-        .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
-    if payload_length > MAX_PAYLOAD_BYTES {
-        return Err(Error::PayloadTooLarge(payload_length));
+    if payload_len_u64 > MAX_PAYLOAD_BYTES as u64 {
+        let size = usize::try_from(payload_len_u64)
+            .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
+        return Err(Error::PayloadTooLarge(size));
     }
+    let payload_length = payload_len_u64 as usize;
 
     let start = pos;
     let usable_size = page.usable_size();
@@ -2217,23 +2405,23 @@ pub(crate) fn read_table_cell_ref_from_bytes<'row>(
 
     let mut pos = offset as usize;
     let remaining = usable.len().saturating_sub(pos);
-    let (payload_length, rowid) = if remaining >= 18 {
+    let (payload_len_u64, rowid) = if remaining >= 18 {
         // SAFETY: remaining >= 18 guarantees two varints (max 9 bytes each) are
         // in-bounds.
-        let payload_length = unsafe { read_varint_unchecked_at(usable, &mut pos) };
+        let payload_len = unsafe { read_varint_unchecked_at(usable, &mut pos) };
         let rowid = unsafe { read_varint_unchecked_at(usable, &mut pos) } as i64;
-        (payload_length, rowid)
+        (payload_len, rowid)
     } else {
-        let payload_length =
-            read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?;
+        let payload_len = read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?;
         let rowid = read_varint_at(usable, &mut pos, Corruption::CellRowIdTruncated)? as i64;
-        (payload_length, rowid)
+        (payload_len, rowid)
     };
-    let payload_length = usize::try_from(payload_length)
-        .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
-    if payload_length > MAX_PAYLOAD_BYTES {
-        return Err(Error::PayloadTooLarge(payload_length));
+    if payload_len_u64 > MAX_PAYLOAD_BYTES as u64 {
+        let size = usize::try_from(payload_len_u64)
+            .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
+        return Err(Error::PayloadTooLarge(size));
     }
+    let payload_length = payload_len_u64 as usize;
 
     let start = pos;
     let usable_size = pager.header().usable_size;
@@ -2278,17 +2466,17 @@ fn read_table_leaf_rowid(page: &PageRef<'_>, offset: u16) -> Result<i64> {
 
     let mut pos = offset as usize;
     let remaining = usable.len().saturating_sub(pos);
-    let payload_length = if remaining >= 18 {
+    let payload_len_u64 = if remaining >= 18 {
         // SAFETY: remaining >= 18 guarantees two varints (max 9 bytes each) are
         // in-bounds.
         unsafe { read_varint_unchecked_at(usable, &mut pos) }
     } else {
         read_varint_at(usable, &mut pos, Corruption::CellPayloadLengthTruncated)?
     };
-    let payload_length = usize::try_from(payload_length)
-        .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
-    if payload_length > MAX_PAYLOAD_BYTES {
-        return Err(Error::PayloadTooLarge(payload_length));
+    if payload_len_u64 > MAX_PAYLOAD_BYTES as u64 {
+        let size = usize::try_from(payload_len_u64)
+            .map_err(|_| Error::Corrupted(Corruption::PayloadIsTooLarge))?;
+        return Err(Error::PayloadTooLarge(size));
     }
     let rowid = if remaining >= 18 {
         // SAFETY: remaining >= 18 guarantees two varints (max 9 bytes each) are
@@ -2758,41 +2946,58 @@ fn decode_record_project_into_bytes(
     let serial_bytes = &payload[header_pos..header_len];
 
     if let Some(needed_cols) = needed_cols {
-        // PROJECTION PATH: SQLite optimization - parse header only up to max needed
-        // column
-        let max_needed_col = needed_cols.iter().map(|&c| c as usize).max().unwrap_or(0);
-        let needed_cap = max_needed_col.saturating_add(1);
-        if serials.capacity() < needed_cap {
-            serials.reserve(needed_cap - serials.capacity());
-        }
-        if offsets.capacity() < needed_cap {
-            offsets.reserve(needed_cap - offsets.capacity());
+        // PROJECTION PATH (streamed):
+        // - Parse header varints only up to max_needed_col, advancing value_pos as we
+        //   go.
+        // - Decode needed columns on the fly (needed_cols is sorted/dedup by
+        //   build_plan).
+        // - Count remaining columns with the same lenient scan used previously.
+        if out.capacity() < needed_cols.len() {
+            return Err(Error::ScratchTooSmall {
+                kind: ScratchKind::Values,
+                needed: needed_cols.len(),
+                capacity: out.capacity(),
+            });
         }
 
-        // Phase 1: Parse serial types lazily (only up to max_needed_col + 1)
+        let max_needed_col = needed_cols.iter().map(|&c| c as usize).max().unwrap_or(0);
+        let mut needed_iter = needed_cols.iter().copied();
+        let mut next_needed = needed_iter.next();
+
         let mut serial_pos = 0usize;
         let mut value_pos = header_len;
-        while serial_pos < serial_bytes.len() && serials.len() <= max_needed_col {
+        let mut col_idx = 0usize;
+
+        while serial_pos < serial_bytes.len() && col_idx <= max_needed_col {
             let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
             let serial = if b < 0x80 {
                 serial_pos += 1;
-                b as u64
+                u64::from(b)
             } else {
                 read_varint_at(serial_bytes, &mut serial_pos, Corruption::RecordHeaderTruncated)?
             };
-            serials.push(serial);
-            offsets.push(value_pos as u32);
-            value_pos += serial_type_len_fast(serial);
+
+            if next_needed == Some(col_idx as u16) {
+                let mut decode_pos = value_pos;
+                let value = decode_value_ref_at(serial, payload, &mut decode_pos)?;
+                out.push(value);
+                value_pos = decode_pos;
+                next_needed = needed_iter.next();
+            } else {
+                value_pos += serial_type_len_fast(serial);
+            }
+
+            col_idx += 1;
         }
 
-        // Count remaining columns without storing (needed for column_count validation)
-        let mut column_count = serials.len();
+        // Count remaining columns without validating varint termination (matches old
+        // behavior).
+        let mut column_count = col_idx;
         while serial_pos < serial_bytes.len() {
             let b = unsafe { *serial_bytes.get_unchecked(serial_pos) };
             if b < 0x80 {
                 serial_pos += 1;
             } else {
-                // Skip multi-byte varint
                 while serial_pos < serial_bytes.len() {
                     let byte = unsafe { *serial_bytes.get_unchecked(serial_pos) };
                     serial_pos += 1;
@@ -2804,43 +3009,6 @@ fn decode_record_project_into_bytes(
             column_count += 1;
         }
 
-        // Check capacity once before decoding
-        if out.capacity() < needed_cols.len() {
-            return Err(Error::ScratchTooSmall {
-                kind: ScratchKind::Values,
-                needed: needed_cols.len(),
-                capacity: out.capacity(),
-            });
-        }
-
-        // Phase 2: Decode only needed columns
-        match needed_cols.len() {
-            0 => {}
-            1 => {
-                // Fast path for single column projection
-                let col_idx = needed_cols[0] as usize;
-                if col_idx < column_count {
-                    let serial = unsafe { *serials.get_unchecked(col_idx) };
-                    let mut decode_pos = unsafe { *offsets.get_unchecked(col_idx) } as usize;
-                    let value = decode_value_ref_at(serial, payload, &mut decode_pos)?;
-                    out.push(value);
-                }
-            }
-            _ => {
-                // Multi-column path: use cached offsets (SQLite aOffset[] style)
-                // needed_cols is already sorted by build_plan
-                for &col in needed_cols {
-                    let col_idx = col as usize;
-                    if col_idx >= column_count {
-                        continue;
-                    }
-                    let serial = unsafe { *serials.get_unchecked(col_idx) };
-                    let mut decode_pos = unsafe { *offsets.get_unchecked(col_idx) } as usize;
-                    let value = decode_value_ref_at(serial, payload, &mut decode_pos)?;
-                    out.push(value);
-                }
-            }
-        }
         Ok(column_count)
     } else {
         // NO PROJECTION PATH: single-pass parse + decode (no intermediate serials
@@ -3320,14 +3488,6 @@ fn read_u64_be_at(bytes: &[u8], pos: &mut usize) -> Result<u64> {
         let v = ptr::read_unaligned(bytes.as_ptr().add(p) as *const u64);
         Ok(u64::from_be(v))
     }
-}
-
-fn read_u32_checked(decoder: &mut Decoder<'_>, msg: Corruption) -> Result<u32> {
-    decoder.try_read_u32().ok_or(Error::Corrupted(msg))
-}
-
-fn read_varint_checked(decoder: &mut Decoder<'_>, msg: Corruption) -> Result<u64> {
-    decoder.try_read_varint().ok_or(Error::Corrupted(msg))
 }
 
 #[inline]

@@ -52,12 +52,13 @@ pub(crate) fn cell_ptrs<'a>(
 
 #[inline(always)]
 pub(crate) fn cell_ptr_at(cell_ptrs: &[u8], idx: usize) -> table::Result<u16> {
-    let offset =
-        idx.checked_mul(2).ok_or(table::Error::Corrupted(Corruption::CellPointerArrayOverflow))?;
+    let offset = idx << 1;
     if offset + 1 >= cell_ptrs.len() {
         return Err(table::Error::Corrupted(Corruption::CellPointerArrayOutOfBounds));
     }
-    Ok(u16::from_be_bytes([cell_ptrs[offset], cell_ptrs[offset + 1]]))
+    let b0 = unsafe { *cell_ptrs.get_unchecked(offset) };
+    let b1 = unsafe { *cell_ptrs.get_unchecked(offset + 1) };
+    Ok(u16::from_be_bytes([b0, b1]))
 }
 
 #[inline]

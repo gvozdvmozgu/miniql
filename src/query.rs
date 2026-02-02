@@ -4,7 +4,9 @@ use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 
 use bumpalo::Bump;
-use rustc_hash::FxHashMap;
+use hashbrown::HashMap;
+use hashbrown::hash_map::RawEntryMut;
+use rustc_hash::{FxBuildHasher, FxHasher};
 use smallvec::SmallVec;
 
 use crate::compare::compare_value_refs;
@@ -1388,31 +1390,49 @@ impl<'db> PreparedAggregate<'db> {
         F: for<'row> FnMut(Row<'row>) -> table::Result<()>,
     {
         let mut groups: Vec<GroupState> = Vec::new();
-        let mut group_map: FxHashMap<GroupKey, usize> = FxHashMap::default();
+        let mut group_map: HashMap<GroupKeyPtr, usize, FxBuildHasher> = HashMap::default();
 
         let (scan, group_by, agg_template) = (&mut self.scan, &self.group_by, &self.agg_template);
         let group_len = group_by.len();
 
+        // Aggregate without GROUP BY always has exactly one group (even for empty
+        // input).
+        if group_len == 0 && self.has_agg {
+            groups.push(GroupState::new(Vec::new(), agg_template.clone()));
+        }
+
         scan.for_each_eager(scratch, |_, row| {
             let group_idx = if group_len == 0 {
-                if groups.is_empty() {
-                    groups.push(GroupState::new(Vec::new(), agg_template.clone()));
-                }
                 0
             } else {
-                let mut key_values = Vec::with_capacity(group_len);
+                let mut key_refs: SmallVec<[ValueRef<'_>; 8]> = SmallVec::with_capacity(group_len);
+                let mut hasher = FxHasher::default();
                 for expr in group_by {
                     let value = eval_value_expr(expr, &row)?;
-                    key_values.push(OwnedValue::from_eval_value(value));
+                    let value_ref = match value {
+                        EvalValue::Value(value) => value,
+                        EvalValue::Lit(lit) => lit.as_value_ref(),
+                    };
+                    key_refs.push(value_ref);
+                    hash_value_ref(value_ref, &mut hasher);
                 }
-                let key = GroupKey(key_values);
-                if let Some(idx) = group_map.get(&key).copied() {
-                    idx
-                } else {
-                    let idx = groups.len();
-                    groups.push(GroupState::new(key.0.clone(), agg_template.clone()));
-                    group_map.insert(key, idx);
-                    idx
+                let hash = hasher.finish();
+                match group_map
+                    .raw_entry_mut()
+                    .from_hash(hash, |key| key.matches_refs(key_refs.as_slice()))
+                {
+                    RawEntryMut::Occupied(entry) => *entry.get(),
+                    RawEntryMut::Vacant(entry) => {
+                        let idx = groups.len();
+                        let mut owned_keys = Vec::with_capacity(group_len);
+                        for value_ref in key_refs.iter().copied() {
+                            owned_keys.push(OwnedValue::from_value_ref(value_ref));
+                        }
+                        groups.push(GroupState::new(owned_keys, agg_template.clone()));
+                        let key_ptr = GroupKeyPtr::new(&groups[idx].keys);
+                        entry.insert(key_ptr, idx);
+                        idx
+                    }
                 }
             };
 
@@ -1424,41 +1444,30 @@ impl<'db> PreparedAggregate<'db> {
             }
             Ok(())
         })?;
-
-        if group_len == 0 && groups.is_empty() && self.has_agg {
-            groups.push(GroupState::new(Vec::new(), agg_template.clone()));
-        }
-
-        let mut output_values: Vec<OwnedValue> = Vec::with_capacity(self.select.len());
         let mut output_slots: Vec<ValueSlot> = Vec::with_capacity(self.select.len());
 
         for group in &groups {
-            output_values.clear();
             output_slots.clear();
 
             for item in &self.select {
                 match item {
                     SelectItemPlan::GroupKey(idx) => {
-                        let value = group.keys.get(*idx).cloned().ok_or(
-                            table::Error::Corrupted(Corruption::AggregateGroupKeyIndexOutOfBounds),
-                        )?;
-                        output_values.push(value);
+                        let value = group.keys.get(*idx).ok_or(table::Error::Corrupted(
+                            Corruption::AggregateGroupKeyIndexOutOfBounds,
+                        ))?;
+                        output_slots.push(value.to_slot());
                     }
                     SelectItemPlan::Agg(idx) => {
-                        let value = group
+                        let slot = group
                             .aggs
                             .get(*idx)
                             .ok_or(table::Error::Corrupted(
                                 Corruption::AggregateStateIndexOutOfBounds,
                             ))?
-                            .finalize();
-                        output_values.push(value);
+                            .finalize_slot();
+                        output_slots.push(slot);
                     }
                 }
-            }
-
-            for value in &output_values {
-                output_slots.push(value.to_slot());
             }
 
             if let Some(expr) = self.having.as_ref()
@@ -1576,16 +1585,21 @@ impl AggState {
                 if current.is_null() {
                     return Ok(());
                 }
-                let owned = OwnedValue::from_eval_value(current);
-                let should_replace = match value.as_ref() {
-                    None => true,
-                    Some(existing) => {
-                        compare_value_refs(owned.as_value_ref(), existing.as_value_ref())
-                            == Ordering::Less
+                match value.as_ref() {
+                    None => {
+                        *value = Some(OwnedValue::from_eval_value(current));
                     }
-                };
-                if should_replace {
-                    *value = Some(owned);
+                    Some(existing) => {
+                        let current_ref = match &current {
+                            EvalValue::Value(value) => *value,
+                            EvalValue::Lit(lit) => lit.as_value_ref(),
+                        };
+                        if compare_value_refs(current_ref, existing.as_value_ref())
+                            == Ordering::Less
+                        {
+                            *value = Some(OwnedValue::from_eval_value(current));
+                        }
+                    }
                 }
             }
             Self::Max { expr, value } => {
@@ -1593,44 +1607,51 @@ impl AggState {
                 if current.is_null() {
                     return Ok(());
                 }
-                let owned = OwnedValue::from_eval_value(current);
-                let should_replace = match value.as_ref() {
-                    None => true,
-                    Some(existing) => {
-                        compare_value_refs(owned.as_value_ref(), existing.as_value_ref())
-                            == Ordering::Greater
+                match value.as_ref() {
+                    None => {
+                        *value = Some(OwnedValue::from_eval_value(current));
                     }
-                };
-                if should_replace {
-                    *value = Some(owned);
+                    Some(existing) => {
+                        let current_ref = match &current {
+                            EvalValue::Value(value) => *value,
+                            EvalValue::Lit(lit) => lit.as_value_ref(),
+                        };
+                        if compare_value_refs(current_ref, existing.as_value_ref())
+                            == Ordering::Greater
+                        {
+                            *value = Some(OwnedValue::from_eval_value(current));
+                        }
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    fn finalize(&self) -> OwnedValue {
+    #[inline]
+    fn finalize_slot(&self) -> ValueSlot {
         match self {
-            Self::Count { n, .. } => OwnedValue::Integer(*n),
+            Self::Count { n, .. } => ValueSlot::Integer(*n),
             Self::Sum { count, int_sum, real_sum, use_real, .. } => {
                 if *count == 0 {
-                    OwnedValue::Null
+                    ValueSlot::Null
                 } else if *use_real {
-                    OwnedValue::Real(*real_sum)
+                    ValueSlot::Real(*real_sum)
                 } else {
-                    OwnedValue::Integer(*int_sum)
+                    ValueSlot::Integer(*int_sum)
                 }
             }
             Self::Avg { count, sum, .. } => {
                 if *count == 0 {
-                    OwnedValue::Null
+                    ValueSlot::Null
                 } else {
-                    OwnedValue::Real(*sum / (*count as f64))
+                    ValueSlot::Real(*sum / (*count as f64))
                 }
             }
-            Self::Min { value, .. } | Self::Max { value, .. } => {
-                value.clone().unwrap_or(OwnedValue::Null)
-            }
+            Self::Min { value, .. } | Self::Max { value, .. } => match value.as_ref() {
+                None => ValueSlot::Null,
+                Some(value) => value.to_slot(),
+            },
         }
     }
 }
@@ -1647,25 +1668,57 @@ impl GroupState {
     }
 }
 
-#[derive(Clone, Debug)]
-struct GroupKey(Vec<OwnedValue>);
+/// HashMap key for GROUP BY: points at the stable heap buffer of
+/// `GroupState.keys`. This avoids storing the key twice (once in the map and
+/// once in the group).
+#[derive(Clone, Copy, Debug)]
+struct GroupKeyPtr {
+    ptr: *const OwnedValue,
+    len: usize,
+}
 
-impl PartialEq for GroupKey {
-    fn eq(&self, other: &Self) -> bool {
-        if self.0.len() != other.0.len() {
+impl GroupKeyPtr {
+    #[inline]
+    fn new(values: &[OwnedValue]) -> Self {
+        Self { ptr: values.as_ptr(), len: values.len() }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[OwnedValue] {
+        // SAFETY: `ptr/len` always reference a `Vec<OwnedValue>` owned by `groups`.
+        // `groups` outlives `group_map` for the duration of
+        // `PreparedAggregate::for_each`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    #[inline]
+    fn matches_refs(&self, refs: &[ValueRef<'_>]) -> bool {
+        if self.len != refs.len() {
             return false;
         }
-        self.0.iter().zip(other.0.iter()).all(|(left, right)| {
+        self.as_slice()
+            .iter()
+            .zip(refs.iter())
+            .all(|(owned, r)| compare_value_refs(owned.as_value_ref(), *r) == Ordering::Equal)
+    }
+}
+
+impl PartialEq for GroupKeyPtr {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        self.as_slice().iter().zip(other.as_slice().iter()).all(|(left, right)| {
             compare_value_refs(left.as_value_ref(), right.as_value_ref()) == Ordering::Equal
         })
     }
 }
 
-impl Eq for GroupKey {}
+impl Eq for GroupKeyPtr {}
 
-impl Hash for GroupKey {
+impl Hash for GroupKeyPtr {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        for value in &self.0 {
+        for value in self.as_slice() {
             hash_owned_value(value, state);
         }
     }
@@ -1796,6 +1849,31 @@ fn hash_owned_value<H: Hasher>(value: &OwnedValue, state: &mut H) {
             bytes.hash(state);
         }
         OwnedValue::Blob(bytes) => {
+            3u8.hash(state);
+            bytes.hash(state);
+        }
+    }
+}
+
+#[inline(always)]
+fn hash_value_ref<H: Hasher>(value: ValueRef<'_>, state: &mut H) {
+    match value {
+        ValueRef::Null => {
+            0u8.hash(state);
+        }
+        ValueRef::Integer(value) => {
+            1u8.hash(state);
+            hash_numeric(value as f64, state);
+        }
+        ValueRef::Real(value) => {
+            1u8.hash(state);
+            hash_numeric(value, state);
+        }
+        ValueRef::Text(bytes) => {
+            2u8.hash(state);
+            bytes.hash(state);
+        }
+        ValueRef::Blob(bytes) => {
             3u8.hash(state);
             bytes.hash(state);
         }
