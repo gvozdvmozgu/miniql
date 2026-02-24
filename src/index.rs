@@ -124,46 +124,17 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
                 }
                 BTreeKind::IndexInterior => {
                     let cell_count = header.cell_count as usize;
-                    let mut lo = 0usize;
-                    let mut hi = cell_count;
-                    let mut candidate_child: Option<PageId> = None;
+                    let (slot, child) =
+                        self.lower_bound_interior_child(&page, cell_ptrs, cell_count, target)?;
 
-                    while lo < hi {
-                        let mid = (lo + hi) / 2;
-                        let offset = btree::cell_ptr_at(cell_ptrs, mid)?;
-                        let cell = read_index_interior_cell(self.pager, &page, offset)?;
-                        let child = cell
-                            .child()
-                            .ok_or(table::Error::Corrupted(Corruption::MissingChildPointer))?;
-                        let key = decode_key_from_payload(
-                            self.key_col,
-                            cell.payload(),
-                            &mut self.scratch.bytes,
-                        )?;
-                        let cmp = compare_value_refs(target, key);
+                    self.scratch.stack.push(StackEntry { page_id, child_slot: slot });
 
-                        if cmp == Ordering::Greater {
-                            lo = mid + 1;
-                        } else {
-                            hi = mid;
-                            candidate_child = Some(child);
-                        }
-                    }
-
-                    if lo < cell_count {
-                        let child = candidate_child
-                            .ok_or(table::Error::Corrupted(Corruption::MissingChildPointer))?;
-                        self.scratch.stack.push(StackEntry { page_id, child_slot: lo });
-                        page_id = child;
-                    } else {
-                        let right_most = header.right_most_child.ok_or(table::Error::Corrupted(
-                            Corruption::MissingRightMostChildPointer,
-                        ))?;
-                        let right_most = PageId::try_new(right_most)
-                            .ok_or(table::Error::Corrupted(Corruption::ChildPageIdZero))?;
-                        self.scratch.stack.push(StackEntry { page_id, child_slot: cell_count });
-                        page_id = right_most;
-                    }
+                    page_id = match child {
+                        Some(child) => child,
+                        None => page_id_from_u32(header.right_most_child.ok_or(
+                            table::Error::Corrupted(Corruption::MissingRightMostChildPointer),
+                        )?)?,
+                    };
                 }
                 BTreeKind::TableLeaf | BTreeKind::TableInterior => {
                     unreachable!("table btree header returned for index page")
@@ -211,46 +182,27 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
 
     /// Check whether the current key equals `target`.
     pub fn key_eq(&mut self, target: ValueRef<'_>) -> Result<bool> {
-        let Some(leaf) = self.leaf else {
+        let Some(eq) = self.with_current_leaf_cell_if_any(|cell, bytes, key_col| {
+            let key = decode_key_from_payload(key_col, cell.payload(), bytes)?;
+
+            if is_not_comparable(key) || is_not_comparable(target) {
+                return Ok(false);
+            }
+
+            Ok(compare_value_refs(target, key) == Ordering::Equal)
+        })?
+        else {
             return Ok(false);
         };
 
-        let page = self.pager.page(leaf.page_id)?;
-        let header = btree::parse_index_header(&page)?;
-        if leaf.cell_index >= header.cell_count as usize {
-            return Ok(false);
-        }
-        let cell_ptrs = btree::cell_ptrs(&page, &header)?;
-        let offset = btree::cell_ptr_at(cell_ptrs, leaf.cell_index)?;
-        let cell = read_index_leaf_cell(self.pager, &page, offset)?;
-        let key = decode_key_from_payload(self.key_col, cell.payload(), &mut self.scratch.bytes)?;
-        if matches!(key, ValueRef::Real(value) if value.is_nan())
-            || matches!(target, ValueRef::Real(value) if value.is_nan())
-        {
-            return Ok(false);
-        }
-        if matches!(key, ValueRef::Null) || matches!(target, ValueRef::Null) {
-            return Ok(false);
-        }
-
-        Ok(compare_value_refs(target, key) == Ordering::Equal)
+        Ok(eq)
     }
 
     /// Return the rowid at the current cursor position.
     pub fn current_rowid(&mut self) -> Result<i64> {
-        let Some(leaf) = self.leaf else {
-            return Err(table::Error::Corrupted(Corruption::IndexCursorNotPositioned));
-        };
-
-        let page = self.pager.page(leaf.page_id)?;
-        let header = btree::parse_index_header(&page)?;
-        if leaf.cell_index >= header.cell_count as usize {
-            return Err(table::Error::Corrupted(Corruption::IndexCursorPastEnd));
-        }
-        let cell_ptrs = btree::cell_ptrs(&page, &header)?;
-        let offset = btree::cell_ptr_at(cell_ptrs, leaf.cell_index)?;
-        let cell = read_index_leaf_cell(self.pager, &page, offset)?;
-        decode_index_rowid(cell.payload(), &mut self.scratch.bytes)
+        self.with_current_leaf_cell(|cell, bytes, _key_col| {
+            decode_index_rowid(cell.payload(), bytes)
+        })
     }
 
     /// Execute `f` with the payload and rowid at the current cursor position.
@@ -258,21 +210,11 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
     where
         F: for<'row> FnOnce(table::PayloadRef<'row>, i64) -> Result<T>,
     {
-        let Some(leaf) = self.leaf else {
-            return Err(table::Error::Corrupted(Corruption::IndexCursorNotPositioned));
-        };
-
-        let page = self.pager.page(leaf.page_id)?;
-        let header = btree::parse_index_header(&page)?;
-        if leaf.cell_index >= header.cell_count as usize {
-            return Err(table::Error::Corrupted(Corruption::IndexCursorPastEnd));
-        }
-        let cell_ptrs = btree::cell_ptrs(&page, &header)?;
-        let offset = btree::cell_ptr_at(cell_ptrs, leaf.cell_index)?;
-        let cell = read_index_leaf_cell(self.pager, &page, offset)?;
-        let payload = cell.payload();
-        let rowid = decode_index_rowid(payload, &mut self.scratch.bytes)?;
-        f(payload, rowid)
+        self.with_current_leaf_cell(|cell, bytes, _key_col| {
+            let payload = cell.payload();
+            let rowid = decode_index_rowid(payload, bytes)?;
+            f(payload, rowid)
+        })
     }
 
     fn lower_bound_leaf(
@@ -302,21 +244,107 @@ impl<'db, 'scratch> IndexCursor<'db, 'scratch> {
         Ok(lo)
     }
 
+    /// Like `lower_bound_leaf`, but for interior pages: returns
+    /// (slot, child_for_slot_or_none_if_right_most).
+    fn lower_bound_interior_child(
+        &mut self,
+        page: &PageRef<'_>,
+        cell_ptrs: &[u8],
+        cell_count: usize,
+        target: ValueRef<'_>,
+    ) -> Result<(usize, Option<PageId>)> {
+        let mut lo = 0usize;
+        let mut hi = cell_count;
+        let mut candidate_child: Option<PageId> = None;
+
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let offset = btree::cell_ptr_at(cell_ptrs, mid)?;
+            let cell = read_index_interior_cell(self.pager, page, offset)?;
+            let child =
+                cell.child().ok_or(table::Error::Corrupted(Corruption::MissingChildPointer))?;
+            let key =
+                decode_key_from_payload(self.key_col, cell.payload(), &mut self.scratch.bytes)?;
+            let cmp = compare_value_refs(target, key);
+
+            if cmp == Ordering::Greater {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+                candidate_child = Some(child);
+            }
+        }
+
+        if lo < cell_count {
+            Ok((
+                lo,
+                Some(
+                    candidate_child
+                        .ok_or(table::Error::Corrupted(Corruption::MissingChildPointer))?,
+                ),
+            ))
+        } else {
+            Ok((lo, None)) // right-most
+        }
+    }
+
     fn compare_current_key(&mut self, target: ValueRef<'_>) -> Result<Ordering> {
+        self.with_current_leaf_cell(|cell, bytes, key_col| {
+            let key = decode_key_from_payload(key_col, cell.payload(), bytes)?;
+            Ok(compare_value_refs(target, key))
+        })
+    }
+
+    /// Strict: must be positioned and not past end.
+    #[inline]
+    fn with_current_leaf_cell<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: for<'row> FnOnce(IndexCellRef<'row>, &mut Vec<u8>, u16) -> Result<T>,
+    {
         let Some(leaf) = self.leaf else {
             return Err(table::Error::Corrupted(Corruption::IndexCursorNotPositioned));
         };
 
         let page = self.pager.page(leaf.page_id)?;
         let header = btree::parse_index_header(&page)?;
+
         if leaf.cell_index >= header.cell_count as usize {
             return Err(table::Error::Corrupted(Corruption::IndexCursorPastEnd));
         }
+
         let cell_ptrs = btree::cell_ptrs(&page, &header)?;
         let offset = btree::cell_ptr_at(cell_ptrs, leaf.cell_index)?;
         let cell = read_index_leaf_cell(self.pager, &page, offset)?;
-        let key = decode_key_from_payload(self.key_col, cell.payload(), &mut self.scratch.bytes)?;
-        Ok(compare_value_refs(target, key))
+
+        let key_col = self.key_col;
+        let bytes = &mut self.scratch.bytes;
+        f(cell, bytes, key_col)
+    }
+
+    /// Lenient: returns `Ok(None)` if not positioned or past end.
+    #[inline]
+    fn with_current_leaf_cell_if_any<T, F>(&mut self, f: F) -> Result<Option<T>>
+    where
+        F: for<'row> FnOnce(IndexCellRef<'row>, &mut Vec<u8>, u16) -> Result<T>,
+    {
+        let Some(leaf) = self.leaf else {
+            return Ok(None);
+        };
+
+        let page = self.pager.page(leaf.page_id)?;
+        let header = btree::parse_index_header(&page)?;
+
+        if leaf.cell_index >= header.cell_count as usize {
+            return Ok(None);
+        }
+
+        let cell_ptrs = btree::cell_ptrs(&page, &header)?;
+        let offset = btree::cell_ptr_at(cell_ptrs, leaf.cell_index)?;
+        let cell = read_index_leaf_cell(self.pager, &page, offset)?;
+
+        let key_col = self.key_col;
+        let bytes = &mut self.scratch.bytes;
+        Ok(Some(f(cell, bytes, key_col)?))
     }
 
     fn advance_from_leaf_end(&mut self) -> Result<bool> {
@@ -431,6 +459,16 @@ pub(crate) fn index_key_len(
     }
 }
 
+#[inline]
+fn is_not_comparable(v: ValueRef<'_>) -> bool {
+    matches!(v, ValueRef::Null) || matches!(v, ValueRef::Real(x) if x.is_nan())
+}
+
+#[inline]
+fn page_id_from_u32(id: u32) -> Result<PageId> {
+    PageId::try_new(id).ok_or(table::Error::Corrupted(Corruption::ChildPageIdZero))
+}
+
 fn decode_key_from_payload<'row>(
     key_col: u16,
     payload: table::PayloadRef<'row>,
@@ -484,7 +522,7 @@ fn read_index_cell<'row>(
         let child =
             u32::from_be_bytes([usable[pos], usable[pos + 1], usable[pos + 2], usable[pos + 3]]);
         pos += 4;
-        Some(PageId::try_new(child).ok_or(table::Error::Corrupted(Corruption::ChildPageIdZero))?)
+        Some(page_id_from_u32(child)?)
     } else {
         None
     };
@@ -549,7 +587,7 @@ fn child_page_for_slot(
         let right_most = header
             .right_most_child
             .ok_or(table::Error::Corrupted(Corruption::MissingRightMostChildPointer))?;
-        PageId::try_new(right_most).ok_or(table::Error::Corrupted(Corruption::ChildPageIdZero))
+        page_id_from_u32(right_most)
     }
 }
 #[inline]

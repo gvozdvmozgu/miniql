@@ -29,17 +29,17 @@ struct SchemaCache {
 impl SchemaCache {
     fn load(pager: &Pager) -> table::Result<Self> {
         let mut tables = HashMap::new();
-        scan_sqlite_schema_until::<(), _>(pager, |row| {
+
+        scan_sqlite_schema(pager, |row| {
             if !row.kind.eq_ignore_ascii_case("table") {
-                return Ok(None::<()>);
+                return Ok(());
             }
-            let column_count = row.sql.as_str().and_then(|sql| {
-                let schema = parse_table_schema(sql);
-                if schema.columns.is_empty() { None } else { Some(schema.columns.len()) }
-            });
+
+            let column_count = column_count_from_schema_sql(row.sql.as_str());
             let info = TableInfo { name: row.name.to_owned(), root: row.root, column_count };
+
             tables.insert(row.name.to_ascii_lowercase(), info);
-            Ok(None::<()>)
+            Ok(())
         })?;
 
         Ok(Self { tables })
@@ -48,6 +48,13 @@ impl SchemaCache {
     fn table(&self, name: &str) -> Option<&TableInfo> {
         self.tables.get(&name.to_ascii_lowercase())
     }
+}
+
+#[inline]
+fn column_count_from_schema_sql(sql: Option<&str>) -> Option<usize> {
+    let sql = sql?;
+    let schema = parse_table_schema(sql);
+    (!schema.columns.is_empty()).then_some(schema.columns.len())
 }
 
 impl Db {
@@ -112,11 +119,12 @@ impl Db {
     }
 
     fn schema_cache(&self) -> table::Result<&SchemaCache> {
-        if let Some(cache) = self.schema.get() {
-            return Ok(cache);
+        if self.schema.get().is_none() {
+            let cache = SchemaCache::load(&self.pager)?;
+            // If set fails, someone else set it first (still fine).
+            let _ = self.schema.set(cache);
         }
-        let cache = SchemaCache::load(&self.pager)?;
-        let _ = self.schema.set(cache);
+
         Ok(self.schema.get().expect("schema cache initialized"))
     }
 }
@@ -147,7 +155,7 @@ impl<'db> Table<'db> {
 
     /// Return the table name if known.
     pub fn name(&self) -> Option<&str> {
-        if self.name.is_empty() { None } else { Some(self.name.as_str()) }
+        (!self.name.is_empty()).then_some(self.name.as_str())
     }
 }
 

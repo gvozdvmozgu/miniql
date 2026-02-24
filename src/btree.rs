@@ -56,6 +56,8 @@ pub(crate) fn cell_ptr_at(cell_ptrs: &[u8], idx: usize) -> table::Result<u16> {
     if offset + 1 >= cell_ptrs.len() {
         return Err(table::Error::Corrupted(Corruption::CellPointerArrayOutOfBounds));
     }
+
+    // Hot path: avoid bounds checks after the single range check above.
     let b0 = unsafe { *cell_ptrs.get_unchecked(offset) };
     let b1 = unsafe { *cell_ptrs.get_unchecked(offset + 1) };
     Ok(u16::from_be_bytes([b0, b1]))
