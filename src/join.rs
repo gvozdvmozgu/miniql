@@ -9,12 +9,11 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::compare::compare_value_refs;
 pub use crate::error::JoinError;
-use crate::ident::{is_ident_char, is_ident_start};
 use crate::index::{self, IndexCursor, IndexScratch};
 use crate::introspect::{SchemaSql, scan_sqlite_schema_until};
 use crate::pager::{PageId, Pager};
 use crate::query::{OrderDir, PreparedScan, Row, Scan, ScanScratch};
-use crate::schema::{TableSchema, parse_index_columns, parse_table_schema};
+use crate::schema::{TableSchema, parse_index_columns, parse_index_is_unique, parse_table_schema};
 use crate::table::{self, ValueRef, ValueSlot};
 
 /// Result type for join operations.
@@ -1758,26 +1757,6 @@ fn index_cols_to_indices(schema: &TableSchema, index_cols: &[String]) -> Option<
     Some(mapped)
 }
 
-fn index_sql_is_unique(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if is_ident_start(bytes[i]) {
-            let start = i;
-            i += 1;
-            while i < bytes.len() && is_ident_char(bytes[i]) {
-                i += 1;
-            }
-            if sql[start..i].eq_ignore_ascii_case("UNIQUE") {
-                return true;
-            }
-            continue;
-        }
-        i += 1;
-    }
-    false
-}
-
 fn find_table_info(pager: &Pager, table_root: PageId) -> Result<Option<(String, String)>> {
     scan_sqlite_schema_until(pager, |row| {
         if !row.kind.eq_ignore_ascii_case("table") {
@@ -1829,7 +1808,7 @@ fn discover_index_for_join(
                 let Some(index_cols) = parse_index_columns(sql) else {
                     return Ok(None);
                 };
-                let unique_by_key = index_sql_is_unique(sql)
+                let unique_by_key = parse_index_is_unique(sql)
                     && index_cols.len() == 1
                     && index_cols[0].eq_ignore_ascii_case(join_col_name);
                 let Some(index_cols) = index_cols_to_indices(&schema, &index_cols) else {

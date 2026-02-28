@@ -9,7 +9,6 @@ mod btree;
 mod compare;
 pub mod db;
 mod error;
-mod ident;
 pub mod introspect;
 mod schema;
 

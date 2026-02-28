@@ -51,6 +51,7 @@ hashbrown = "0.16"
 memmap2 = "0.9"
 rustc-hash = "2.1"
 smallvec = { version = "1", features = ["union"] }
+sqlparser = "0.61"
 
 [[bench]]
 name = "read_table"
