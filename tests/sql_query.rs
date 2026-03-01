@@ -531,6 +531,52 @@ fn executes_left_join_with_where_limit_offset() {
 }
 
 #[test]
+fn executes_left_join_distinct_projection_with_order_by_ordinal() {
+    let file = util::make_db(|conn| {
+        conn.execute_batch(
+            "CREATE TABLE users (id INTEGER, name TEXT);
+             CREATE TABLE orders (user_id INTEGER, amount INTEGER);",
+        )
+        .unwrap();
+        let users = [(1_i64, "alice"), (2, "bob"), (3, "cara"), (4, "dina")];
+        for (id, name) in users {
+            conn.execute("INSERT INTO users (id, name) VALUES (?1, ?2)", params![id, name])
+                .unwrap();
+        }
+        let orders = [(1_i64, 100_i64), (1, 40), (2, 75), (9, 10)];
+        for (user_id, amount) in orders {
+            conn.execute(
+                "INSERT INTO orders (user_id, amount) VALUES (?1, ?2)",
+                params![user_id, amount],
+            )
+            .unwrap();
+        }
+    });
+
+    let db = Db::open(file.path()).expect("open db");
+    let mut scratch = ScanScratch::with_capacity(4, 0);
+    let mut seen = Vec::new();
+
+    db.query(
+        "SELECT DISTINCT u.name
+         FROM users AS u
+         LEFT JOIN orders AS o ON u.id = o.user_id
+         ORDER BY 1 ASC",
+        &mut scratch,
+        |row| {
+            seen.push(text_col(&row, 0, "name"));
+            Ok(())
+        },
+    )
+    .expect("execute distinct left join");
+
+    assert_eq!(
+        seen,
+        vec!["alice".to_string(), "bob".to_string(), "cara".to_string(), "dina".to_string()]
+    );
+}
+
+#[test]
 fn limit_zero_short_circuits_scan_and_join_paths() {
     let file = util::make_db(|conn| {
         conn.execute_batch(

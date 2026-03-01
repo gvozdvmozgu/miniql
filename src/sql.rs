@@ -1389,16 +1389,12 @@ impl<'db> PreparedJoin<'db> {
 }
 
 fn owned_values_from_joined_row(joined: JoinedRow<'_>) -> Vec<OwnedSqlValue> {
-    let left_raw = joined.left.values_raw();
-    let right_raw = joined.right.values_raw();
-    let mut values = Vec::with_capacity(left_raw.len() + right_raw.len());
-    for slot in left_raw {
-        let value = unsafe { slot.as_value_ref() };
-        values.push(OwnedSqlValue::from_value_ref(value));
+    let mut values = Vec::with_capacity(joined.left.len() + joined.right.len());
+    for idx in 0..joined.left.len() {
+        values.push(OwnedSqlValue::from_row_value(joined.left.get(idx)));
     }
-    for slot in right_raw {
-        let value = unsafe { slot.as_value_ref() };
-        values.push(OwnedSqlValue::from_value_ref(value));
+    for idx in 0..joined.right.len() {
+        values.push(OwnedSqlValue::from_row_value(joined.right.get(idx)));
     }
     values
 }

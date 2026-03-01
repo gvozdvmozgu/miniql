@@ -39,6 +39,7 @@ use_self = "warn"
 name = "miniql"
 version.workspace = true
 edition.workspace = true
+autobenches = false
 
 [dev-dependencies]
 codspeed-criterion-compat = "4"
