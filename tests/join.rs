@@ -107,8 +107,8 @@ fn inner_join_users_orders_indexed() {
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();
 
-    let users = db.table_root(users_root);
-    let orders = db.table_root(orders_root);
+    let users = db.table_from_root(users_root);
+    let orders = db.table_from_root(orders_root);
     let mut join = Join::inner(users.scan(), orders.scan())
         .on(JoinKey::RowId, JoinKey::Col(0))
         .project_left([0])
@@ -144,8 +144,8 @@ fn auto_discovers_index_for_join() {
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();
 
-    let users = db.table_root(users_root);
-    let orders = db.table_root(orders_root);
+    let users = db.table_from_root(users_root);
+    let orders = db.table_from_root(orders_root);
     let mut join = Join::inner(users.scan(), orders.scan())
         .on(JoinKey::RowId, JoinKey::Col(0))
         .project_left([0])
@@ -182,8 +182,8 @@ fn null_join_keys_do_not_match() {
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut count = 0usize;
 
-    let orders = db.table_root(orders_root);
-    let users = db.table_root(users_root);
+    let orders = db.table_from_root(orders_root);
+    let users = db.table_from_root(users_root);
     let mut join = Join::inner(orders.scan(), users.scan())
         .on(JoinKey::Col(0), JoinKey::RowId)
         .project_left([0])
@@ -209,8 +209,8 @@ fn left_join_emits_null_right_rows() {
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();
 
-    let orders = db.table_root(orders_root);
-    let users = db.table_root(users_root);
+    let orders = db.table_from_root(orders_root);
+    let users = db.table_from_root(users_root);
     let mut join = Join::left(orders.scan(), users.scan())
         .on(JoinKey::Col(0), JoinKey::RowId)
         .project_left([0, 1])
@@ -244,8 +244,8 @@ fn auto_discovers_unique_autoindex() {
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();
 
-    let orders = db.table_root(PageId::new(orders_root));
-    let users = db.table_root(PageId::new(users_root));
+    let orders = db.table_from_root(PageId::new(orders_root));
+    let users = db.table_from_root(PageId::new(users_root));
     let mut join = Join::inner(orders.scan(), users.scan())
         .on(JoinKey::Col(1), JoinKey::Col(1))
         .project_left([1])
@@ -284,8 +284,8 @@ fn auto_discovers_composite_primary_key_autoindex() {
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut seen = Vec::new();
 
-    let orders = db.table_root(PageId::new(orders_root));
-    let pk = db.table_root(PageId::new(pk_root));
+    let orders = db.table_from_root(PageId::new(orders_root));
+    let pk = db.table_from_root(PageId::new(pk_root));
     let mut join = Join::inner(orders.scan(), pk.scan())
         .on(JoinKey::Col(1), JoinKey::Col(0))
         .project_left([1])

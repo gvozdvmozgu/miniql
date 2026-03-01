@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::introspect::{SchemaRow, scan_sqlite_schema, scan_sqlite_schema_until};
 use crate::pager::{PageId, Pager};
-use crate::query::{Scan, ScanScratch};
+use crate::query::{Row, Scan, ScanScratch};
 use crate::schema::parse_table_schema;
 use crate::table;
 
@@ -13,6 +13,21 @@ use crate::table;
 pub struct Db {
     pager: Pager,
     schema: OnceCell<SchemaCache>,
+}
+
+/// Prepared SQL `SELECT` query.
+pub struct PreparedQuery<'db> {
+    inner: crate::sql::PreparedSqlQuery<'db>,
+}
+
+impl<'db> PreparedQuery<'db> {
+    /// Execute the prepared SQL query and invoke `cb` for each output row.
+    pub fn for_each<F>(&mut self, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
+    where
+        F: for<'row> FnMut(Row<'row>) -> table::Result<()>,
+    {
+        self.inner.for_each(scratch, &mut cb)
+    }
 }
 
 #[derive(Clone)]
@@ -89,12 +104,12 @@ impl Db {
     }
 
     /// Create a table handle from a root page id.
-    pub fn table_root(&self, root: PageId) -> Table<'_> {
+    pub fn table_from_root(&self, root: PageId) -> Table<'_> {
         Table { db: self, root, name: String::new(), column_count: None }
     }
 
     /// Create an index handle from a root page id.
-    pub fn index_root(&self, root: PageId) -> Index<'_> {
+    pub fn index_from_root(&self, root: PageId) -> Index<'_> {
         Index { db: self, root }
     }
 
@@ -111,11 +126,31 @@ impl Db {
     }
 
     /// Visit rows in `sqlite_schema` until the callback returns `Some`.
-    pub fn scan_schema_until<T, F>(&self, f: F) -> table::Result<Option<T>>
+    pub fn find_schema<T, F>(&self, f: F) -> table::Result<Option<T>>
     where
         F: for<'row> FnMut(SchemaRow<'row>) -> table::Result<Option<T>>,
     {
         scan_sqlite_schema_until(self.pager(), f)
+    }
+
+    /// Execute a SQL `SELECT` query against this database.
+    ///
+    /// Supported SQL currently focuses on single-table `SELECT`:
+    /// projection, `WHERE`, `ORDER BY`, `LIMIT/OFFSET`, and basic aggregates
+    /// (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) with `GROUP BY`.
+    pub fn query<F>(&self, sql: &str, scratch: &mut ScanScratch, mut cb: F) -> table::Result<()>
+    where
+        F: for<'row> FnMut(Row<'row>) -> table::Result<()>,
+    {
+        crate::sql::execute_query_sql(self, sql, scratch, &mut cb)
+    }
+
+    /// Prepare a SQL `SELECT` query.
+    ///
+    /// This is the preferred API and mirrors SQLite's `prepare`.
+    pub fn prepare(&self, sql: &str) -> table::Result<PreparedQuery<'_>> {
+        let inner = crate::sql::prepare_sql_query(self, sql)?;
+        Ok(PreparedQuery { inner })
     }
 
     fn schema_cache(&self) -> table::Result<&SchemaCache> {
@@ -172,7 +207,7 @@ impl<'db> Index<'db> {
     }
 
     /// Return the parent database handle.
-    pub fn table(&self) -> &'db Db {
+    pub fn db(&self) -> &'db Db {
         self.db
     }
 }

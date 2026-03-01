@@ -50,19 +50,23 @@ fn join_count(
 ) -> usize {
     let mut scratch = JoinScratch::with_capacity(2, 2, 0);
     let mut rows = 0usize;
-    Join::new(JoinType::Inner, Scan::table(pager, left_root), Scan::table(pager, right_root))
-        .on(JoinKey::Col(0), JoinKey::Col(0))
-        .strategy(match strategy {
-            JoinStrategy::IndexNestedLoop { .. } => {
-                JoinStrategy::IndexNestedLoop { index_root, index_key_col: 0 }
-            }
-            other => other,
-        })
-        .for_each(&mut scratch, |_jr| {
-            rows += 1;
-            Ok(())
-        })
-        .expect("join");
+    Join::new(
+        JoinType::Inner,
+        Scan::from_root(pager, left_root),
+        Scan::from_root(pager, right_root),
+    )
+    .on(JoinKey::Col(0), JoinKey::Col(0))
+    .strategy(match strategy {
+        JoinStrategy::IndexNestedLoop { .. } => {
+            JoinStrategy::IndexNestedLoop { index_root, index_key_col: 0 }
+        }
+        other => other,
+    })
+    .for_each(&mut scratch, |_jr| {
+        rows += 1;
+        Ok(())
+    })
+    .expect("join");
     rows
 }
 
@@ -76,14 +80,18 @@ fn join_count_on_cols(
 ) -> usize {
     let mut scratch = JoinScratch::with_capacity(2, 2, 0);
     let mut rows = 0usize;
-    Join::new(JoinType::Inner, Scan::table(pager, left_root), Scan::table(pager, right_root))
-        .on(JoinKey::Col(left_col), JoinKey::Col(right_col))
-        .strategy(strategy)
-        .for_each(&mut scratch, |_jr| {
-            rows += 1;
-            Ok(())
-        })
-        .expect("join");
+    Join::new(
+        JoinType::Inner,
+        Scan::from_root(pager, left_root),
+        Scan::from_root(pager, right_root),
+    )
+    .on(JoinKey::Col(left_col), JoinKey::Col(right_col))
+    .strategy(strategy)
+    .for_each(&mut scratch, |_jr| {
+        rows += 1;
+        Ok(())
+    })
+    .expect("join");
     rows
 }
 

@@ -1069,14 +1069,8 @@ where
             }
         }
 
-        if !matched && let Some(len) = right_null_len {
-            let right_out = null_right_row(right_nulls, len);
-            cb(JoinedRow {
-                left_rowid,
-                right_rowid: NULL_ROWID,
-                left: left_out,
-                right: right_out,
-            })?;
+        if !matched {
+            emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb)?;
         }
 
         Ok(())
@@ -1187,14 +1181,8 @@ where
             }
         }
 
-        if !matched && let Some(len) = right_null_len {
-            let right_out = null_right_row(right_nulls, len);
-            cb(JoinedRow {
-                left_rowid,
-                right_rowid: NULL_ROWID,
-                left: left_out,
-                right: right_out,
-            })?;
+        if !matched {
+            emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb)?;
         }
 
         Ok(())
@@ -1618,23 +1606,11 @@ where
                     }
                 }
             }
-            if !matched && let Some(len) = right_null_len {
-                let right_out = null_right_row(right_nulls, len);
-                cb(JoinedRow {
-                    left_rowid,
-                    right_rowid: NULL_ROWID,
-                    left: left_out,
-                    right: right_out,
-                })?;
+            if !matched {
+                emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb)?;
             }
-        } else if let Some(len) = right_null_len {
-            let right_out = null_right_row(right_nulls, len);
-            cb(JoinedRow {
-                left_rowid,
-                right_rowid: NULL_ROWID,
-                left: left_out,
-                right: right_out,
-            })?;
+        } else {
+            emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb)?;
         }
 
         Ok(())
@@ -1677,14 +1653,8 @@ where
             Ok(())
         })?;
 
-        if !matched && let Some(len) = right_null_len {
-            let right_out = null_right_row(right_nulls, len);
-            cb(JoinedRow {
-                left_rowid,
-                right_rowid: NULL_ROWID,
-                left: left_out,
-                right: right_out,
-            })?;
+        if !matched {
+            emit_left_only(left_rowid, left_out, right_nulls, right_null_len, cb)?;
         }
 
         Ok(())

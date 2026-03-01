@@ -42,7 +42,7 @@ edition.workspace = true
 
 [dev-dependencies]
 codspeed-criterion-compat = "4"
-rusqlite = { version = "0.38", default-features = true }
+rusqlite = { version = "0.38", default-features = true, features = ["bundled"] }
 tempfile = "3"
 
 [dependencies]
@@ -68,4 +68,8 @@ harness = false
 
 [[bench]]
 name = "aggregate"
+harness = false
+
+[[bench]]
+name = "sql"
 harness = false

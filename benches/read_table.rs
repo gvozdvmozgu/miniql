@@ -252,7 +252,7 @@ fn bench_query_scan_full_projection_hot(c: &mut Criterion) {
     let pager = Pager::new(file).expect("create pager");
     let mut scratch = ScanScratch::with_capacity(8, 0);
     let mut scan =
-        Scan::table(&pager, PageId::new(2)).project([0, 1, 2]).compile().expect("compile scan");
+        Scan::from_root(&pager, PageId::new(2)).project([0, 1, 2]).compile().expect("compile scan");
     c.bench_function("query_scan_full_projection_hot", |b| {
         b.iter(|| {
             let mut rows = 0usize;
@@ -271,7 +271,7 @@ fn bench_query_scan_filter_int_hot(c: &mut Criterion) {
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
     let mut scratch = ScanScratch::with_capacity(8, 0);
-    let mut scan = Scan::table(&pager, PageId::new(2))
+    let mut scan = Scan::from_root(&pager, PageId::new(2))
         .project([1, 2])
         .filter(col(2).gt(lit_i64(25)))
         .compile()
@@ -294,7 +294,7 @@ fn bench_query_scan_filter_text_hot(c: &mut Criterion) {
     let file = File::open(&db_path).expect("open fixture");
     let pager = Pager::new(file).expect("create pager");
     let mut scratch = ScanScratch::with_capacity(8, 0);
-    let mut scan = Scan::table(&pager, PageId::new(2))
+    let mut scan = Scan::from_root(&pager, PageId::new(2))
         .project([1])
         .filter(col(1).eq(lit_bytes(b"alice")))
         .compile()

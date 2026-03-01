@@ -57,8 +57,8 @@ fn bench_join_sort_merge_hot(c: &mut Criterion) {
     // Force SortMergeJoin by not providing an index or choosing Hash
     let mut prepared = Join::new(
         JoinType::Inner,
-        Scan::table(&pager, users_root),
-        Scan::table(&pager, orders_root),
+        Scan::from_root(&pager, users_root),
+        Scan::from_root(&pager, orders_root),
     )
     .on(JoinKey::RowId, JoinKey::Col(0))
     .project_left([0])

@@ -108,6 +108,12 @@ pub enum QueryError {
     NonAggregateMustAppearInGroupBy,
     AggregateRequiresGroupByOrFunctions,
     AggregateExprOnlyColOrLit,
+    SqlParse,
+    SqlUnsupported,
+    SqlUnknownColumn,
+    SqlAmbiguousColumn,
+    SqlInvalidLimitOffset,
+    SqlDistinctMemoryLimitExceeded,
 }
 
 impl QueryError {
@@ -124,6 +130,12 @@ impl QueryError {
             Self::AggregateExprOnlyColOrLit => {
                 "aggregate expressions support only column and literal operands"
             }
+            Self::SqlParse => "failed to parse SQL query",
+            Self::SqlUnsupported => "unsupported SQL query",
+            Self::SqlUnknownColumn => "unknown SQL column",
+            Self::SqlAmbiguousColumn => "ambiguous SQL column",
+            Self::SqlInvalidLimitOffset => "invalid SQL LIMIT/OFFSET",
+            Self::SqlDistinctMemoryLimitExceeded => "SQL DISTINCT memory limit exceeded",
         }
     }
 }
@@ -591,6 +603,50 @@ pub struct RowView<'row> {
     serial_bytes: &'row [u8],
 }
 
+trait TypedRowAccess<'row> {
+    fn column_count(&self) -> usize;
+    fn get(&self, col_idx: usize) -> Result<Option<ValueRef<'row>>>;
+
+    #[inline]
+    fn get_i64(&self, col_idx: usize) -> Result<i64> {
+        expect_typed(
+            self.get(col_idx)?,
+            col_idx,
+            self.column_count(),
+            ValueKind::Integer,
+            |value| match value {
+                ValueRef::Integer(v) => Some(v),
+                _ => None,
+            },
+        )
+    }
+
+    #[inline]
+    fn get_text(&self, col_idx: usize) -> Result<&'row str> {
+        let bytes = expect_typed(
+            self.get(col_idx)?,
+            col_idx,
+            self.column_count(),
+            ValueKind::Text,
+            |value| match value {
+                ValueRef::Text(bytes) => Some(bytes),
+                _ => None,
+            },
+        )?;
+        Ok(str::from_utf8(bytes)?)
+    }
+
+    #[inline]
+    fn get_bytes(&self, col_idx: usize) -> Result<&'row [u8]> {
+        expect_typed(self.get(col_idx)?, col_idx, self.column_count(), ValueKind::Bytes, |value| {
+            match value {
+                ValueRef::Text(bytes) | ValueRef::Blob(bytes) => Some(bytes),
+                _ => None,
+            }
+        })
+    }
+}
+
 impl<'row> RowView<'row> {
     /// Create a row view from inline payload bytes.
     #[inline]
@@ -684,52 +740,31 @@ impl<'row> RowView<'row> {
     /// Get an i64 value or return a type mismatch error.
     #[inline]
     pub fn get_i64(&self, col_idx: usize) -> Result<i64> {
-        match self.get(col_idx)? {
-            Some(ValueRef::Integer(v)) => Ok(v),
-            Some(other) => Err(Error::TypeMismatch {
-                col: col_idx,
-                expected: ValueKind::Integer,
-                got: value_ref_kind(other),
-            }),
-            None => Err(Error::InvalidColumnIndex {
-                col: col_idx as u16,
-                column_count: self.column_count(),
-            }),
-        }
+        TypedRowAccess::get_i64(self, col_idx)
     }
 
     /// Get a text value or return a type mismatch error.
     #[inline]
     pub fn get_text(&self, col_idx: usize) -> Result<&'row str> {
-        match self.get(col_idx)? {
-            Some(ValueRef::Text(bytes)) => Ok(str::from_utf8(bytes)?),
-            Some(other) => Err(Error::TypeMismatch {
-                col: col_idx,
-                expected: ValueKind::Text,
-                got: value_ref_kind(other),
-            }),
-            None => Err(Error::InvalidColumnIndex {
-                col: col_idx as u16,
-                column_count: self.column_count(),
-            }),
-        }
+        TypedRowAccess::get_text(self, col_idx)
     }
 
     /// Get raw bytes (text or blob) or return a type mismatch error.
     #[inline]
     pub fn get_bytes(&self, col_idx: usize) -> Result<&'row [u8]> {
-        match self.get(col_idx)? {
-            Some(ValueRef::Text(bytes)) | Some(ValueRef::Blob(bytes)) => Ok(bytes),
-            Some(other) => Err(Error::TypeMismatch {
-                col: col_idx,
-                expected: ValueKind::Bytes,
-                got: value_ref_kind(other),
-            }),
-            None => Err(Error::InvalidColumnIndex {
-                col: col_idx as u16,
-                column_count: self.column_count(),
-            }),
-        }
+        TypedRowAccess::get_bytes(self, col_idx)
+    }
+}
+
+impl<'row> TypedRowAccess<'row> for RowView<'row> {
+    #[inline]
+    fn column_count(&self) -> usize {
+        RowView::column_count(self)
+    }
+
+    #[inline]
+    fn get(&self, col_idx: usize) -> Result<Option<ValueRef<'row>>> {
+        RowView::get(self, col_idx)
     }
 }
 
@@ -828,52 +863,58 @@ impl<'row, 'cache> CachedRowView<'row, 'cache> {
     /// Get an i64 value or return a type mismatch error.
     #[inline]
     pub fn get_i64(&self, col_idx: usize) -> Result<i64> {
-        match self.get(col_idx)? {
-            Some(ValueRef::Integer(v)) => Ok(v),
-            Some(other) => Err(Error::TypeMismatch {
-                col: col_idx,
-                expected: ValueKind::Integer,
-                got: value_ref_kind(other),
-            }),
-            None => Err(Error::InvalidColumnIndex {
-                col: col_idx as u16,
-                column_count: self.column_count(),
-            }),
-        }
+        TypedRowAccess::get_i64(self, col_idx)
     }
 
     /// Get a text value or return a type mismatch error.
     #[inline]
     pub fn get_text(&self, col_idx: usize) -> Result<&'row str> {
-        match self.get(col_idx)? {
-            Some(ValueRef::Text(bytes)) => Ok(str::from_utf8(bytes)?),
-            Some(other) => Err(Error::TypeMismatch {
-                col: col_idx,
-                expected: ValueKind::Text,
-                got: value_ref_kind(other),
-            }),
-            None => Err(Error::InvalidColumnIndex {
-                col: col_idx as u16,
-                column_count: self.column_count(),
-            }),
-        }
+        TypedRowAccess::get_text(self, col_idx)
     }
 
     /// Get raw bytes (text or blob) or return a type mismatch error.
     #[inline]
     pub fn get_bytes(&self, col_idx: usize) -> Result<&'row [u8]> {
-        match self.get(col_idx)? {
-            Some(ValueRef::Text(bytes)) | Some(ValueRef::Blob(bytes)) => Ok(bytes),
-            Some(other) => Err(Error::TypeMismatch {
-                col: col_idx,
-                expected: ValueKind::Bytes,
-                got: value_ref_kind(other),
-            }),
-            None => Err(Error::InvalidColumnIndex {
-                col: col_idx as u16,
-                column_count: self.column_count(),
-            }),
-        }
+        TypedRowAccess::get_bytes(self, col_idx)
+    }
+}
+
+impl<'row, 'cache> TypedRowAccess<'row> for CachedRowView<'row, 'cache> {
+    #[inline]
+    fn column_count(&self) -> usize {
+        CachedRowView::column_count(self)
+    }
+
+    #[inline]
+    fn get(&self, col_idx: usize) -> Result<Option<ValueRef<'row>>> {
+        CachedRowView::get(self, col_idx)
+    }
+}
+
+#[inline]
+fn invalid_column_index_error(col_idx: usize, column_count: usize) -> Error {
+    Error::InvalidColumnIndex { col: col_idx as u16, column_count }
+}
+
+#[inline]
+fn type_mismatch_error(col_idx: usize, expected: ValueKind, got: ValueRef<'_>) -> Error {
+    Error::TypeMismatch { col: col_idx, expected, got: value_ref_kind(got) }
+}
+
+#[inline]
+fn expect_typed<'row, T, F>(
+    value: Option<ValueRef<'row>>,
+    col_idx: usize,
+    column_count: usize,
+    expected: ValueKind,
+    extract: F,
+) -> Result<T>
+where
+    F: FnOnce(ValueRef<'row>) -> Option<T>,
+{
+    match value {
+        Some(value) => extract(value).ok_or_else(|| type_mismatch_error(col_idx, expected, value)),
+        None => Err(invalid_column_index_error(col_idx, column_count)),
     }
 }
 

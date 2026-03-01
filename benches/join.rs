@@ -56,8 +56,8 @@ fn bench_join_inlj_hot(c: &mut Criterion) {
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut prepared = Join::new(
         JoinType::Inner,
-        Scan::table(&pager, users_root),
-        Scan::table(&pager, orders_root),
+        Scan::from_root(&pager, users_root),
+        Scan::from_root(&pager, orders_root),
     )
     .on(JoinKey::RowId, JoinKey::Col(0))
     .project_left([0])
@@ -86,8 +86,8 @@ fn bench_join_hash_hot(c: &mut Criterion) {
     let mut scratch = JoinScratch::with_capacity(4, 4, 0);
     let mut prepared = Join::new(
         JoinType::Inner,
-        Scan::table(&pager, users_root),
-        Scan::table(&pager, orders_root),
+        Scan::from_root(&pager, users_root),
+        Scan::from_root(&pager, orders_root),
     )
     .on(JoinKey::RowId, JoinKey::Col(0))
     .project_left([0])

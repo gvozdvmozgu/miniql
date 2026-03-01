@@ -53,6 +53,22 @@ fn new_scratch() -> JoinScratch {
     JoinScratch::with_capacity(4, 4, 4096)
 }
 
+fn left_right_tables(db: &Db) -> (miniql::Table<'_>, miniql::Table<'_>) {
+    let left = db.table("left_t").expect("left table");
+    let right = db.table("right_t").expect("right table");
+    (left, right)
+}
+
+fn tables_from_roots(
+    db: &Db,
+    left_root: PageId,
+    right_root: PageId,
+) -> (miniql::Table<'_>, miniql::Table<'_>) {
+    let left = db.table_from_root(left_root);
+    let right = db.table_from_root(right_root);
+    (left, right)
+}
+
 fn make_int_join_db(
     left_keys: &[Option<i64>],
     right_keys: &[Option<i64>],
@@ -87,8 +103,7 @@ fn collect_pairs(
     let db = Db::open(db_path).expect("open db");
     let pager = Pager::new(std::fs::File::open(db_path).unwrap()).unwrap();
     let (left_root, right_root, _) = join_roots(&pager, "left_t", "right_t", None);
-    let left = db.table_root(left_root);
-    let right = db.table_root(right_root);
+    let (left, right) = tables_from_roots(&db, left_root, right_root);
 
     let strategy = match (strategy, index_root) {
         (JoinStrategy::IndexNestedLoop { .. }, Some(index_root)) => {
@@ -120,8 +135,7 @@ fn collect_left_rows(
     index_root: Option<PageId>,
 ) -> Vec<(i64, i64, bool)> {
     let db = Db::open(db_path).expect("open db");
-    let left = db.table("left_t").expect("left table");
-    let right = db.table("right_t").expect("right table");
+    let (left, right) = left_right_tables(&db);
 
     let strategy = match (strategy, index_root) {
         (JoinStrategy::IndexNestedLoop { .. }, Some(index_root)) => {
@@ -153,8 +167,7 @@ fn collect_left_rows(
 fn join_compile_missing_on_errors() {
     let file = make_int_join_db(&[Some(1)], &[Some(1)], false);
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let err = Join::new(JoinType::Inner, left.scan(), right.scan()).compile();
     assert!(matches!(err, Err(TableError::Join(JoinError::MissingJoinCondition))));
 }
@@ -167,8 +180,7 @@ fn join_compile_index_nested_loop_requires_right_col_key() {
         join_roots(&pager, "left_t", "right_t", Some("right_k_idx"));
     let index_root = index_root.expect("index root");
     let db = Db::open(file.path()).unwrap();
-    let left = db.table_root(left_root);
-    let right = db.table_root(right_root);
+    let (left, right) = tables_from_roots(&db, left_root, right_root);
     let err = Join::new(JoinType::Inner, left.scan(), right.scan())
         .on(JoinKey::Col(0), JoinKey::RowId)
         .strategy(JoinStrategy::IndexNestedLoop { index_root, index_key_col: 0 })
@@ -195,8 +207,7 @@ fn join_order_by_left_right_columns() {
     });
 
     let db = Db::open(file.path()).expect("open db");
-    let left = db.table("left_t").expect("left table");
-    let right = db.table("right_t").expect("right table");
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let mut seen = Vec::new();
 
@@ -342,8 +353,7 @@ fn null_join_keys_never_match() {
 fn left_join_emits_nulls_for_unmatched() {
     let file = make_int_join_db(&[Some(1), Some(2), Some(3)], &[Some(1)], true);
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let mut seen = Vec::new();
 
@@ -364,8 +374,7 @@ fn left_join_emits_nulls_for_unmatched() {
 fn left_join_null_left_key_emits_nulls() {
     let file = make_int_join_db(&[None, Some(1)], &[Some(1)], true);
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let mut seen = Vec::new();
 
@@ -417,8 +426,7 @@ fn join_key_not_in_projection_still_works() {
     });
 
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let mut seen = Vec::new();
 
@@ -449,8 +457,7 @@ fn projection_reorder_and_duplicates() {
     });
 
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
 
     Join::inner(left.scan().project([2, 0]), right.scan().project([1]))
@@ -492,8 +499,7 @@ fn filter_on_left_and_right() {
     });
 
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let mut seen = Vec::new();
 
@@ -527,8 +533,7 @@ fn filter_uses_non_projected_columns() {
     });
 
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let mut seen = Vec::new();
 
@@ -559,8 +564,7 @@ fn filter_on_right_uses_non_projected_columns() {
     });
 
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let mut seen = Vec::new();
 
@@ -580,8 +584,7 @@ fn filter_on_right_uses_non_projected_columns() {
 fn limit_interaction_left_and_right() {
     let file = make_int_join_db(&[Some(1), Some(2), Some(3)], &[Some(1), Some(2), Some(3)], true);
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let mut seen = Vec::new();
 
@@ -612,8 +615,7 @@ fn limit_interaction_left_and_right() {
 fn left_join_limit_respects_left_and_right() {
     let file = make_int_join_db(&[Some(1), Some(2), Some(3)], &[Some(1), Some(2), Some(3)], true);
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let mut seen = Vec::new();
 
@@ -659,8 +661,7 @@ fn auto_rowid_join_ignores_hash_mem_limit() {
     });
 
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let mut seen = Vec::new();
 
@@ -681,8 +682,7 @@ fn auto_rowid_join_ignores_hash_mem_limit() {
 fn auto_without_index_uses_hash() {
     let file = make_int_join_db(&[Some(1)], &[Some(1)], false);
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let err = Join::inner(left.scan(), right.scan())
         .on(JoinKey::Col(0), JoinKey::Col(0))
@@ -711,8 +711,7 @@ fn hash_mem_limit_enforced() {
     let pager = Pager::new(std::fs::File::open(file.path()).unwrap()).unwrap();
     let (left_root, right_root, _) = join_roots(&pager, "left_t", "right_t", None);
     let db = Db::open(file.path()).unwrap();
-    let left = db.table_root(left_root);
-    let right = db.table_root(right_root);
+    let (left, right) = tables_from_roots(&db, left_root, right_root);
 
     let mut payload_total = 0usize;
     table::scan_table_cells_with_scratch(&pager, right_root, |cell| {
@@ -754,8 +753,7 @@ fn filter_on_real_keys_and_zero_neg_zero() {
     });
 
     let db = Db::open(file.path()).unwrap();
-    let left = db.table("left_t").unwrap();
-    let right = db.table("right_t").unwrap();
+    let (left, right) = left_right_tables(&db);
     let mut scratch = new_scratch();
     let mut seen = Vec::new();
 

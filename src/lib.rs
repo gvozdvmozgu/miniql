@@ -11,8 +11,9 @@ pub mod db;
 mod error;
 pub mod introspect;
 mod schema;
+mod sql;
 
-pub use db::{CellScan, Db, Index, Table};
+pub use db::{CellScan, Db, Index, PreparedQuery, Table};
 pub use join::{
     Join, JoinKey, JoinOrderBy, JoinScratch, JoinSide, JoinStrategy, JoinType, JoinedRow,
     PreparedJoin, left_asc, left_desc, right_asc, right_desc,

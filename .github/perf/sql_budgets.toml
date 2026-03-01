@@ -1,0 +1,6 @@
+[groups]
+# miniql / rusqlite max ratio allowed per benchmark group.
+sql_scan = 1.50
+sql_join = 1.75
+sql_aggregate_order = 0.75
+sql_distinct = 3.00

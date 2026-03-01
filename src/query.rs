@@ -27,6 +27,7 @@ pub enum Expr {
     Le(Box<Expr>, Box<Expr>),
     Gt(Box<Expr>, Box<Expr>),
     Ge(Box<Expr>, Box<Expr>),
+    Like(Box<Expr>, Box<Expr>),
 
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
@@ -48,6 +49,7 @@ enum CompiledExpr {
     Le(Box<CompiledExpr>, Box<CompiledExpr>),
     Gt(Box<CompiledExpr>, Box<CompiledExpr>),
     Ge(Box<CompiledExpr>, Box<CompiledExpr>),
+    Like(Box<CompiledExpr>, Box<CompiledExpr>),
 
     And(Box<CompiledExpr>, Box<CompiledExpr>),
     Or(Box<CompiledExpr>, Box<CompiledExpr>),
@@ -274,6 +276,11 @@ impl Expr {
         Expr::Ge(Box::new(self), Box::new(rhs))
     }
 
+    /// Compare two expressions with `LIKE`.
+    pub fn like(self, rhs: Expr) -> Expr {
+        Expr::Like(Box::new(self), Box::new(rhs))
+    }
+
     /// Logical AND of two expressions.
     pub fn and(self, rhs: Expr) -> Expr {
         Expr::And(Box::new(self), Box::new(rhs))
@@ -310,6 +317,7 @@ impl Expr {
             | Expr::Le(lhs, rhs)
             | Expr::Gt(lhs, rhs)
             | Expr::Ge(lhs, rhs)
+            | Expr::Like(lhs, rhs)
             | Expr::And(lhs, rhs)
             | Expr::Or(lhs, rhs) => {
                 lhs.collect_cols(out);
@@ -410,71 +418,48 @@ impl<'row> Row<'row> {
 
     /// Return an `i64` value or a type mismatch error.
     pub fn get_i64(&self, i: usize) -> table::Result<i64> {
-        match self.get(i) {
-            Some(ValueRef::Integer(value)) => Ok(value),
-            Some(other) => Err(table::Error::TypeMismatch {
-                col: i,
-                expected: ValueKind::Integer,
-                got: value_kind(other),
-            }),
-            None => Err(table::Error::TypeMismatch {
-                col: i,
-                expected: ValueKind::Integer,
-                got: ValueKind::Missing,
-            }),
+        let value = self.require(i, ValueKind::Integer)?;
+        match value {
+            ValueRef::Integer(value) => Ok(value),
+            other => Err(Self::type_mismatch(i, ValueKind::Integer, other)),
         }
     }
 
     /// Return an `f64` value or a type mismatch error.
     pub fn get_f64(&self, i: usize) -> table::Result<f64> {
-        match self.get(i) {
-            Some(ValueRef::Real(value)) => Ok(value),
-            Some(other) => Err(table::Error::TypeMismatch {
-                col: i,
-                expected: ValueKind::Real,
-                got: value_kind(other),
-            }),
-            None => Err(table::Error::TypeMismatch {
-                col: i,
-                expected: ValueKind::Real,
-                got: ValueKind::Missing,
-            }),
+        let value = self.require(i, ValueKind::Real)?;
+        match value {
+            ValueRef::Real(value) => Ok(value),
+            other => Err(Self::type_mismatch(i, ValueKind::Real, other)),
         }
     }
 
     /// Return a UTF-8 string or a type mismatch error.
     pub fn get_text(&self, i: usize) -> table::Result<&'row str> {
-        match self.get(i) {
-            Some(ValueRef::Text(bytes)) => Ok(std::str::from_utf8(bytes)?),
-            Some(other) => Err(table::Error::TypeMismatch {
-                col: i,
-                expected: ValueKind::Text,
-                got: value_kind(other),
-            }),
-            None => Err(table::Error::TypeMismatch {
-                col: i,
-                expected: ValueKind::Text,
-                got: ValueKind::Missing,
-            }),
+        let value = self.require(i, ValueKind::Text)?;
+        match value {
+            ValueRef::Text(bytes) => Ok(std::str::from_utf8(bytes)?),
+            other => Err(Self::type_mismatch(i, ValueKind::Text, other)),
         }
     }
 
     /// Return text/blob bytes or a type mismatch error.
     pub fn get_bytes(&self, i: usize) -> table::Result<&'row [u8]> {
-        match self.get(i) {
-            Some(ValueRef::Text(bytes)) => Ok(bytes),
-            Some(ValueRef::Blob(bytes)) => Ok(bytes),
-            Some(other) => Err(table::Error::TypeMismatch {
-                col: i,
-                expected: ValueKind::Bytes,
-                got: value_kind(other),
-            }),
-            None => Err(table::Error::TypeMismatch {
-                col: i,
-                expected: ValueKind::Bytes,
-                got: ValueKind::Missing,
-            }),
+        let value = self.require(i, ValueKind::Bytes)?;
+        match value {
+            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => Ok(bytes),
+            other => Err(Self::type_mismatch(i, ValueKind::Bytes, other)),
         }
+    }
+
+    #[inline]
+    fn require(&self, i: usize, expected: ValueKind) -> table::Result<ValueRef<'row>> {
+        self.get(i).ok_or(table::Error::TypeMismatch { col: i, expected, got: ValueKind::Missing })
+    }
+
+    #[inline]
+    fn type_mismatch(i: usize, expected: ValueKind, got: ValueRef<'_>) -> table::Error {
+        table::Error::TypeMismatch { col: i, expected, got: value_kind(got) }
     }
 }
 
@@ -508,13 +493,9 @@ pub struct PreparedScan<'db> {
     column_count_hint: OnceCell<usize>,
 }
 
-/// Deprecated alias for `PreparedScan`.
-#[deprecated(note = "use PreparedScan")]
-pub type CompiledScan<'db> = PreparedScan<'db>;
-
 impl<'db> Scan<'db> {
     /// Create a scan over a table root.
-    pub fn table(pager: &'db Pager, root: PageId) -> Self {
+    pub fn from_root(pager: &'db Pager, root: PageId) -> Self {
         Self {
             pager,
             root,
@@ -558,21 +539,13 @@ impl<'db> Scan<'db> {
     }
 
     /// Apply a custom filter function (disables predicate compilation).
-    pub fn filter_fn_slow<F>(mut self, f: F) -> Self
+    pub fn filter_fn<F>(mut self, f: F) -> Self
     where
         F: for<'row> FnMut(&Row<'row>) -> table::Result<bool> + 'db,
     {
         self.filter_expr = None;
         self.filter_fn = Some(Box::new(f));
         self
-    }
-
-    /// Apply a custom filter function.
-    pub fn filter_fn<F>(self, f: F) -> Self
-    where
-        F: for<'row> FnMut(&Row<'row>) -> table::Result<bool> + 'db,
-    {
-        self.filter_fn_slow(f)
     }
 
     /// Apply `ORDER BY` to a scan.
@@ -627,6 +600,15 @@ impl<'db> Scan<'db> {
     pub(crate) fn with_projection_override(mut self, projection: Option<Vec<u16>>) -> Self {
         self.projection = projection;
         self
+    }
+
+    pub(crate) fn with_order_by_override(mut self, order_by: Option<Vec<OrderBy>>) -> Self {
+        self.order_by = order_by;
+        self
+    }
+
+    pub(crate) fn aggregate_dyn(self, exprs: Vec<AggExpr>) -> Aggregate<'db> {
+        Aggregate { scan: self, group_by: Vec::new(), select: exprs, having: None }
     }
 
     /// Compile the scan into an executable plan.
@@ -1257,6 +1239,11 @@ impl<'db> Aggregate<'db> {
     /// Apply a HAVING predicate evaluated against the aggregate output row.
     pub fn having(mut self, expr: Expr) -> Self {
         self.having = Some(expr);
+        self
+    }
+
+    pub(crate) fn with_group_by_override(mut self, exprs: Vec<Expr>) -> Self {
+        self.group_by = exprs;
         self
     }
 
@@ -2130,6 +2117,10 @@ fn compile_expr(expr: &Expr, needed_cols: Option<&[u16]>) -> table::Result<Compi
         Expr::Le(lhs, rhs) => compile_cmp(lhs, rhs, CmpOp::Le, CompiledExpr::Le)?,
         Expr::Gt(lhs, rhs) => compile_cmp(lhs, rhs, CmpOp::Gt, CompiledExpr::Gt)?,
         Expr::Ge(lhs, rhs) => compile_cmp(lhs, rhs, CmpOp::Ge, CompiledExpr::Ge)?,
+        Expr::Like(lhs, rhs) => CompiledExpr::Like(
+            Box::new(compile_expr(lhs, needed_cols)?),
+            Box::new(compile_expr(rhs, needed_cols)?),
+        ),
         Expr::And(lhs, rhs) => CompiledExpr::And(
             Box::new(compile_expr(lhs, needed_cols)?),
             Box::new(compile_expr(rhs, needed_cols)?),
@@ -2290,6 +2281,7 @@ fn eval_compiled_expr_inner(expr: &CompiledExpr, ctx: &EvalContext<'_>) -> table
         CompiledExpr::Le(lhs, rhs) => eval_cmp(CmpOp::Le, lhs, rhs, ctx),
         CompiledExpr::Gt(lhs, rhs) => eval_cmp(CmpOp::Gt, lhs, rhs, ctx),
         CompiledExpr::Ge(lhs, rhs) => eval_cmp(CmpOp::Ge, lhs, rhs, ctx),
+        CompiledExpr::Like(lhs, rhs) => eval_like(lhs, rhs, ctx),
         CompiledExpr::And(lhs, rhs) => {
             let left = eval_compiled_expr_inner(lhs, ctx)?;
             if left == Truth::False {
@@ -2345,16 +2337,37 @@ fn eval_cmp(
     rhs: &CompiledExpr,
     ctx: &EvalContext<'_>,
 ) -> table::Result<Truth> {
+    eval_binary_predicate(lhs, rhs, ctx, |left, right| compare(op, left, right))
+}
+
+#[inline]
+fn eval_like(
+    lhs: &CompiledExpr,
+    rhs: &CompiledExpr,
+    ctx: &EvalContext<'_>,
+) -> table::Result<Truth> {
+    eval_binary_predicate(lhs, rhs, ctx, like_compare)
+}
+
+#[inline]
+fn eval_binary_predicate<F>(
+    lhs: &CompiledExpr,
+    rhs: &CompiledExpr,
+    ctx: &EvalContext<'_>,
+    eval: F,
+) -> table::Result<Truth>
+where
+    F: for<'a, 'b> Fn(ValueRef<'a>, ValueRef<'b>) -> Truth,
+{
     let left = eval_operand(lhs, ctx)?;
     let right = eval_operand(rhs, ctx)?;
-
-    Ok(match (left, right) {
-        (Operand::Null, _) | (_, Operand::Null) => Truth::Null,
-        (Operand::Value(l), Operand::Value(r)) => compare(op, l, r),
-        (Operand::Value(l), Operand::Literal(r)) => compare(op, l, r),
-        (Operand::Literal(l), Operand::Value(r)) => compare(op, l, r),
-        (Operand::Literal(l), Operand::Literal(r)) => compare(op, l, r),
-    })
+    match (left, right) {
+        (Operand::Null, _) | (_, Operand::Null) => Ok(Truth::Null),
+        (Operand::Value(left), Operand::Value(right))
+        | (Operand::Value(left), Operand::Literal(right))
+        | (Operand::Literal(left), Operand::Value(right))
+        | (Operand::Literal(left), Operand::Literal(right)) => Ok(eval(left, right)),
+    }
 }
 
 #[inline]
@@ -2392,6 +2405,62 @@ fn compare<'a, 'b>(op: CmpOp, left: ValueRef<'a>, right: ValueRef<'b>) -> Truth 
         (ValueRef::Blob(l), ValueRef::Blob(r)) => cmp_order(op, l.cmp(r)),
         _ => Truth::False,
     }
+}
+
+#[inline(always)]
+fn like_compare<'a, 'b>(value: ValueRef<'a>, pattern: ValueRef<'b>) -> Truth {
+    match (value, pattern) {
+        (ValueRef::Null, _) | (_, ValueRef::Null) => Truth::Null,
+        (ValueRef::Text(value), ValueRef::Text(pattern)) => {
+            if like_match(value, pattern) {
+                Truth::True
+            } else {
+                Truth::False
+            }
+        }
+        _ => Truth::False,
+    }
+}
+
+fn like_match(value: &[u8], pattern: &[u8]) -> bool {
+    let mut value_pos = 0usize;
+    let mut pattern_pos = 0usize;
+    let mut star_pattern_pos: Option<usize> = None;
+    let mut star_value_pos = 0usize;
+
+    while value_pos < value.len() {
+        if pattern_pos < pattern.len() {
+            let token = pattern[pattern_pos];
+            if token == b'%' {
+                star_pattern_pos = Some(pattern_pos);
+                pattern_pos += 1;
+                star_value_pos = value_pos;
+                continue;
+            }
+            if token == b'_' || ascii_like_eq(token, value[value_pos]) {
+                pattern_pos += 1;
+                value_pos += 1;
+                continue;
+            }
+        }
+
+        let Some(star_pos) = star_pattern_pos else {
+            return false;
+        };
+        pattern_pos = star_pos + 1;
+        star_value_pos += 1;
+        value_pos = star_value_pos;
+    }
+
+    while pattern_pos < pattern.len() && pattern[pattern_pos] == b'%' {
+        pattern_pos += 1;
+    }
+    pattern_pos == pattern.len()
+}
+
+#[inline(always)]
+fn ascii_like_eq(left: u8, right: u8) -> bool {
+    left.eq_ignore_ascii_case(&right)
 }
 
 #[inline(always)]
