@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 use bumpalo::Bump;
 use hashbrown::HashMap as HbHashMap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
+use smallvec::SmallVec;
 
 use crate::compare::compare_value_refs;
 pub use crate::error::JoinError;
@@ -237,9 +238,21 @@ impl<'db> Join<'db> {
         self
     }
 
+    /// Project columns from the left side (dynamic list).
+    pub fn project_left_dyn(mut self, cols: Vec<u16>) -> Self {
+        self.project_left = Some(cols);
+        self
+    }
+
     /// Project columns from the right side.
     pub fn project_right<const N: usize>(mut self, cols: [u16; N]) -> Self {
         self.project_right = Some(cols.to_vec());
+        self
+    }
+
+    /// Project columns from the right side (dynamic list).
+    pub fn project_right_dyn(mut self, cols: Vec<u16>) -> Self {
+        self.project_right = Some(cols);
         self
     }
 
@@ -470,10 +483,12 @@ impl<'db> PreparedJoin<'db> {
             index_scratch,
             hash_state,
             rowid_cache,
+            decoded_right_cache,
             right_nulls,
         ) = scratch.split_mut();
         let right_null_len = self.right_null_len;
         rowid_cache.clear();
+        decoded_right_cache.clear();
 
         match &self.plan {
             JoinPlan::IndexNestedLoop { index_root, index_key_col, index_cols } => {
@@ -492,6 +507,7 @@ impl<'db> PreparedJoin<'db> {
                     right_offsets,
                     index_scratch,
                     rowid_cache,
+                    decoded_right_cache,
                     right_nulls,
                     right_null_len,
                     cb,
@@ -512,6 +528,7 @@ impl<'db> PreparedJoin<'db> {
                 right_offsets,
                 index_scratch,
                 rowid_cache,
+                decoded_right_cache,
                 right_nulls,
                 right_null_len,
                 cb,
@@ -529,6 +546,7 @@ impl<'db> PreparedJoin<'db> {
                 right_serials,
                 right_offsets,
                 hash_state,
+                decoded_right_cache,
                 right_nulls,
                 right_null_len,
                 cb,
@@ -666,6 +684,103 @@ impl RowLocationCache {
     }
 }
 
+#[derive(Debug)]
+struct CachedDecodedRow {
+    values: Vec<ValueSlot>,
+    _owned_bytes: Vec<Vec<u8>>,
+}
+
+impl CachedDecodedRow {
+    fn from_row(row: Row<'_>) -> Self {
+        let mut values = Vec::with_capacity(row.values_raw().len());
+        let mut owned_bytes = Vec::new();
+        for slot in row.values_raw() {
+            // SAFETY: slots come from a just-decoded row and remain valid for
+            // the duration of this copy operation.
+            let value = unsafe { slot.as_value_ref() };
+            let cached = match value {
+                ValueRef::Null => ValueSlot::Null,
+                ValueRef::Integer(v) => ValueSlot::Integer(v),
+                ValueRef::Real(v) => ValueSlot::Real(v),
+                ValueRef::Text(bytes) => {
+                    owned_bytes.push(bytes.to_vec());
+                    let stored = owned_bytes
+                        .last()
+                        .expect("owned bytes contains the row value we just pushed");
+                    ValueSlot::Text(table::BytesSpan::Mmap(table::RawBytes::from_slice(
+                        stored.as_slice(),
+                    )))
+                }
+                ValueRef::Blob(bytes) => {
+                    owned_bytes.push(bytes.to_vec());
+                    let stored = owned_bytes
+                        .last()
+                        .expect("owned bytes contains the row value we just pushed");
+                    ValueSlot::Blob(table::BytesSpan::Mmap(table::RawBytes::from_slice(
+                        stored.as_slice(),
+                    )))
+                }
+            };
+            values.push(cached);
+        }
+        Self { values, _owned_bytes: owned_bytes }
+    }
+}
+
+#[derive(Debug)]
+enum DecodedRightState {
+    Present(CachedDecodedRow),
+    FilteredOut,
+}
+
+#[inline(always)]
+fn decoded_state_values(state: &DecodedRightState) -> Option<&[ValueSlot]> {
+    match state {
+        DecodedRightState::Present(row) => Some(row.values.as_slice()),
+        DecodedRightState::FilteredOut => None,
+    }
+}
+
+#[derive(Debug)]
+struct DecodedRightCache {
+    entries: Vec<(i64, DecodedRightState)>,
+    next: usize,
+    capacity: usize,
+}
+
+impl DecodedRightCache {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self { entries: Vec::with_capacity(capacity), next: 0, capacity }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.next = 0;
+    }
+
+    fn get(&self, rowid: i64) -> Option<&DecodedRightState> {
+        self.entries.iter().find(|(id, _)| *id == rowid).map(|(_, state)| state)
+    }
+
+    fn contains(&self, rowid: i64) -> bool {
+        self.entries.iter().any(|(id, _)| *id == rowid)
+    }
+
+    fn insert(&mut self, rowid: i64, state: DecodedRightState) {
+        if let Some(entry) = self.entries.iter_mut().find(|(id, _)| *id == rowid) {
+            entry.1 = state;
+            return;
+        }
+        if self.entries.len() < self.capacity {
+            self.entries.push((rowid, state));
+        } else {
+            self.entries[self.next] = (rowid, state);
+            self.next = (self.next + 1) % self.capacity;
+        }
+    }
+}
+
 /// Scratch buffers for join execution.
 #[derive(Debug)]
 pub struct JoinScratch {
@@ -678,6 +793,7 @@ pub struct JoinScratch {
     index: IndexScratch,
     hash: HashState,
     rowid_cache: RowLocationCache,
+    decoded_right_cache: DecodedRightCache,
     right_nulls: Vec<ValueSlot>,
 }
 
@@ -691,6 +807,7 @@ type JoinScratchParts<'a> = (
     &'a mut IndexScratch,
     &'a mut HashState,
     &'a mut RowLocationCache,
+    &'a mut DecodedRightCache,
     &'a mut Vec<ValueSlot>,
 );
 
@@ -707,6 +824,7 @@ impl JoinScratch {
             index: IndexScratch::new(),
             hash: HashState::new(),
             rowid_cache: RowLocationCache::new(64),
+            decoded_right_cache: DecodedRightCache::new(256),
             right_nulls: Vec::new(),
         }
     }
@@ -723,6 +841,7 @@ impl JoinScratch {
             index: IndexScratch::with_capacity(right_values, overflow),
             hash: HashState::with_capacity(right_values, overflow),
             rowid_cache: RowLocationCache::new(64),
+            decoded_right_cache: DecodedRightCache::new(256),
             right_nulls: Vec::with_capacity(right_values),
         }
     }
@@ -738,6 +857,7 @@ impl JoinScratch {
             &mut self.index,
             &mut self.hash,
             &mut self.rowid_cache,
+            &mut self.decoded_right_cache,
             &mut self.right_nulls,
         )
     }
@@ -765,6 +885,78 @@ fn lookup_rowid_cell_cached<'row>(
     }
 
     Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn get_or_decode_table_row_cached<'a>(
+    rowid: i64,
+    payload: table::PayloadRef<'_>,
+    right_scan: &mut PreparedScan<'_>,
+    right_values: &mut Vec<ValueSlot>,
+    right_bytes: &mut Vec<u8>,
+    right_serials: &mut Vec<u64>,
+    right_offsets: &mut Vec<u32>,
+    apply_filters: bool,
+    decoded_cache: &'a mut DecodedRightCache,
+) -> Result<Option<&'a [ValueSlot]>> {
+    if decoded_cache.contains(rowid) {
+        return Ok(decoded_cache.get(rowid).and_then(decoded_state_values));
+    }
+
+    let decoded = right_scan.eval_payload_with_filters(
+        payload,
+        right_values,
+        right_bytes,
+        right_serials,
+        right_offsets,
+        apply_filters,
+    )?;
+    match decoded {
+        Some(row) => {
+            let cached = CachedDecodedRow::from_row(row);
+            decoded_cache.insert(rowid, DecodedRightState::Present(cached));
+        }
+        None => decoded_cache.insert(rowid, DecodedRightState::FilteredOut),
+    }
+
+    Ok(decoded_cache.get(rowid).and_then(decoded_state_values))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn get_or_decode_index_row_cached<'a>(
+    rowid: i64,
+    payload: table::PayloadRef<'_>,
+    map: &[(u16, usize)],
+    right_scan: &mut PreparedScan<'_>,
+    right_values: &mut Vec<ValueSlot>,
+    right_bytes: &mut Vec<u8>,
+    right_serials: &mut Vec<u64>,
+    right_offsets: &mut Vec<u32>,
+    apply_filters: bool,
+    decoded_cache: &'a mut DecodedRightCache,
+) -> Result<Option<&'a [ValueSlot]>> {
+    if decoded_cache.contains(rowid) {
+        return Ok(decoded_cache.get(rowid).and_then(decoded_state_values));
+    }
+
+    let decoded = right_scan.eval_index_payload_with_map(
+        payload,
+        map,
+        right_values,
+        right_bytes,
+        right_serials,
+        right_offsets,
+        apply_filters,
+    )?;
+    match decoded {
+        Some(row) => {
+            let cached = CachedDecodedRow::from_row(row);
+            decoded_cache.insert(rowid, DecodedRightState::Present(cached));
+        }
+        None => decoded_cache.insert(rowid, DecodedRightState::FilteredOut),
+    }
+
+    Ok(decoded_cache.get(rowid).and_then(decoded_state_values))
 }
 
 impl Default for JoinScratch {
@@ -988,6 +1180,7 @@ fn index_nested_loop<F>(
     right_offsets: &mut Vec<u32>,
     index_scratch: &mut IndexScratch,
     rowid_cache: &mut RowLocationCache,
+    decoded_right_cache: &mut DecodedRightCache,
     right_nulls: &mut Vec<ValueSlot>,
     right_null_len: Option<usize>,
     cb: &mut F,
@@ -1023,16 +1216,19 @@ where
         while cursor.key_eq(left_key_value)? {
             if let Some(map) = covering_map.as_ref() {
                 let emitted = cursor.with_current_payload_and_rowid(|payload, right_rowid| {
-                    if let Some(right_row) = right_scan.eval_index_payload_with_map(
+                    if let Some(right_values_cached) = get_or_decode_index_row_cached(
+                        right_rowid,
                         payload,
                         map,
+                        right_scan,
                         right_values,
                         right_bytes,
                         right_serials,
                         right_offsets,
                         true,
+                        decoded_right_cache,
                     )? {
-                        let right_out = right_meta.output_row(right_row.values_raw());
+                        let right_out = right_meta.output_row(right_values_cached);
                         cb(JoinedRow {
                             left_rowid,
                             right_rowid,
@@ -1050,15 +1246,19 @@ where
                 let right_rowid = cursor.current_rowid()?;
                 if let Some(cell) =
                     lookup_rowid_cell_cached(pager, right_root, right_rowid, rowid_cache)?
-                    && let Some(right_row) = right_scan.eval_payload(
+                    && let Some(right_values_cached) = get_or_decode_table_row_cached(
+                        right_rowid,
                         cell.payload(),
+                        right_scan,
                         right_values,
                         right_bytes,
                         right_serials,
                         right_offsets,
+                        true,
+                        decoded_right_cache,
                     )?
                 {
-                    let right_out = right_meta.output_row(right_row.values_raw());
+                    let right_out = right_meta.output_row(right_values_cached);
                     cb(JoinedRow { left_rowid, right_rowid, left: left_out, right: right_out })?;
                     matched = true;
                 }
@@ -1095,6 +1295,7 @@ fn index_merge_join<F>(
     right_offsets: &mut Vec<u32>,
     index_scratch: &mut IndexScratch,
     rowid_cache: &mut RowLocationCache,
+    decoded_right_cache: &mut DecodedRightCache,
     right_nulls: &mut Vec<ValueSlot>,
     right_null_len: Option<usize>,
     cb: &mut F,
@@ -1131,16 +1332,19 @@ where
         loop {
             if let Some(map) = covering_map.as_ref() {
                 let emitted = cursor.with_current_payload_and_rowid(|payload, right_rowid| {
-                    if let Some(right_row) = right_scan.eval_index_payload_with_map(
+                    if let Some(right_values_cached) = get_or_decode_index_row_cached(
+                        right_rowid,
                         payload,
                         map,
+                        right_scan,
                         right_values,
                         right_bytes,
                         right_serials,
                         right_offsets,
                         true,
+                        decoded_right_cache,
                     )? {
-                        let right_out = right_meta.output_row(right_row.values_raw());
+                        let right_out = right_meta.output_row(right_values_cached);
                         cb(JoinedRow {
                             left_rowid,
                             right_rowid,
@@ -1158,15 +1362,19 @@ where
                 let right_rowid = cursor.current_rowid()?;
                 if let Some(cell) =
                     lookup_rowid_cell_cached(pager, right_root, right_rowid, rowid_cache)?
-                    && let Some(right_row) = right_scan.eval_payload(
+                    && let Some(right_values_cached) = get_or_decode_table_row_cached(
+                        right_rowid,
                         cell.payload(),
+                        right_scan,
                         right_values,
                         right_bytes,
                         right_serials,
                         right_offsets,
+                        true,
+                        decoded_right_cache,
                     )?
                 {
-                    let right_out = right_meta.output_row(right_row.values_raw());
+                    let right_out = right_meta.output_row(right_values_cached);
                     cb(JoinedRow { left_rowid, right_rowid, left: left_out, right: right_out })?;
                     matched = true;
                 }
@@ -1271,28 +1479,40 @@ struct RightRow {
 
 #[derive(Debug, Clone)]
 enum RightRowList {
-    One(RightRow),
+    Few(SmallVec<[RightRow; 4]>),
     Many(Vec<RightRow>),
 }
 
 impl RightRowList {
     #[inline(always)]
     fn new(row: RightRow) -> Self {
-        RightRowList::One(row)
+        let mut rows = SmallVec::new();
+        rows.push(row);
+        RightRowList::Few(rows)
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[RightRow] {
+        match self {
+            RightRowList::Few(rows) => rows.as_slice(),
+            RightRowList::Many(rows) => rows.as_slice(),
+        }
     }
 
     #[inline(always)]
     fn push(&mut self, row: RightRow) -> (usize, usize) {
         match self {
-            RightRowList::One(_) => {
-                let first = match std::mem::replace(self, RightRowList::Many(Vec::new())) {
-                    RightRowList::One(first) => first,
-                    _ => unreachable!("RightRowList variant swap failed"),
-                };
-                let vec = vec![first, row];
-                let new = vec.capacity();
+            RightRowList::Few(rows) => {
+                if rows.len() < rows.inline_size() {
+                    rows.push(row);
+                    return (0, 0);
+                }
+                let mut vec = Vec::with_capacity(rows.inline_size().saturating_mul(2));
+                vec.extend(rows.drain(..));
+                vec.push(row);
+                let cap = vec.capacity();
                 *self = RightRowList::Many(vec);
-                (0, new)
+                (0, cap)
             }
             RightRowList::Many(vec) => {
                 let old = vec.capacity();
@@ -1412,6 +1632,7 @@ fn hash_join<F>(
     right_serials: &mut Vec<u64>,
     right_offsets: &mut Vec<u32>,
     hash_state: &mut HashState,
+    decoded_right_cache: &mut DecodedRightCache,
     right_nulls: &mut Vec<ValueSlot>,
     right_null_len: Option<usize>,
     cb: &mut F,
@@ -1541,69 +1762,34 @@ where
 
         if let Some(rows) = rows {
             let mut matched = false;
-            match rows {
-                RightRowList::One(row) => {
-                    if let Some(numeric_key) = row.numeric_key
-                        && !numeric_key_equals(left_key_value, numeric_key)
-                    {
-                        // Hash collision on numeric key: ignore.
-                    } else {
-                        let cell = table::read_table_cell_ref_from_bytes(
-                            pager,
-                            row.page_id,
-                            row.cell_offset,
-                        )?;
-                        let payload = cell.payload();
-                        if let Some(right_row) = right_scan.eval_payload_with_filters(
-                            payload,
-                            right_values,
-                            right_bytes,
-                            right_serials,
-                            right_offsets,
-                            false,
-                        )? {
-                            let right_out = right_meta.output_row(right_row.values_raw());
-                            cb(JoinedRow {
-                                left_rowid,
-                                right_rowid: row.rowid,
-                                left: left_out,
-                                right: right_out,
-                            })?;
-                            matched = true;
-                        }
-                    }
+            for row in rows.as_slice().iter() {
+                if let Some(numeric_key) = row.numeric_key
+                    && !numeric_key_equals(left_key_value, numeric_key)
+                {
+                    // Hash collision on numeric key: ignore.
+                    continue;
                 }
-                RightRowList::Many(rows) => {
-                    for row in rows.iter() {
-                        if let Some(numeric_key) = row.numeric_key
-                            && !numeric_key_equals(left_key_value, numeric_key)
-                        {
-                            continue;
-                        }
-                        let cell = table::read_table_cell_ref_from_bytes(
-                            pager,
-                            row.page_id,
-                            row.cell_offset,
-                        )?;
-                        let payload = cell.payload();
-                        if let Some(right_row) = right_scan.eval_payload_with_filters(
-                            payload,
-                            right_values,
-                            right_bytes,
-                            right_serials,
-                            right_offsets,
-                            false,
-                        )? {
-                            let right_out = right_meta.output_row(right_row.values_raw());
-                            cb(JoinedRow {
-                                left_rowid,
-                                right_rowid: row.rowid,
-                                left: left_out,
-                                right: right_out,
-                            })?;
-                            matched = true;
-                        }
-                    }
+                let cell =
+                    table::read_table_cell_ref_from_bytes(pager, row.page_id, row.cell_offset)?;
+                if let Some(right_values_cached) = get_or_decode_table_row_cached(
+                    row.rowid,
+                    cell.payload(),
+                    right_scan,
+                    right_values,
+                    right_bytes,
+                    right_serials,
+                    right_offsets,
+                    false,
+                    decoded_right_cache,
+                )? {
+                    let right_out = right_meta.output_row(right_values_cached);
+                    cb(JoinedRow {
+                        left_rowid,
+                        right_rowid: row.rowid,
+                        left: left_out,
+                        right: right_out,
+                    })?;
+                    matched = true;
                 }
             }
             if !matched {

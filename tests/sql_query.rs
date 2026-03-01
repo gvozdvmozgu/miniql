@@ -531,6 +531,46 @@ fn executes_left_join_with_where_limit_offset() {
 }
 
 #[test]
+fn limit_zero_short_circuits_scan_and_join_paths() {
+    let file = util::make_db(|conn| {
+        conn.execute_batch(
+            "CREATE TABLE users (id INTEGER, name TEXT);
+             CREATE TABLE orders (user_id INTEGER, amount INTEGER);
+             INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob');
+             INSERT INTO orders (user_id, amount) VALUES (1, 100), (1, 40), (2, 75);",
+        )
+        .unwrap();
+    });
+
+    let db = Db::open(file.path()).expect("open db");
+    let mut scratch = ScanScratch::with_capacity(4, 0);
+
+    let mut scan_rows = 0usize;
+    db.query("SELECT name FROM users ORDER BY name ASC LIMIT 0 OFFSET 1000", &mut scratch, |_| {
+        scan_rows += 1;
+        Ok(())
+    })
+    .expect("execute limit 0 scan");
+    assert_eq!(scan_rows, 0);
+
+    let mut join_rows = 0usize;
+    db.query(
+        "SELECT u.name, o.amount
+         FROM users AS u
+         LEFT JOIN orders AS o ON u.id = o.user_id
+         ORDER BY u.name ASC, o.amount DESC
+         LIMIT 0 OFFSET 1000",
+        &mut scratch,
+        |_| {
+            join_rows += 1;
+            Ok(())
+        },
+    )
+    .expect("execute limit 0 join");
+    assert_eq!(join_rows, 0);
+}
+
+#[test]
 fn executes_join_where_with_in_between_and_like() {
     let file = util::make_db(|conn| {
         conn.execute_batch(

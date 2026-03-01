@@ -6,6 +6,8 @@ use rusqlite::types::ValueRef as SqliteValueRef;
 use rusqlite::{Connection, Row as SqliteRow, params};
 use tempfile::NamedTempFile;
 
+mod alloc_profiler;
+
 const ROW_COUNTS: &[usize] = &[2_000, 20_000];
 
 const SCAN_SQL: &str = "SELECT id, score FROM users WHERE score >= 100 ORDER BY score DESC, id \
@@ -152,16 +154,19 @@ fn bench_sql_scan(c: &mut Criterion) {
         bench_group.bench_with_input(BenchmarkId::new("miniql", row_count), &row_count, |b, _| {
             let db = Db::open(&db_path).expect("open db");
             let mut scratch = ScanScratch::with_capacity(8, 0);
-            b.iter(|| {
-                let mut rows = 0usize;
-                let mut checksum = 0i64;
-                db.query(SCAN_SQL, &mut scratch, |row| {
-                    checksum = checksum.wrapping_add(fold_miniql_row(row));
-                    rows += 1;
-                    Ok(())
-                })
-                .expect("run miniql scan sql");
-                black_box((rows, checksum))
+            let bench_id = format!("sql_scan/miniql/{row_count}");
+            alloc_profiler::with_alloc_log(bench_id.as_str(), || {
+                b.iter(|| {
+                    let mut rows = 0usize;
+                    let mut checksum = 0i64;
+                    db.query(SCAN_SQL, &mut scratch, |row| {
+                        checksum = checksum.wrapping_add(fold_miniql_row(row));
+                        rows += 1;
+                        Ok(())
+                    })
+                    .expect("run miniql scan sql");
+                    black_box((rows, checksum))
+                });
             });
         });
 
@@ -172,15 +177,18 @@ fn bench_sql_scan(c: &mut Criterion) {
                 let conn = Connection::open(&db_path).expect("open db");
                 let mut stmt = conn.prepare(SCAN_SQL).expect("prepare query");
                 let col_count = stmt.column_count();
-                b.iter(|| {
-                    let mut rows_iter = stmt.query([]).expect("run query");
-                    let mut rows = 0usize;
-                    let mut checksum = 0i64;
-                    while let Some(row) = rows_iter.next().expect("next row") {
-                        checksum = checksum.wrapping_add(fold_sqlite_row(row, col_count));
-                        rows += 1;
-                    }
-                    black_box((rows, checksum))
+                let bench_id = format!("sql_scan/rusqlite/{row_count}");
+                alloc_profiler::with_alloc_log(bench_id.as_str(), || {
+                    b.iter(|| {
+                        let mut rows_iter = stmt.query([]).expect("run query");
+                        let mut rows = 0usize;
+                        let mut checksum = 0i64;
+                        while let Some(row) = rows_iter.next().expect("next row") {
+                            checksum = checksum.wrapping_add(fold_sqlite_row(row, col_count));
+                            rows += 1;
+                        }
+                        black_box((rows, checksum))
+                    });
                 });
             },
         );
@@ -201,16 +209,19 @@ fn bench_sql_aggregate_order(c: &mut Criterion) {
                 |b, _| {
                     let db = Db::open(&db_path).expect("open db");
                     let mut scratch = ScanScratch::with_capacity(4, 0);
-                    b.iter(|| {
-                        let mut rows = 0usize;
-                        let mut checksum = 0i64;
-                        db.query(sql, &mut scratch, |row| {
-                            checksum = checksum.wrapping_add(fold_miniql_row(row));
-                            rows += 1;
-                            Ok(())
-                        })
-                        .expect("run miniql aggregate sql");
-                        black_box((rows, checksum))
+                    let bench_id = format!("sql_aggregate_order/miniql_{variant}/{row_count}");
+                    alloc_profiler::with_alloc_log(bench_id.as_str(), || {
+                        b.iter(|| {
+                            let mut rows = 0usize;
+                            let mut checksum = 0i64;
+                            db.query(sql, &mut scratch, |row| {
+                                checksum = checksum.wrapping_add(fold_miniql_row(row));
+                                rows += 1;
+                                Ok(())
+                            })
+                            .expect("run miniql aggregate sql");
+                            black_box((rows, checksum))
+                        });
                     });
                 },
             );
@@ -222,15 +233,18 @@ fn bench_sql_aggregate_order(c: &mut Criterion) {
                     let conn = Connection::open(&db_path).expect("open db");
                     let mut stmt = conn.prepare(sql).expect("prepare query");
                     let col_count = stmt.column_count();
-                    b.iter(|| {
-                        let mut rows_iter = stmt.query([]).expect("run query");
-                        let mut rows = 0usize;
-                        let mut checksum = 0i64;
-                        while let Some(row) = rows_iter.next().expect("next row") {
-                            checksum = checksum.wrapping_add(fold_sqlite_row(row, col_count));
-                            rows += 1;
-                        }
-                        black_box((rows, checksum))
+                    let bench_id = format!("sql_aggregate_order/rusqlite_{variant}/{row_count}");
+                    alloc_profiler::with_alloc_log(bench_id.as_str(), || {
+                        b.iter(|| {
+                            let mut rows_iter = stmt.query([]).expect("run query");
+                            let mut rows = 0usize;
+                            let mut checksum = 0i64;
+                            while let Some(row) = rows_iter.next().expect("next row") {
+                                checksum = checksum.wrapping_add(fold_sqlite_row(row, col_count));
+                                rows += 1;
+                            }
+                            black_box((rows, checksum))
+                        });
                     });
                 },
             );
@@ -252,16 +266,19 @@ fn bench_sql_join(c: &mut Criterion) {
                 |b, _| {
                     let db = Db::open(&db_path).expect("open db");
                     let mut scratch = ScanScratch::with_capacity(8, 0);
-                    b.iter(|| {
-                        let mut rows = 0usize;
-                        let mut checksum = 0i64;
-                        db.query(sql, &mut scratch, |row| {
-                            checksum = checksum.wrapping_add(fold_miniql_row(row));
-                            rows += 1;
-                            Ok(())
-                        })
-                        .expect("run miniql join sql");
-                        black_box((rows, checksum))
+                    let bench_id = format!("sql_join/miniql_{variant}/{row_count}");
+                    alloc_profiler::with_alloc_log(bench_id.as_str(), || {
+                        b.iter(|| {
+                            let mut rows = 0usize;
+                            let mut checksum = 0i64;
+                            db.query(sql, &mut scratch, |row| {
+                                checksum = checksum.wrapping_add(fold_miniql_row(row));
+                                rows += 1;
+                                Ok(())
+                            })
+                            .expect("run miniql join sql");
+                            black_box((rows, checksum))
+                        });
                     });
                 },
             );
@@ -273,15 +290,18 @@ fn bench_sql_join(c: &mut Criterion) {
                     let conn = Connection::open(&db_path).expect("open db");
                     let mut stmt = conn.prepare(sql).expect("prepare query");
                     let col_count = stmt.column_count();
-                    b.iter(|| {
-                        let mut rows_iter = stmt.query([]).expect("run query");
-                        let mut rows = 0usize;
-                        let mut checksum = 0i64;
-                        while let Some(row) = rows_iter.next().expect("next row") {
-                            checksum = checksum.wrapping_add(fold_sqlite_row(row, col_count));
-                            rows += 1;
-                        }
-                        black_box((rows, checksum))
+                    let bench_id = format!("sql_join/rusqlite_{variant}/{row_count}");
+                    alloc_profiler::with_alloc_log(bench_id.as_str(), || {
+                        b.iter(|| {
+                            let mut rows_iter = stmt.query([]).expect("run query");
+                            let mut rows = 0usize;
+                            let mut checksum = 0i64;
+                            while let Some(row) = rows_iter.next().expect("next row") {
+                                checksum = checksum.wrapping_add(fold_sqlite_row(row, col_count));
+                                rows += 1;
+                            }
+                            black_box((rows, checksum))
+                        });
                     });
                 },
             );
@@ -303,16 +323,19 @@ fn bench_sql_distinct(c: &mut Criterion) {
                 |b, _| {
                     let db = Db::open(&db_path).expect("open db");
                     let mut scratch = ScanScratch::with_capacity(2, 0);
-                    b.iter(|| {
-                        let mut rows = 0usize;
-                        let mut checksum = 0i64;
-                        db.query(sql, &mut scratch, |row| {
-                            checksum = checksum.wrapping_add(fold_miniql_row(row));
-                            rows += 1;
-                            Ok(())
-                        })
-                        .expect("run miniql distinct sql");
-                        black_box((rows, checksum))
+                    let bench_id = format!("sql_distinct/miniql_{variant}/{row_count}");
+                    alloc_profiler::with_alloc_log(bench_id.as_str(), || {
+                        b.iter(|| {
+                            let mut rows = 0usize;
+                            let mut checksum = 0i64;
+                            db.query(sql, &mut scratch, |row| {
+                                checksum = checksum.wrapping_add(fold_miniql_row(row));
+                                rows += 1;
+                                Ok(())
+                            })
+                            .expect("run miniql distinct sql");
+                            black_box((rows, checksum))
+                        });
                     });
                 },
             );
@@ -324,15 +347,18 @@ fn bench_sql_distinct(c: &mut Criterion) {
                     let conn = Connection::open(&db_path).expect("open db");
                     let mut stmt = conn.prepare(sql).expect("prepare query");
                     let col_count = stmt.column_count();
-                    b.iter(|| {
-                        let mut rows_iter = stmt.query([]).expect("run query");
-                        let mut rows = 0usize;
-                        let mut checksum = 0i64;
-                        while let Some(row) = rows_iter.next().expect("next row") {
-                            checksum = checksum.wrapping_add(fold_sqlite_row(row, col_count));
-                            rows += 1;
-                        }
-                        black_box((rows, checksum))
+                    let bench_id = format!("sql_distinct/rusqlite_{variant}/{row_count}");
+                    alloc_profiler::with_alloc_log(bench_id.as_str(), || {
+                        b.iter(|| {
+                            let mut rows_iter = stmt.query([]).expect("run query");
+                            let mut rows = 0usize;
+                            let mut checksum = 0i64;
+                            while let Some(row) = rows_iter.next().expect("next row") {
+                                checksum = checksum.wrapping_add(fold_sqlite_row(row, col_count));
+                                rows += 1;
+                            }
+                            black_box((rows, checksum))
+                        });
                     });
                 },
             );
@@ -340,11 +366,17 @@ fn bench_sql_distinct(c: &mut Criterion) {
     }
 }
 
-criterion_group!(
-    benches,
-    bench_sql_scan,
-    bench_sql_aggregate_order,
-    bench_sql_join,
-    bench_sql_distinct
-);
+fn criterion_config() -> Criterion {
+    Criterion::default()
+}
+
+criterion_group! {
+    name = benches;
+    config = criterion_config();
+    targets =
+        bench_sql_scan,
+        bench_sql_aggregate_order,
+        bench_sql_join,
+        bench_sql_distinct
+}
 criterion_main!(benches);

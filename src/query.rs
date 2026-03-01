@@ -398,7 +398,10 @@ impl<'row> Row<'row> {
     /// Number of columns in the projected row.
     #[inline]
     pub fn len(&self) -> usize {
-        self.proj_map.map_or(self.values.len(), |map| map.len())
+        match self.proj_map {
+            Some(proj_map) => proj_map.len(),
+            None => self.values.len(),
+        }
     }
 
     /// Returns true when there are no columns.

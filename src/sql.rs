@@ -1,10 +1,12 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::hash::{Hash, Hasher};
+use std::collections::{BinaryHeap, HashMap};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::sync::Arc;
 
 use rustc_hash::FxHasher;
+use smallvec::SmallVec;
 use sqlparser::ast::{
     BinaryOperator as SqlBinaryOperator, Distinct, Expr as SqlExpr, Function, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
@@ -32,6 +34,28 @@ use crate::table::{self, BytesSpan, Corruption, QueryError, RawBytes, ValueRef, 
 const DEFAULT_SQL_DISTINCT_HASH_MEM_CAP_BYTES: usize = 64 * 1024 * 1024;
 // Optional override for DISTINCT hash dedup memory cap (bytes).
 const SQL_DISTINCT_HASH_MEM_CAP_ENV: &str = "SQL_DISTINCT_HASH_MEM_CAP_BYTES";
+
+#[derive(Default)]
+struct U64IdentityHasher(u64);
+
+impl Hasher for U64IdentityHasher {
+    #[inline]
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("u64 identity hasher only supports write_u64")
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type BuildU64Hasher = BuildHasherDefault<U64IdentityHasher>;
 
 pub(crate) struct PreparedSqlQuery<'db> {
     exec: SqlExec<'db>,
@@ -72,6 +96,7 @@ where
 }
 
 enum SqlExec<'db> {
+    Empty,
     Scan {
         prepared: PreparedScan<'db>,
         offset: usize,
@@ -79,6 +104,7 @@ enum SqlExec<'db> {
         projection: Vec<u16>,
         ordered: bool,
         distinct: bool,
+        distinct_single_col_order_dir: Option<OrderDir>,
     },
     Aggregate {
         prepared: Box<PreparedAggregate<'db>>,
@@ -105,7 +131,16 @@ impl<'db> SqlExec<'db> {
         F: for<'row> FnMut(Row<'row>) -> table::Result<()>,
     {
         match self {
-            Self::Scan { prepared, offset, limit, projection, ordered, distinct } => {
+            Self::Empty => Ok(()),
+            Self::Scan {
+                prepared,
+                offset,
+                limit,
+                projection,
+                ordered,
+                distinct,
+                distinct_single_col_order_dir,
+            } => {
                 if !*distinct {
                     let mut skipped = 0usize;
                     let mut emitted = 0usize;
@@ -126,17 +161,11 @@ impl<'db> SqlExec<'db> {
                     }
 
                     let mut projected = Vec::with_capacity(projection.len());
-                    let mut owned_bytes = Vec::<Vec<u8>>::new();
                     return prepared
                         .for_each(scratch, |_, row| {
                             projected.clear();
-                            owned_bytes.clear();
                             for &col in projection.iter() {
-                                project_value(
-                                    row.get(col as usize)?,
-                                    &mut projected,
-                                    &mut owned_bytes,
-                                );
+                                project_value_borrowed(row.get(col as usize)?, &mut projected);
                             }
 
                             let row = Row::from_raw(projected.as_slice(), None);
@@ -153,29 +182,206 @@ impl<'db> SqlExec<'db> {
                         .or_else(ignore_limit_reached);
                 }
 
-                let mut rows = Vec::<Vec<OwnedSqlValue>>::new();
+                if let Some(dir) = *distinct_single_col_order_dir {
+                    let key_col = projection[0];
+                    let mut unique_keys = Vec::<OwnedSqlValue>::new();
+                    let mut unique_key_buckets =
+                        HashMap::<u64, SmallVec<[usize; 2]>, BuildU64Hasher>::default();
+                    let mut fallback_keys: Option<Vec<OwnedSqlValue>> = None;
+                    let mut distinct_rows =
+                        DistinctRows::with_cap(true, sql_distinct_hash_mem_cap_bytes());
+
+                    prepared.for_each_eager(scratch, |_, row| {
+                        if let Some(keys) = fallback_keys.as_mut() {
+                            keys.push(OwnedSqlValue::from_row_value(row.get(key_col as usize)));
+                            return Ok(());
+                        }
+                        let key_ref = row.get(key_col as usize).unwrap_or(ValueRef::Null);
+                        let hash = hash_sql_single_value_ref(key_ref);
+                        if let Some(existing) = unique_key_buckets.get(&hash)
+                            && existing.iter().copied().any(|idx| {
+                                compare_value_refs(unique_keys[idx].as_value_ref(), key_ref)
+                                    == Ordering::Equal
+                            })
+                        {
+                            return Ok(());
+                        }
+
+                        let key = OwnedSqlValue::from_row_value(Some(key_ref));
+                        match distinct_rows.accept_values(std::iter::once(key.clone())) {
+                            Ok(true) => {
+                                let idx = unique_keys.len();
+                                unique_keys.push(key);
+                                unique_key_buckets.entry(hash).or_default().push(idx);
+                            }
+                            Ok(false) => {}
+                            Err(err) if is_distinct_hash_cap_error(&err) => {
+                                let mut keys = std::mem::take(&mut unique_keys);
+                                keys.push(key);
+                                fallback_keys = Some(keys);
+                            }
+                            Err(err) => return Err(err),
+                        }
+                        Ok(())
+                    })?;
+
+                    let need_post_sort_dedup = fallback_keys.is_some();
+                    let mut keys = if let Some(keys) = fallback_keys { keys } else { unique_keys };
+                    keys.sort_by(|left, right| compare_owned_single_value_dir(left, right, dir));
+                    if need_post_sort_dedup {
+                        keys.dedup_by(|left, right| {
+                            compare_value_refs(left.as_value_ref(), right.as_value_ref())
+                                == Ordering::Equal
+                        });
+                    }
+
+                    let mut skipped = 0usize;
+                    let mut emitted = 0usize;
+                    let mut output_slots = Vec::with_capacity(1);
+                    for key in keys {
+                        if skipped < *offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        if limit_reached(*limit, emitted) {
+                            break;
+                        }
+                        emitted += 1;
+                        output_slots.clear();
+                        output_slots.push(key.to_slot());
+                        cb(Row::from_raw(output_slots.as_slice(), None))?;
+                    }
+
+                    return Ok(());
+                }
+
+                let mut distinct_rows =
+                    DistinctRowIndex::with_cap(true, sql_distinct_hash_mem_cap_bytes());
+                let mut unique_rows = Vec::<Vec<OwnedSqlValue>>::new();
+                let mut fallback_rows: Option<Vec<Vec<OwnedSqlValue>>> = None;
+
                 if !*ordered {
                     prepared.for_each_eager(scratch, |_, row| {
-                        rows.push(owned_values_from_row(row, row.len()));
+                        if let Some(rows) = fallback_rows.as_mut() {
+                            rows.push(owned_values_from_row(row, row.len()));
+                            return Ok(());
+                        }
+
+                        let row_len = row.len();
+                        let mut is_duplicate = false;
+                        let row_hash = hash_sql_value_refs(
+                            row_len,
+                            (0..row_len).map(|idx| row.get(idx).unwrap_or(ValueRef::Null)),
+                        );
+                        if let Some(bucket) = distinct_rows.bucket(row_hash) {
+                            'candidates: for &candidate_idx in bucket {
+                                let existing = unique_rows[candidate_idx].as_slice();
+                                if existing.len() != row_len {
+                                    continue;
+                                }
+                                for (col, existing_value) in existing.iter().enumerate() {
+                                    let value = row.get(col).unwrap_or(ValueRef::Null);
+                                    if compare_value_refs(existing_value.as_value_ref(), value)
+                                        != Ordering::Equal
+                                    {
+                                        continue 'candidates;
+                                    }
+                                }
+                                is_duplicate = true;
+                                break;
+                            }
+                        }
+                        if is_duplicate {
+                            return Ok(());
+                        }
+
+                        let owned_row = owned_values_from_row(row, row_len);
+                        match distinct_rows.accept_row(owned_row.as_slice(), unique_rows.as_slice())
+                        {
+                            Ok(true) => unique_rows.push(owned_row),
+                            Ok(false) => {}
+                            Err(err) if is_distinct_hash_cap_error(&err) => {
+                                let mut rows = std::mem::take(&mut unique_rows);
+                                rows.push(owned_row);
+                                fallback_rows = Some(rows);
+                            }
+                            Err(err) => return Err(err),
+                        }
                         Ok(())
                     })?;
                 } else {
-                    let mut projected = Vec::with_capacity(projection.len());
-                    let mut owned_bytes = Vec::<Vec<u8>>::new();
                     prepared.for_each(scratch, |_, row| {
-                        projected.clear();
-                        owned_bytes.clear();
-                        for &col in projection.iter() {
-                            project_value(row.get(col as usize)?, &mut projected, &mut owned_bytes);
+                        if let Some(rows) = fallback_rows.as_mut() {
+                            let mut owned_row = Vec::with_capacity(projection.len());
+                            for &col in projection.iter() {
+                                owned_row
+                                    .push(OwnedSqlValue::from_row_value(row.get(col as usize)?));
+                            }
+                            rows.push(owned_row);
+                            return Ok(());
                         }
-                        let row = Row::from_raw(projected.as_slice(), None);
-                        rows.push(owned_values_from_row(row, row.len()));
+
+                        let mut row_hasher = FxHasher::default();
+                        projection.len().hash(&mut row_hasher);
+                        for &col in projection.iter() {
+                            let value = row.get(col as usize)?.unwrap_or(ValueRef::Null);
+                            hash_sql_value_ref(value, &mut row_hasher);
+                        }
+                        let row_hash = row_hasher.finish();
+
+                        let mut is_duplicate = false;
+                        if let Some(bucket) = distinct_rows.bucket(row_hash) {
+                            'candidates: for &candidate_idx in bucket {
+                                let existing = unique_rows[candidate_idx].as_slice();
+                                if existing.len() != projection.len() {
+                                    continue;
+                                }
+                                for (out_idx, &col) in projection.iter().enumerate() {
+                                    let value = row.get(col as usize)?.unwrap_or(ValueRef::Null);
+                                    if compare_value_refs(existing[out_idx].as_value_ref(), value)
+                                        != Ordering::Equal
+                                    {
+                                        continue 'candidates;
+                                    }
+                                }
+                                is_duplicate = true;
+                                break;
+                            }
+                        }
+                        if is_duplicate {
+                            return Ok(());
+                        }
+
+                        let mut owned_row = Vec::with_capacity(projection.len());
+                        for &col in projection.iter() {
+                            owned_row.push(OwnedSqlValue::from_row_value(row.get(col as usize)?));
+                        }
+                        match distinct_rows.accept_row(owned_row.as_slice(), unique_rows.as_slice())
+                        {
+                            Ok(true) => unique_rows.push(owned_row),
+                            Ok(false) => {}
+                            Err(err) if is_distinct_hash_cap_error(&err) => {
+                                let mut rows = std::mem::take(&mut unique_rows);
+                                rows.push(owned_row);
+                                fallback_rows = Some(rows);
+                            }
+                            Err(err) => return Err(err),
+                        }
                         Ok(())
                     })?;
                 }
 
-                let keep = distinct_indices_for_rows(rows.as_slice())?;
-                emit_owned_rows(select_rows_by_indices(rows, keep), *offset, *limit, cb)
+                if let Some(rows) = fallback_rows {
+                    let keep = distinct_indices_for_rows(rows.as_slice())?;
+                    return emit_owned_rows(
+                        select_rows_by_indices(rows, keep),
+                        *offset,
+                        *limit,
+                        cb,
+                    );
+                }
+
+                emit_owned_rows(unique_rows, *offset, *limit, cb)
             }
             Self::Aggregate { prepared, offset, limit, visible_cols, distinct, order_by } => {
                 let mut rows: Vec<Vec<OwnedSqlValue>> = Vec::new();
@@ -192,7 +398,7 @@ impl<'db> SqlExec<'db> {
                 }
 
                 if let Some(order_by) = order_by.as_ref() {
-                    rows.sort_by(|left, right| compare_owned_row_values(left, right, order_by));
+                    rows = order_rows_with_top_k(rows, order_by, *offset, *limit);
                 }
 
                 emit_owned_rows_visible(rows, *visible_cols, *offset, *limit, cb)
@@ -242,26 +448,16 @@ fn parse_sql_distinct_hash_mem_cap_override(value: &str) -> Option<usize> {
     value.parse::<usize>().ok().filter(|value| *value > 0)
 }
 
-fn project_value(
-    value: Option<ValueRef<'_>>,
-    projected: &mut Vec<ValueSlot>,
-    owned_bytes: &mut Vec<Vec<u8>>,
-) {
+fn project_value_borrowed(value: Option<ValueRef<'_>>, projected: &mut Vec<ValueSlot>) {
     let slot = match value {
         Some(ValueRef::Null) | None => ValueSlot::Null,
         Some(ValueRef::Integer(value)) => ValueSlot::Integer(value),
         Some(ValueRef::Real(value)) => ValueSlot::Real(value),
         Some(ValueRef::Text(bytes)) => {
-            owned_bytes.push(bytes.to_vec());
-            let stored =
-                owned_bytes.last().expect("owned bytes contains the row value we just pushed");
-            ValueSlot::Text(BytesSpan::Mmap(RawBytes::from_slice(stored.as_slice())))
+            ValueSlot::Text(BytesSpan::Mmap(RawBytes::from_slice(bytes)))
         }
         Some(ValueRef::Blob(bytes)) => {
-            owned_bytes.push(bytes.to_vec());
-            let stored =
-                owned_bytes.last().expect("owned bytes contains the row value we just pushed");
-            ValueSlot::Blob(BytesSpan::Mmap(RawBytes::from_slice(stored.as_slice())))
+            ValueSlot::Blob(BytesSpan::Mmap(RawBytes::from_slice(bytes)))
         }
     };
     projected.push(slot);
@@ -277,6 +473,10 @@ enum OwnedSqlValue {
 }
 
 impl OwnedSqlValue {
+    fn from_value_ref(value: ValueRef<'_>) -> Self {
+        Self::from_row_value(Some(value))
+    }
+
     fn from_row_value(value: Option<ValueRef<'_>>) -> Self {
         match value {
             Some(ValueRef::Null) | None => Self::Null,
@@ -316,23 +516,26 @@ struct DistinctRows {
     enabled: bool,
     mem_cap_bytes: usize,
     mem_used_bytes: usize,
-    seen: HashMap<u64, Vec<Vec<OwnedSqlValue>>>,
+    seen: HashMap<u64, Vec<Vec<OwnedSqlValue>>, BuildU64Hasher>,
 }
 
 impl DistinctRows {
     fn with_cap(enabled: bool, mem_cap_bytes: usize) -> Self {
-        Self { enabled, mem_cap_bytes, mem_used_bytes: 0, seen: HashMap::new() }
+        Self { enabled, mem_cap_bytes, mem_used_bytes: 0, seen: HashMap::default() }
     }
 
     fn accept_values<I>(&mut self, values: I) -> table::Result<bool>
     where
         I: IntoIterator<Item = OwnedSqlValue>,
     {
+        self.accept_owned_row(values.into_iter().collect::<Vec<_>>())
+    }
+
+    fn accept_owned_row(&mut self, owned: Vec<OwnedSqlValue>) -> table::Result<bool> {
         if !self.enabled {
             return Ok(true);
         }
 
-        let owned = values.into_iter().collect::<Vec<_>>();
         let hash = hash_sql_row(owned.as_slice());
 
         let mut has_bucket = false;
@@ -354,6 +557,66 @@ impl DistinctRows {
             Entry::Occupied(mut entry) => entry.get_mut().push(owned),
             Entry::Vacant(entry) => {
                 entry.insert(vec![owned]);
+            }
+        }
+        Ok(true)
+    }
+
+    fn charge_distinct_bytes(&mut self, bytes: usize) -> table::Result<()> {
+        let next = self.mem_used_bytes.saturating_add(bytes);
+        if next > self.mem_cap_bytes {
+            return Err(table::Error::Query(QueryError::SqlDistinctMemoryLimitExceeded));
+        }
+        self.mem_used_bytes = next;
+        Ok(())
+    }
+}
+
+struct DistinctRowIndex {
+    enabled: bool,
+    mem_cap_bytes: usize,
+    mem_used_bytes: usize,
+    seen: HashMap<u64, Vec<usize>, BuildU64Hasher>,
+}
+
+impl DistinctRowIndex {
+    fn with_cap(enabled: bool, mem_cap_bytes: usize) -> Self {
+        Self { enabled, mem_cap_bytes, mem_used_bytes: 0, seen: HashMap::default() }
+    }
+
+    fn bucket(&self, hash: u64) -> Option<&[usize]> {
+        self.seen.get(&hash).map(Vec::as_slice)
+    }
+
+    fn accept_row(
+        &mut self,
+        row: &[OwnedSqlValue],
+        unique_rows: &[Vec<OwnedSqlValue>],
+    ) -> table::Result<bool> {
+        if !self.enabled {
+            return Ok(true);
+        }
+
+        let hash = hash_sql_row(row);
+        if let Some(bucket) = self.seen.get(&hash)
+            && bucket.iter().any(|idx| sql_row_equal(unique_rows[*idx].as_slice(), row))
+        {
+            return Ok(false);
+        }
+
+        let row_bytes = estimate_owned_row_bytes(row);
+        let entry_overhead = if self.seen.contains_key(&hash) {
+            std::mem::size_of::<usize>()
+        } else {
+            std::mem::size_of::<u64>()
+                + std::mem::size_of::<Vec<usize>>()
+                + std::mem::size_of::<usize>()
+        };
+        self.charge_distinct_bytes(entry_overhead.saturating_add(row_bytes))?;
+        match self.seen.entry(hash) {
+            Entry::Occupied(mut entry) => entry.get_mut().push(unique_rows.len()),
+            Entry::Vacant(entry) => {
+                entry.insert(vec![unique_rows.len()]);
             }
         }
         Ok(true)
@@ -402,6 +665,25 @@ fn hash_sql_row(row: &[OwnedSqlValue]) -> u64 {
     hasher.finish()
 }
 
+fn hash_sql_value_refs<'a, I>(len: usize, values: I) -> u64
+where
+    I: IntoIterator<Item = ValueRef<'a>>,
+{
+    let mut hasher = FxHasher::default();
+    len.hash(&mut hasher);
+    for value in values {
+        hash_sql_value_ref(value, &mut hasher);
+    }
+    hasher.finish()
+}
+
+fn hash_sql_single_value_ref(value: ValueRef<'_>) -> u64 {
+    let mut hasher = FxHasher::default();
+    1usize.hash(&mut hasher);
+    hash_sql_value_ref(value, &mut hasher);
+    hasher.finish()
+}
+
 fn hash_sql_value(value: &OwnedSqlValue, hasher: &mut FxHasher) {
     match value {
         OwnedSqlValue::Null => {
@@ -420,6 +702,30 @@ fn hash_sql_value(value: &OwnedSqlValue, hasher: &mut FxHasher) {
             bytes.hash(hasher);
         }
         OwnedSqlValue::Blob(bytes) => {
+            3u8.hash(hasher);
+            bytes.hash(hasher);
+        }
+    }
+}
+
+fn hash_sql_value_ref(value: ValueRef<'_>, hasher: &mut FxHasher) {
+    match value {
+        ValueRef::Null => {
+            0u8.hash(hasher);
+        }
+        ValueRef::Integer(value) => {
+            1u8.hash(hasher);
+            normalize_numeric_hash(value as f64).hash(hasher);
+        }
+        ValueRef::Real(value) => {
+            1u8.hash(hasher);
+            normalize_numeric_hash(value).hash(hasher);
+        }
+        ValueRef::Text(bytes) => {
+            2u8.hash(hasher);
+            bytes.hash(hasher);
+        }
+        ValueRef::Blob(bytes) => {
             3u8.hash(hasher);
             bytes.hash(hasher);
         }
@@ -472,6 +778,19 @@ fn compare_owned_row_lex(left: &[OwnedSqlValue], right: &[OwnedSqlValue]) -> Ord
         }
     }
     left.len().cmp(&right.len())
+}
+
+#[inline]
+fn compare_owned_single_value_dir(
+    left: &OwnedSqlValue,
+    right: &OwnedSqlValue,
+    dir: OrderDir,
+) -> Ordering {
+    let mut cmp = compare_value_refs(left.as_value_ref(), right.as_value_ref());
+    if matches!(dir, OrderDir::Desc) {
+        cmp = cmp.reverse();
+    }
+    cmp
 }
 
 fn is_distinct_hash_cap_error(err: &table::Error) -> bool {
@@ -642,6 +961,153 @@ where
     Ok(())
 }
 
+#[derive(Clone)]
+struct TopKItem {
+    row: Vec<OwnedSqlValue>,
+    seq: usize,
+    order_by: Arc<[OrderBy]>,
+}
+
+struct TopKRefItem<'a> {
+    projected: Vec<OwnedSqlValue>,
+    order_keys: Vec<OwnedSqlValue>,
+    seq: usize,
+    order_dirs: &'a [OrderDir],
+    order_proj_pos: Option<&'a [usize]>,
+}
+
+impl TopKRefItem<'_> {
+    #[inline]
+    fn order_value_at(&self, idx: usize) -> ValueRef<'_> {
+        if let Some(pos) = self.order_proj_pos {
+            let p = *pos.get(idx).unwrap_or(&usize::MAX);
+            return self
+                .projected
+                .get(p)
+                .map(OwnedSqlValue::as_value_ref)
+                .unwrap_or(ValueRef::Null);
+        }
+        self.order_keys.get(idx).map(OwnedSqlValue::as_value_ref).unwrap_or(ValueRef::Null)
+    }
+
+    #[inline]
+    fn compare_desired(&self, other: &Self) -> Ordering {
+        for (idx, dir) in self.order_dirs.iter().enumerate() {
+            let left = self.order_value_at(idx);
+            let right = other.order_value_at(idx);
+            let mut cmp = compare_value_refs(left, right);
+            if matches!(dir, OrderDir::Desc) {
+                cmp = cmp.reverse();
+            }
+            if cmp != Ordering::Equal {
+                return cmp.then(self.seq.cmp(&other.seq));
+            }
+        }
+        self.seq.cmp(&other.seq)
+    }
+}
+
+impl PartialEq for TopKRefItem<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.compare_desired(other) == Ordering::Equal
+    }
+}
+
+impl Eq for TopKRefItem<'_> {}
+
+impl PartialOrd for TopKRefItem<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TopKRefItem<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.compare_desired(other)
+    }
+}
+
+impl TopKItem {
+    #[inline]
+    fn compare_desired(&self, other: &Self) -> Ordering {
+        compare_owned_row_values(self.row.as_slice(), other.row.as_slice(), &self.order_by)
+            .then(self.seq.cmp(&other.seq))
+    }
+}
+
+impl PartialEq for TopKItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.compare_desired(other) == Ordering::Equal
+    }
+}
+
+impl Eq for TopKItem {}
+
+impl PartialOrd for TopKItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TopKItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.compare_desired(other)
+    }
+}
+
+fn order_rows_with_top_k(
+    rows: Vec<Vec<OwnedSqlValue>>,
+    order_by: &[OrderBy],
+    offset: usize,
+    limit: Option<usize>,
+) -> Vec<Vec<OwnedSqlValue>> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(limit) = limit else {
+        let mut rows = rows;
+        // Stable full sort for unlimited ORDER BY output.
+        rows.sort_by(|left, right| compare_owned_row_values(left, right, order_by));
+        return rows;
+    };
+    let keep = offset.saturating_add(limit);
+    if keep == 0 {
+        return Vec::new();
+    }
+
+    if keep >= rows.len() {
+        let mut rows = rows;
+        rows.sort_by(|left, right| compare_owned_row_values(left, right, order_by));
+        return rows;
+    }
+
+    let order_by = Arc::<[OrderBy]>::from(order_by.to_vec().into_boxed_slice());
+    let mut heap = BinaryHeap::with_capacity(keep.saturating_add(1));
+    for (seq, row) in rows.into_iter().enumerate() {
+        let item = TopKItem { row, seq, order_by: order_by.clone() };
+        push_top_k_item(&mut heap, item, keep);
+    }
+
+    let mut items = heap.into_vec();
+    items.sort_by(|left, right| left.compare_desired(right));
+    items.into_iter().map(|item| item.row).collect()
+}
+
+#[inline]
+fn push_top_k_item(heap: &mut BinaryHeap<TopKItem>, item: TopKItem, keep: usize) {
+    if heap.len() < keep {
+        heap.push(item);
+        return;
+    }
+    if let Some(worst) = heap.peek()
+        && item.compare_desired(worst) == Ordering::Less
+    {
+        let _ = heap.pop();
+        heap.push(item);
+    }
+}
+
 struct JoinRunOptions<'a> {
     projection: &'a [u16],
     where_expr: Option<&'a Expr>,
@@ -649,6 +1115,14 @@ struct JoinRunOptions<'a> {
     offset: usize,
     limit: Option<usize>,
     distinct: bool,
+}
+
+struct JoinOrderedOptions<'a> {
+    projection: &'a [u16],
+    where_expr: Option<&'a Expr>,
+    order_by: &'a [OrderBy],
+    offset: usize,
+    limit: Option<usize>,
 }
 
 fn run_join_query<F>(
@@ -664,22 +1138,53 @@ where
 
     if distinct {
         let mut rows = Vec::<Vec<OwnedSqlValue>>::new();
+        let mut unique_keys = Vec::<Vec<OwnedSqlValue>>::new();
+        let mut fallback_rows: Option<Vec<Vec<OwnedSqlValue>>> = None;
+        let mut distinct_rows = DistinctRowIndex::with_cap(true, sql_distinct_hash_mem_cap_bytes());
         prepared.for_each(&mut scratch, |joined| {
-            let full_row = owned_values_from_joined_row(joined);
             if let Some(where_expr) = where_expr
-                && eval_expr_on_owned(where_expr, full_row.as_slice())? != SqlTruth::True
+                && eval_expr_on_joined_compact(where_expr, &joined)? != SqlTruth::True
             {
                 return Ok(());
             }
-            rows.push(full_row);
+            if let Some(all_rows) = fallback_rows.as_mut() {
+                all_rows.push(owned_values_from_joined_row(joined));
+                return Ok(());
+            }
+
+            let key_hash = hash_joined_cols(&joined, projection);
+            if let Some(bucket) = distinct_rows.bucket(key_hash) {
+                for &idx in bucket {
+                    if joined_cols_equal_owned(&joined, projection, unique_keys[idx].as_slice()) {
+                        return Ok(());
+                    }
+                }
+            }
+
+            let key = owned_values_from_joined_cols(&joined, projection)?;
+            match distinct_rows.accept_row(key.as_slice(), unique_keys.as_slice()) {
+                Ok(true) => {
+                    unique_keys.push(key);
+                    rows.push(owned_values_from_joined_row(joined));
+                }
+                Ok(false) => {}
+                Err(err) if is_distinct_hash_cap_error(&err) => {
+                    let mut all_rows = std::mem::take(&mut rows);
+                    all_rows.push(owned_values_from_joined_row(joined));
+                    fallback_rows = Some(all_rows);
+                }
+                Err(err) => return Err(err),
+            }
             Ok(())
         })?;
 
-        let keep = distinct_indices_for_projection(rows.as_slice(), projection)?;
-        rows = select_rows_by_indices(rows, keep);
+        if let Some(all_rows) = fallback_rows {
+            let keep = distinct_indices_for_projection(all_rows.as_slice(), projection)?;
+            rows = select_rows_by_indices(all_rows, keep);
+        }
 
         if let Some(order_by) = order_by {
-            rows.sort_by(|left, right| compare_owned_row_values(left, right, order_by));
+            rows = order_rows_with_top_k(rows, order_by, offset, limit);
         }
 
         let mut output_slots = Vec::with_capacity(projection.len());
@@ -706,40 +1211,11 @@ where
     }
 
     if let Some(order_by) = order_by {
-        let mut rows = Vec::<Vec<OwnedSqlValue>>::new();
-        prepared.for_each(&mut scratch, |joined| {
-            let full_row = owned_values_from_joined_row(joined);
-            if let Some(where_expr) = where_expr
-                && eval_expr_on_owned(where_expr, full_row.as_slice())? != SqlTruth::True
-            {
-                return Ok(());
-            }
-            rows.push(full_row);
-            Ok(())
-        })?;
-
-        rows.sort_by(|left, right| compare_owned_row_values(left, right, order_by));
-
-        let mut output_slots = Vec::with_capacity(projection.len());
-        let mut skipped = 0usize;
-        let mut emitted = 0usize;
-        for row in rows {
-            if skipped < offset {
-                skipped += 1;
-                continue;
-            }
-            if limit_reached(limit, emitted) {
-                break;
-            }
-            emitted += 1;
-            output_slots.clear();
-            for idx in projection {
-                push_projected_slot_from_owned_row(row.as_slice(), *idx, &mut output_slots)?;
-            }
-            cb(Row::from_raw(output_slots.as_slice(), None))?;
-        }
-
-        return Ok(());
+        return prepared.run_sql_ordered_compact(
+            &mut scratch,
+            JoinOrderedOptions { projection, where_expr, order_by, offset, limit },
+            cb,
+        );
     }
 
     let mut output_slots = Vec::with_capacity(projection.len());
@@ -747,9 +1223,8 @@ where
     let mut emitted = 0usize;
     prepared
         .for_each(&mut scratch, |joined| {
-            let full_row = owned_values_from_joined_row(joined);
             if let Some(where_expr) = where_expr
-                && eval_expr_on_owned(where_expr, full_row.as_slice())? != SqlTruth::True
+                && eval_expr_on_joined_compact(where_expr, &joined)? != SqlTruth::True
             {
                 return Ok(());
             }
@@ -764,22 +1239,246 @@ where
 
             output_slots.clear();
             for idx in projection {
-                push_projected_slot_from_owned_row(full_row.as_slice(), *idx, &mut output_slots)?;
+                push_projected_slot_from_joined(&joined, *idx, &mut output_slots)?;
             }
             cb(Row::from_raw(output_slots.as_slice(), None))
         })
         .or_else(ignore_limit_reached)
 }
 
-fn owned_values_from_joined_row(joined: JoinedRow<'_>) -> Vec<OwnedSqlValue> {
-    let mut values = Vec::with_capacity(joined.left.len() + joined.right.len());
-    for idx in 0..joined.left.len() {
-        values.push(OwnedSqlValue::from_row_value(joined.left.get(idx)));
+impl<'db> PreparedJoin<'db> {
+    fn run_sql_ordered_compact<F>(
+        &mut self,
+        scratch: &mut JoinScratch,
+        opts: JoinOrderedOptions<'_>,
+        cb: &mut F,
+    ) -> table::Result<()>
+    where
+        F: for<'row> FnMut(Row<'row>) -> table::Result<()>,
+    {
+        let JoinOrderedOptions { projection, where_expr, order_by, offset, limit } = opts;
+        let order_cols = order_by.iter().map(|item| item.col).collect::<Vec<_>>();
+        let order_dirs = order_by.iter().map(|item| item.dir).collect::<Vec<_>>();
+        let order_proj_pos = {
+            let mut out = Vec::with_capacity(order_cols.len());
+            let mut all = true;
+            for col in &order_cols {
+                if let Some(pos) = projection.iter().position(|p| p == col) {
+                    out.push(pos);
+                } else {
+                    all = false;
+                    break;
+                }
+            }
+            if all { Some(out) } else { None }
+        };
+        let order_proj_pos_ref = order_proj_pos.as_deref();
+        let use_projected_order = order_proj_pos_ref.is_some();
+        let mut rows = Vec::<TopKRefItem<'_>>::new();
+        let mut seq = 0usize;
+        if let Some(limit) = limit {
+            let keep = offset.saturating_add(limit);
+            if keep == 0 {
+                return Ok(());
+            }
+
+            let mut heap: BinaryHeap<TopKRefItem<'_>> =
+                BinaryHeap::with_capacity(keep.saturating_add(1));
+            self.for_each(scratch, |joined| {
+                if let Some(where_expr) = where_expr
+                    && eval_expr_on_joined_compact(where_expr, &joined)? != SqlTruth::True
+                {
+                    return Ok(());
+                }
+                if heap.len() < keep {
+                    let item = TopKRefItem {
+                        projected: owned_values_from_joined_cols(&joined, projection)?,
+                        order_keys: if use_projected_order {
+                            Vec::new()
+                        } else {
+                            owned_values_from_joined_cols(&joined, order_cols.as_slice())?
+                        },
+                        seq,
+                        order_dirs: order_dirs.as_slice(),
+                        order_proj_pos: order_proj_pos_ref,
+                    };
+                    heap.push(item);
+                    seq = seq.saturating_add(1);
+                    return Ok(());
+                }
+
+                let keep_row = if let Some(worst) = heap.peek() {
+                    compare_joined_order_to_item(
+                        &joined,
+                        order_cols.as_slice(),
+                        order_dirs.as_slice(),
+                        seq,
+                        worst,
+                    ) == Ordering::Less
+                } else {
+                    true
+                };
+
+                if keep_row {
+                    let item = TopKRefItem {
+                        projected: owned_values_from_joined_cols(&joined, projection)?,
+                        order_keys: if use_projected_order {
+                            Vec::new()
+                        } else {
+                            owned_values_from_joined_cols(&joined, order_cols.as_slice())?
+                        },
+                        seq,
+                        order_dirs: order_dirs.as_slice(),
+                        order_proj_pos: order_proj_pos_ref,
+                    };
+                    let _ = heap.pop();
+                    heap.push(item);
+                }
+                seq = seq.saturating_add(1);
+                Ok(())
+            })?;
+
+            let mut items = heap.into_vec();
+            items.sort_by(|left, right| left.compare_desired(right));
+            rows = items;
+        } else {
+            self.for_each(scratch, |joined| {
+                if let Some(where_expr) = where_expr
+                    && eval_expr_on_joined_compact(where_expr, &joined)? != SqlTruth::True
+                {
+                    return Ok(());
+                }
+                rows.push(TopKRefItem {
+                    projected: owned_values_from_joined_cols(&joined, projection)?,
+                    order_keys: if use_projected_order {
+                        Vec::new()
+                    } else {
+                        owned_values_from_joined_cols(&joined, order_cols.as_slice())?
+                    },
+                    seq,
+                    order_dirs: order_dirs.as_slice(),
+                    order_proj_pos: order_proj_pos_ref,
+                });
+                seq = seq.saturating_add(1);
+                Ok(())
+            })?;
+
+            rows.sort_by(|left, right| left.compare_desired(right));
+        }
+
+        let mut skipped = 0usize;
+        let mut emitted = 0usize;
+        let mut output_slots = Vec::with_capacity(projection.len());
+        for row in rows {
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if limit_reached(limit, emitted) {
+                break;
+            }
+            emitted += 1;
+            output_slots.clear();
+            for value in row.projected.as_slice() {
+                output_slots.push(value.to_slot());
+            }
+            cb(Row::from_raw(output_slots.as_slice(), None))?;
+        }
+        Ok(())
     }
-    for idx in 0..joined.right.len() {
-        values.push(OwnedSqlValue::from_row_value(joined.right.get(idx)));
+}
+
+fn owned_values_from_joined_row(joined: JoinedRow<'_>) -> Vec<OwnedSqlValue> {
+    let left_raw = joined.left.values_raw();
+    let right_raw = joined.right.values_raw();
+    let mut values = Vec::with_capacity(left_raw.len() + right_raw.len());
+    for slot in left_raw {
+        let value = unsafe { slot.as_value_ref() };
+        values.push(OwnedSqlValue::from_value_ref(value));
+    }
+    for slot in right_raw {
+        let value = unsafe { slot.as_value_ref() };
+        values.push(OwnedSqlValue::from_value_ref(value));
     }
     values
+}
+
+fn owned_values_from_joined_cols(
+    joined: &JoinedRow<'_>,
+    cols: &[u16],
+) -> table::Result<Vec<OwnedSqlValue>> {
+    let mut values = Vec::with_capacity(cols.len());
+    for col in cols {
+        let value = joined_compact_get(joined, *col).ok_or(table::Error::InvalidColumnIndex {
+            col: *col,
+            column_count: joined.left.len() + joined.right.len(),
+        })?;
+        values.push(OwnedSqlValue::from_value_ref(value));
+    }
+    Ok(values)
+}
+
+fn joined_compact_get<'row>(joined: &JoinedRow<'row>, idx: u16) -> Option<ValueRef<'row>> {
+    let idx = idx as usize;
+    if idx < joined.left.len() {
+        return joined.left.get(idx);
+    }
+    joined.right.get(idx.saturating_sub(joined.left.len()))
+}
+
+fn hash_joined_cols(joined: &JoinedRow<'_>, cols: &[u16]) -> u64 {
+    hash_sql_value_refs(
+        cols.len(),
+        cols.iter().map(|col| joined_compact_get(joined, *col).unwrap_or(ValueRef::Null)),
+    )
+}
+
+fn joined_cols_equal_owned(
+    joined: &JoinedRow<'_>,
+    cols: &[u16],
+    owned_values: &[OwnedSqlValue],
+) -> bool {
+    if owned_values.len() != cols.len() {
+        return false;
+    }
+    cols.iter().enumerate().all(|(idx, col)| {
+        let value = joined_compact_get(joined, *col).unwrap_or(ValueRef::Null);
+        compare_value_refs(owned_values[idx].as_value_ref(), value) == Ordering::Equal
+    })
+}
+
+fn push_projected_slot_from_joined(
+    joined: &JoinedRow<'_>,
+    idx: u16,
+    out: &mut Vec<ValueSlot>,
+) -> table::Result<()> {
+    let column_count = joined.left.len() + joined.right.len();
+    let value = joined_compact_get(joined, idx)
+        .ok_or(table::Error::InvalidColumnIndex { col: idx, column_count })?;
+    project_value_borrowed(Some(value), out);
+    Ok(())
+}
+
+#[inline]
+fn compare_joined_order_to_item(
+    joined: &JoinedRow<'_>,
+    order_cols: &[u16],
+    order_dirs: &[OrderDir],
+    seq: usize,
+    item: &TopKRefItem<'_>,
+) -> Ordering {
+    for (idx, dir) in order_dirs.iter().enumerate() {
+        let left = joined_compact_get(joined, order_cols[idx]).unwrap_or(ValueRef::Null);
+        let right = item.order_value_at(idx);
+        let mut cmp = compare_value_refs(left, right);
+        if matches!(dir, OrderDir::Desc) {
+            cmp = cmp.reverse();
+        }
+        if cmp != Ordering::Equal {
+            return cmp.then(seq.cmp(&item.seq));
+        }
+    }
+    seq.cmp(&item.seq)
 }
 
 fn push_projected_slot_from_owned_row(
@@ -812,88 +1511,111 @@ enum SqlTruth {
     Null,
 }
 
-fn eval_expr_on_owned(expr: &Expr, values: &[OwnedSqlValue]) -> table::Result<SqlTruth> {
+fn eval_expr_on_joined_compact(expr: &Expr, joined: &JoinedRow<'_>) -> table::Result<SqlTruth> {
     match expr {
         Expr::Col(_) | Expr::Lit(_) => Ok(SqlTruth::Null),
-        Expr::Eq(left, right) => eval_cmp(CmpOp::Eq, left, right, values),
-        Expr::Ne(left, right) => eval_cmp(CmpOp::Ne, left, right, values),
-        Expr::Lt(left, right) => eval_cmp(CmpOp::Lt, left, right, values),
-        Expr::Le(left, right) => eval_cmp(CmpOp::Le, left, right, values),
-        Expr::Gt(left, right) => eval_cmp(CmpOp::Gt, left, right, values),
-        Expr::Ge(left, right) => eval_cmp(CmpOp::Ge, left, right, values),
-        Expr::Like(left, right) => eval_like(left, right, values),
+        Expr::Eq(left, right) => eval_cmp_on_joined_compact(CmpOp::Eq, left, right, joined),
+        Expr::Ne(left, right) => eval_cmp_on_joined_compact(CmpOp::Ne, left, right, joined),
+        Expr::Lt(left, right) => eval_cmp_on_joined_compact(CmpOp::Lt, left, right, joined),
+        Expr::Le(left, right) => eval_cmp_on_joined_compact(CmpOp::Le, left, right, joined),
+        Expr::Gt(left, right) => eval_cmp_on_joined_compact(CmpOp::Gt, left, right, joined),
+        Expr::Ge(left, right) => eval_cmp_on_joined_compact(CmpOp::Ge, left, right, joined),
+        Expr::Like(left, right) => eval_like_on_joined_compact(left, right, joined),
         Expr::And(left, right) => {
-            let left = eval_expr_on_owned(left, values)?;
+            let left = eval_expr_on_joined_compact(left, joined)?;
             if left == SqlTruth::False {
                 return Ok(SqlTruth::False);
             }
-            let right = eval_expr_on_owned(right, values)?;
+            let right = eval_expr_on_joined_compact(right, joined)?;
             Ok(truth_and(left, right))
         }
         Expr::Or(left, right) => {
-            let left = eval_expr_on_owned(left, values)?;
+            let left = eval_expr_on_joined_compact(left, joined)?;
             if left == SqlTruth::True {
                 return Ok(SqlTruth::True);
             }
-            let right = eval_expr_on_owned(right, values)?;
+            let right = eval_expr_on_joined_compact(right, joined)?;
             Ok(truth_or(left, right))
         }
-        Expr::Not(inner) => Ok(truth_not(eval_expr_on_owned(inner, values)?)),
-        Expr::IsNull(inner) => eval_is_null(inner, values),
-        Expr::IsNotNull(inner) => eval_is_not_null(inner, values),
+        Expr::Not(inner) => Ok(truth_not(eval_expr_on_joined_compact(inner, joined)?)),
+        Expr::IsNull(inner) => eval_is_null_on_joined_compact(inner, joined),
+        Expr::IsNotNull(inner) => eval_is_not_null_on_joined_compact(inner, joined),
     }
 }
 
-fn eval_cmp(
+fn eval_cmp_on_joined_compact(
     op: CmpOp,
     left: &Expr,
     right: &Expr,
-    values: &[OwnedSqlValue],
+    joined: &JoinedRow<'_>,
 ) -> table::Result<SqlTruth> {
-    let left = eval_operand(left, values)?;
-    let right = eval_operand(right, values)?;
+    let left = eval_operand_on_joined_compact(left, joined)?;
+    let right = eval_operand_on_joined_compact(right, joined)?;
     Ok(match (left, right) {
-        (None, _) | (_, None) => SqlTruth::Null,
-        (Some(left), Some(right)) => compare_sql_values(op, left, right),
+        (JoinedOperand::Null, _) | (_, JoinedOperand::Null) => SqlTruth::Null,
+        (left, right) => compare_sql_values(op, left.as_value_ref(), right.as_value_ref()),
     })
 }
 
-fn eval_like(left: &Expr, right: &Expr, values: &[OwnedSqlValue]) -> table::Result<SqlTruth> {
-    let left = eval_operand(left, values)?;
-    let right = eval_operand(right, values)?;
+fn eval_like_on_joined_compact(
+    left: &Expr,
+    right: &Expr,
+    joined: &JoinedRow<'_>,
+) -> table::Result<SqlTruth> {
+    let left = eval_operand_on_joined_compact(left, joined)?;
+    let right = eval_operand_on_joined_compact(right, joined)?;
     Ok(match (left, right) {
-        (None, _) | (_, None) => SqlTruth::Null,
-        (Some(left), Some(right)) => compare_sql_like(left, right),
+        (JoinedOperand::Null, _) | (_, JoinedOperand::Null) => SqlTruth::Null,
+        (left, right) => compare_sql_like(left.as_value_ref(), right.as_value_ref()),
     })
 }
 
-fn eval_operand<'a>(
-    expr: &'a Expr,
-    values: &'a [OwnedSqlValue],
-) -> table::Result<Option<ValueRef<'a>>> {
-    match expr {
-        Expr::Col(idx) => values
-            .get(*idx as usize)
-            .map(OwnedSqlValue::as_value_ref)
-            .ok_or(table::Error::InvalidColumnIndex { col: *idx, column_count: values.len() })
-            .map(Some),
-        Expr::Lit(lit) => Ok(Some(value_lit_to_ref(lit))),
-        _ => Ok(None),
+enum JoinedOperand<'row, 'expr> {
+    Value(ValueRef<'row>),
+    Lit(&'expr ValueLit),
+    Null,
+}
+
+impl JoinedOperand<'_, '_> {
+    #[inline]
+    fn as_value_ref(&self) -> ValueRef<'_> {
+        match self {
+            Self::Value(value) => *value,
+            Self::Lit(lit) => value_lit_to_ref(lit),
+            Self::Null => ValueRef::Null,
+        }
     }
 }
 
-fn eval_is_null(expr: &Expr, values: &[OwnedSqlValue]) -> table::Result<SqlTruth> {
+fn eval_operand_on_joined_compact<'row, 'expr>(
+    expr: &'expr Expr,
+    joined: &JoinedRow<'row>,
+) -> table::Result<JoinedOperand<'row, 'expr>> {
+    match expr {
+        Expr::Col(idx) => joined_compact_get(joined, *idx)
+            .ok_or(table::Error::InvalidColumnIndex {
+                col: *idx,
+                column_count: joined.left.len() + joined.right.len(),
+            })
+            .map(JoinedOperand::Value),
+        Expr::Lit(lit) => Ok(JoinedOperand::Lit(lit)),
+        _ => Ok(JoinedOperand::Null),
+    }
+}
+
+fn eval_is_null_on_joined_compact(expr: &Expr, joined: &JoinedRow<'_>) -> table::Result<SqlTruth> {
     match expr {
         Expr::Col(idx) => {
-            let value = values.get(*idx as usize).ok_or(table::Error::InvalidColumnIndex {
-                col: *idx,
-                column_count: values.len(),
-            })?;
-            Ok(if matches!(value, OwnedSqlValue::Null) { SqlTruth::True } else { SqlTruth::False })
+            let value =
+                joined_compact_get(joined, *idx).ok_or(table::Error::InvalidColumnIndex {
+                    col: *idx,
+                    column_count: joined.left.len() + joined.right.len(),
+                })?;
+            Ok(if matches!(value, ValueRef::Null) { SqlTruth::True } else { SqlTruth::False })
         }
         Expr::Lit(ValueLit::Null) => Ok(SqlTruth::True),
         Expr::Lit(_) => Ok(SqlTruth::False),
-        _ => Ok(if eval_expr_on_owned(expr, values)? == SqlTruth::Null {
+        _ => Ok(if eval_expr_on_joined_compact(expr, joined)? == SqlTruth::Null {
             SqlTruth::True
         } else {
             SqlTruth::False
@@ -901,8 +1623,11 @@ fn eval_is_null(expr: &Expr, values: &[OwnedSqlValue]) -> table::Result<SqlTruth
     }
 }
 
-fn eval_is_not_null(expr: &Expr, values: &[OwnedSqlValue]) -> table::Result<SqlTruth> {
-    Ok(match eval_is_null(expr, values)? {
+fn eval_is_not_null_on_joined_compact(
+    expr: &Expr,
+    joined: &JoinedRow<'_>,
+) -> table::Result<SqlTruth> {
+    Ok(match eval_is_null_on_joined_compact(expr, joined)? {
         SqlTruth::True => SqlTruth::False,
         SqlTruth::False => SqlTruth::True,
         SqlTruth::Null => SqlTruth::Null,
@@ -1077,6 +1802,9 @@ fn build_exec<'db>(db: &'db Db, query: SqlQuery) -> table::Result<SqlExec<'db>> 
         select.selection.as_ref().map(|expr| parse_filter_expr(expr, &resolver)).transpose()?;
     let group_by = parse_group_by(&select.group_by, &resolver)?;
     let (limit, offset) = parse_limit_offset(query.limit_clause.as_ref())?;
+    if limit == Some(0) {
+        return Ok(SqlExec::Empty);
+    }
 
     let has_agg = projection.iter().any(|item| matches!(item, ProjectionExpr::Aggregate(_)));
     let aggregate_mode = has_agg || !group_by.is_empty();
@@ -1133,13 +1861,16 @@ fn build_exec<'db>(db: &'db Db, query: SqlQuery) -> table::Result<SqlExec<'db>> 
         .collect::<table::Result<Vec<_>>>()?;
     let order_by =
         parse_order_by(query.order_by.as_ref(), &resolver, &projection_cols, Some(&output_names))?;
-    let ordered = order_by.is_some();
+    let distinct_single_col_order_dir =
+        distinct_single_col_order_dir(distinct, projection_cols.as_slice(), order_by.as_deref());
+    let ordered = order_by.is_some() && distinct_single_col_order_dir.is_none();
+    let scan_order_by = if distinct_single_col_order_dir.is_some() { None } else { order_by };
 
     let mut scan = table.scan().with_projection_override(Some(projection_cols.clone()));
     if let Some(expr) = where_expr {
         scan = scan.filter(expr);
     }
-    scan = scan.with_order_by_override(order_by);
+    scan = scan.with_order_by_override(scan_order_by);
     if !distinct && let Some(limit) = limit {
         let scan_limit = offset
             .checked_add(limit)
@@ -1148,7 +1879,38 @@ fn build_exec<'db>(db: &'db Db, query: SqlQuery) -> table::Result<SqlExec<'db>> 
     }
 
     let prepared = scan.compile()?;
-    Ok(SqlExec::Scan { prepared, offset, limit, projection: projection_cols, ordered, distinct })
+    Ok(SqlExec::Scan {
+        prepared,
+        offset,
+        limit,
+        projection: projection_cols,
+        ordered,
+        distinct,
+        distinct_single_col_order_dir,
+    })
+}
+
+fn distinct_single_col_order_dir(
+    distinct: bool,
+    projection_cols: &[u16],
+    order_by: Option<&[OrderBy]>,
+) -> Option<OrderDir> {
+    if !distinct || projection_cols.len() != 1 {
+        return None;
+    }
+    let Some([item]) = order_by else {
+        return None;
+    };
+    if item.col == projection_cols[0] { Some(item.dir) } else { None }
+}
+
+#[cfg(test)]
+fn supports_streaming_distinct_single_col(
+    distinct: bool,
+    projection_cols: &[u16],
+    order_by: Option<&[OrderBy]>,
+) -> bool {
+    distinct_single_col_order_dir(distinct, projection_cols, order_by).is_some()
 }
 
 fn is_join_select(select: &Select) -> bool {
@@ -1378,20 +2140,80 @@ fn build_join_exec<'db>(
         .as_ref()
         .map(|expr| parse_join_filter_expr(expr, &resolver))
         .transpose()?;
+    let (left_where_pushdown, right_where_pushdown, where_expr) =
+        split_join_where_pushdown(where_expr, join_type, resolver.left_len());
     let order_by = parse_join_order_by(order_by, &resolver, projection.as_slice(), &output_names)?;
     let (limit, offset) = parse_limit_offset(limit_clause)?;
+    if limit == Some(0) {
+        return Ok(SqlExec::Empty);
+    }
+
+    let mut needed_globals = projection.clone();
+    if let Some(order_by) = order_by.as_ref() {
+        needed_globals.extend(order_by.iter().map(|item| item.col));
+    }
+    if let Some(expr) = where_expr.as_ref() {
+        collect_expr_cols(expr, &mut needed_globals);
+    }
+    needed_globals.sort_unstable();
+    needed_globals.dedup();
+
+    let remap_col = |col: u16| -> table::Result<u16> {
+        let idx = needed_globals
+            .binary_search(&col)
+            .map_err(|_| table::Error::Query(QueryError::SqlUnknownColumn))?;
+        u16::try_from(idx).map_err(|_| table::Error::Query(QueryError::SqlUnsupported))
+    };
+    let remap_projection = |cols: &[u16]| -> table::Result<Vec<u16>> {
+        cols.iter().copied().map(remap_col).collect::<table::Result<Vec<_>>>()
+    };
+    let projection = remap_projection(projection.as_slice())?;
+    let where_expr = where_expr.map(|expr| remap_expr_cols(expr, &remap_col)).transpose()?;
+    let order_by = order_by
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| Ok(OrderBy { col: remap_col(item.col)?, dir: item.dir }))
+                .collect::<table::Result<Vec<_>>>()
+        })
+        .transpose()?;
+
+    let left_len = resolver.left_len();
+    let mut left_project = Vec::new();
+    let mut right_project = Vec::new();
+    for col in needed_globals {
+        let col_usize = col as usize;
+        if col_usize < left_len {
+            left_project.push(col);
+        } else {
+            let right = col_usize
+                .checked_sub(left_len)
+                .ok_or(table::Error::Query(QueryError::SqlUnsupported))?;
+            right_project.push(
+                u16::try_from(right)
+                    .map_err(|_| table::Error::Query(QueryError::SqlUnsupported))?,
+            );
+        }
+    }
+
+    let mut left_scan = left_table.scan();
+    if let Some(expr) = left_where_pushdown {
+        left_scan = left_scan.filter(expr);
+    }
+    let mut right_scan = right_table.scan();
+    if let Some(expr) = right_where_pushdown {
+        right_scan = right_scan.filter(expr);
+    }
 
     let mut join_builder = match join_type {
-        JoinType::Inner => {
-            ExecJoin::inner(left_table.scan(), right_table.scan()).on(left_key, right_key)
-        }
-        JoinType::Left => {
-            ExecJoin::left(left_table.scan(), right_table.scan()).on(left_key, right_key)
-        }
+        JoinType::Inner => ExecJoin::inner(left_scan, right_scan).on(left_key, right_key),
+        JoinType::Left => ExecJoin::left(left_scan, right_scan).on(left_key, right_key),
     };
     if let Some(strategy) = choose_join_strategy_from_right_index(db, &resolver.right, right_key)? {
         join_builder = join_builder.strategy(strategy);
     }
+    join_builder = join_builder.project_left_dyn(left_project);
+    join_builder = join_builder.project_right_dyn(right_project);
     let prepared = join_builder.compile()?;
 
     Ok(SqlExec::Join {
@@ -1403,6 +2225,220 @@ fn build_join_exec<'db>(
         limit,
         distinct,
     })
+}
+
+fn collect_expr_cols(expr: &Expr, out: &mut Vec<u16>) {
+    match expr {
+        Expr::Col(col) => out.push(*col),
+        Expr::Lit(_) => {}
+        Expr::Eq(lhs, rhs)
+        | Expr::Ne(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Le(lhs, rhs)
+        | Expr::Gt(lhs, rhs)
+        | Expr::Ge(lhs, rhs)
+        | Expr::Like(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs) => {
+            collect_expr_cols(lhs, out);
+            collect_expr_cols(rhs, out);
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_expr_cols(inner, out)
+        }
+    }
+}
+
+fn remap_expr_cols<F>(expr: Expr, remap_col: &F) -> table::Result<Expr>
+where
+    F: Fn(u16) -> table::Result<u16>,
+{
+    Ok(match expr {
+        Expr::Col(col) => Expr::Col(remap_col(col)?),
+        Expr::Lit(lit) => Expr::Lit(lit),
+        Expr::Eq(lhs, rhs) => Expr::Eq(
+            Box::new(remap_expr_cols(*lhs, remap_col)?),
+            Box::new(remap_expr_cols(*rhs, remap_col)?),
+        ),
+        Expr::Ne(lhs, rhs) => Expr::Ne(
+            Box::new(remap_expr_cols(*lhs, remap_col)?),
+            Box::new(remap_expr_cols(*rhs, remap_col)?),
+        ),
+        Expr::Lt(lhs, rhs) => Expr::Lt(
+            Box::new(remap_expr_cols(*lhs, remap_col)?),
+            Box::new(remap_expr_cols(*rhs, remap_col)?),
+        ),
+        Expr::Le(lhs, rhs) => Expr::Le(
+            Box::new(remap_expr_cols(*lhs, remap_col)?),
+            Box::new(remap_expr_cols(*rhs, remap_col)?),
+        ),
+        Expr::Gt(lhs, rhs) => Expr::Gt(
+            Box::new(remap_expr_cols(*lhs, remap_col)?),
+            Box::new(remap_expr_cols(*rhs, remap_col)?),
+        ),
+        Expr::Ge(lhs, rhs) => Expr::Ge(
+            Box::new(remap_expr_cols(*lhs, remap_col)?),
+            Box::new(remap_expr_cols(*rhs, remap_col)?),
+        ),
+        Expr::Like(lhs, rhs) => Expr::Like(
+            Box::new(remap_expr_cols(*lhs, remap_col)?),
+            Box::new(remap_expr_cols(*rhs, remap_col)?),
+        ),
+        Expr::And(lhs, rhs) => Expr::And(
+            Box::new(remap_expr_cols(*lhs, remap_col)?),
+            Box::new(remap_expr_cols(*rhs, remap_col)?),
+        ),
+        Expr::Or(lhs, rhs) => Expr::Or(
+            Box::new(remap_expr_cols(*lhs, remap_col)?),
+            Box::new(remap_expr_cols(*rhs, remap_col)?),
+        ),
+        Expr::Not(inner) => Expr::Not(Box::new(remap_expr_cols(*inner, remap_col)?)),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(remap_expr_cols(*inner, remap_col)?)),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(remap_expr_cols(*inner, remap_col)?)),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PredicateSide {
+    Neutral,
+    Left,
+    Right,
+    Mixed,
+}
+
+fn split_join_where_pushdown(
+    where_expr: Option<Expr>,
+    join_type: JoinType,
+    left_len: usize,
+) -> (Option<Expr>, Option<Expr>, Option<Expr>) {
+    let Some(where_expr) = where_expr else {
+        return (None, None, None);
+    };
+
+    let mut conjuncts = Vec::new();
+    split_and_conjuncts(where_expr, &mut conjuncts);
+
+    let mut left_terms = Vec::new();
+    let mut right_terms = Vec::new();
+    let mut residual_terms = Vec::new();
+    for term in conjuncts {
+        match expr_predicate_side(&term, left_len) {
+            PredicateSide::Neutral | PredicateSide::Left => left_terms.push(term),
+            PredicateSide::Right if matches!(join_type, JoinType::Inner) => {
+                right_terms.push(remap_expr_cols_to_right_side(term, left_len));
+            }
+            PredicateSide::Right | PredicateSide::Mixed => residual_terms.push(term),
+        }
+    }
+
+    (fold_and_terms(left_terms), fold_and_terms(right_terms), fold_and_terms(residual_terms))
+}
+
+fn split_and_conjuncts(expr: Expr, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::And(lhs, rhs) => {
+            split_and_conjuncts(*lhs, out);
+            split_and_conjuncts(*rhs, out);
+        }
+        other => out.push(other),
+    }
+}
+
+fn fold_and_terms(terms: Vec<Expr>) -> Option<Expr> {
+    let mut iter = terms.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, Expr::and))
+}
+
+fn remap_expr_cols_to_right_side(expr: Expr, left_len: usize) -> Expr {
+    match expr {
+        Expr::Col(col) => {
+            let local = (col as usize).checked_sub(left_len).unwrap_or(usize::from(col));
+            let local = u16::try_from(local).unwrap_or(col);
+            Expr::Col(local)
+        }
+        Expr::Eq(lhs, rhs) => Expr::Eq(
+            Box::new(remap_expr_cols_to_right_side(*lhs, left_len)),
+            Box::new(remap_expr_cols_to_right_side(*rhs, left_len)),
+        ),
+        Expr::Ne(lhs, rhs) => Expr::Ne(
+            Box::new(remap_expr_cols_to_right_side(*lhs, left_len)),
+            Box::new(remap_expr_cols_to_right_side(*rhs, left_len)),
+        ),
+        Expr::Lt(lhs, rhs) => Expr::Lt(
+            Box::new(remap_expr_cols_to_right_side(*lhs, left_len)),
+            Box::new(remap_expr_cols_to_right_side(*rhs, left_len)),
+        ),
+        Expr::Le(lhs, rhs) => Expr::Le(
+            Box::new(remap_expr_cols_to_right_side(*lhs, left_len)),
+            Box::new(remap_expr_cols_to_right_side(*rhs, left_len)),
+        ),
+        Expr::Gt(lhs, rhs) => Expr::Gt(
+            Box::new(remap_expr_cols_to_right_side(*lhs, left_len)),
+            Box::new(remap_expr_cols_to_right_side(*rhs, left_len)),
+        ),
+        Expr::Ge(lhs, rhs) => Expr::Ge(
+            Box::new(remap_expr_cols_to_right_side(*lhs, left_len)),
+            Box::new(remap_expr_cols_to_right_side(*rhs, left_len)),
+        ),
+        Expr::Like(lhs, rhs) => Expr::Like(
+            Box::new(remap_expr_cols_to_right_side(*lhs, left_len)),
+            Box::new(remap_expr_cols_to_right_side(*rhs, left_len)),
+        ),
+        Expr::And(lhs, rhs) => Expr::And(
+            Box::new(remap_expr_cols_to_right_side(*lhs, left_len)),
+            Box::new(remap_expr_cols_to_right_side(*rhs, left_len)),
+        ),
+        Expr::Or(lhs, rhs) => Expr::Or(
+            Box::new(remap_expr_cols_to_right_side(*lhs, left_len)),
+            Box::new(remap_expr_cols_to_right_side(*rhs, left_len)),
+        ),
+        Expr::Not(inner) => Expr::Not(Box::new(remap_expr_cols_to_right_side(*inner, left_len))),
+        Expr::IsNull(inner) => {
+            Expr::IsNull(Box::new(remap_expr_cols_to_right_side(*inner, left_len)))
+        }
+        Expr::IsNotNull(inner) => {
+            Expr::IsNotNull(Box::new(remap_expr_cols_to_right_side(*inner, left_len)))
+        }
+        Expr::Lit(lit) => Expr::Lit(lit),
+    }
+}
+
+fn expr_predicate_side(expr: &Expr, left_len: usize) -> PredicateSide {
+    fn combine(a: PredicateSide, b: PredicateSide) -> PredicateSide {
+        match (a, b) {
+            (PredicateSide::Mixed, _) | (_, PredicateSide::Mixed) => PredicateSide::Mixed,
+            (PredicateSide::Neutral, side) | (side, PredicateSide::Neutral) => side,
+            (left, right) if left == right => left,
+            _ => PredicateSide::Mixed,
+        }
+    }
+
+    match expr {
+        Expr::Col(idx) => {
+            if (*idx as usize) < left_len {
+                PredicateSide::Left
+            } else {
+                PredicateSide::Right
+            }
+        }
+        Expr::Lit(_) => PredicateSide::Neutral,
+        Expr::Eq(lhs, rhs)
+        | Expr::Ne(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Le(lhs, rhs)
+        | Expr::Gt(lhs, rhs)
+        | Expr::Ge(lhs, rhs)
+        | Expr::Like(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs) => combine(
+            expr_predicate_side(lhs.as_ref(), left_len),
+            expr_predicate_side(rhs.as_ref(), left_len),
+        ),
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            expr_predicate_side(inner.as_ref(), left_len)
+        }
+    }
 }
 
 fn choose_join_strategy_from_right_index(
@@ -2546,6 +3582,8 @@ fn object_name_last_ident(name: &ObjectName) -> table::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use rusqlite::Connection;
     use sqlparser::ast::{
         Expr as SqlExpr, Ident, OrderByExpr as SqlOrderByExpr, OrderByOptions, WithFill,
@@ -2553,14 +3591,15 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::{
-        JoinTableResolver, OwnedSqlValue, choose_join_strategy_from_right_index,
-        distinct_indices_for_prefix, distinct_indices_for_projection,
-        distinct_indices_from_keys_with_hash_fallback_cap, parse_order_by_item_dir,
-        parse_sql_distinct_hash_mem_cap_override,
+        JoinTableResolver, OwnedSqlValue, PredicateSide, choose_join_strategy_from_right_index,
+        compare_owned_row_values, distinct_indices_for_prefix, distinct_indices_for_projection,
+        distinct_indices_from_keys_with_hash_fallback_cap, expr_predicate_side,
+        order_rows_with_top_k, parse_order_by_item_dir, parse_sql_distinct_hash_mem_cap_override,
+        split_join_where_pushdown, supports_streaming_distinct_single_col,
     };
     use crate::db::Db;
     use crate::join::{JoinKey, JoinStrategy};
-    use crate::query::OrderDir;
+    use crate::query::{OrderBy, OrderDir};
     use crate::table::{self, QueryError};
 
     fn make_db<F: FnOnce(&Connection)>(f: F) -> NamedTempFile {
@@ -2738,5 +3777,143 @@ mod tests {
         let strategy =
             choose_join_strategy_from_right_index(&db, &right, JoinKey::Col(0)).expect("plan");
         assert!(strategy.is_none());
+    }
+
+    #[test]
+    fn detects_streaming_distinct_single_col_shape() {
+        assert!(supports_streaming_distinct_single_col(
+            true,
+            &[2],
+            Some(&[OrderBy { col: 2, dir: OrderDir::Asc }])
+        ));
+        assert!(supports_streaming_distinct_single_col(
+            true,
+            &[2],
+            Some(&[OrderBy { col: 2, dir: OrderDir::Desc }])
+        ));
+    }
+
+    #[test]
+    fn rejects_streaming_distinct_when_shape_does_not_match() {
+        assert!(!supports_streaming_distinct_single_col(
+            false,
+            &[2],
+            Some(&[OrderBy { col: 2, dir: OrderDir::Asc }])
+        ));
+        assert!(!supports_streaming_distinct_single_col(
+            true,
+            &[1, 2],
+            Some(&[OrderBy { col: 1, dir: OrderDir::Asc }])
+        ));
+        assert!(!supports_streaming_distinct_single_col(
+            true,
+            &[2],
+            Some(&[OrderBy { col: 2, dir: OrderDir::Asc }, OrderBy { col: 1, dir: OrderDir::Asc }])
+        ));
+        assert!(!supports_streaming_distinct_single_col(
+            true,
+            &[2],
+            Some(&[OrderBy { col: 1, dir: OrderDir::Asc }])
+        ));
+        assert!(!supports_streaming_distinct_single_col(true, &[2], None));
+    }
+
+    #[test]
+    fn top_k_ordering_matches_full_sort_prefix() {
+        let rows = vec![
+            vec![OwnedSqlValue::Integer(5)],
+            vec![OwnedSqlValue::Integer(1)],
+            vec![OwnedSqlValue::Integer(3)],
+            vec![OwnedSqlValue::Integer(2)],
+            vec![OwnedSqlValue::Integer(4)],
+        ];
+        let order_by = [OrderBy { col: 0, dir: OrderDir::Asc }];
+        let offset = 1usize;
+        let limit = 2usize;
+
+        let mut expected = rows.clone();
+        expected.sort_by(|left, right| compare_owned_row_values(left, right, &order_by));
+        let keep = offset + limit;
+        expected.truncate(keep);
+
+        let actual = order_rows_with_top_k(rows, &order_by, offset, Some(limit));
+        assert_eq!(actual.len(), expected.len());
+        for (left, right) in actual.iter().zip(expected.iter()) {
+            assert_eq!(compare_owned_row_values(left, right, &order_by), Ordering::Equal);
+        }
+    }
+
+    #[test]
+    fn top_k_ordering_keeps_stable_order_for_equal_keys() {
+        let rows = vec![
+            vec![OwnedSqlValue::Integer(1), OwnedSqlValue::Text(b"a".to_vec())],
+            vec![OwnedSqlValue::Integer(1), OwnedSqlValue::Text(b"b".to_vec())],
+            vec![OwnedSqlValue::Integer(1), OwnedSqlValue::Text(b"c".to_vec())],
+        ];
+        let order_by = [OrderBy { col: 0, dir: OrderDir::Asc }];
+        let actual = order_rows_with_top_k(rows, &order_by, 0, Some(2));
+        assert_eq!(actual.len(), 2);
+        assert!(matches!(&actual[0][1], OwnedSqlValue::Text(v) if v.as_slice() == b"a"));
+        assert!(matches!(&actual[1][1], OwnedSqlValue::Text(v) if v.as_slice() == b"b"));
+    }
+
+    #[test]
+    fn inner_join_pushes_single_side_where_terms() {
+        let where_expr = crate::query::col(0)
+            .gt(crate::query::lit_i64(10))
+            .and(crate::query::col(3).lt(crate::query::lit_i64(5)))
+            .and(crate::query::col(0).eq(crate::query::col(3)));
+        let (left, right, residual) =
+            split_join_where_pushdown(Some(where_expr), crate::join::JoinType::Inner, 2);
+
+        let Some(left) = left else {
+            panic!("expected left pushdown");
+        };
+        let Some(right) = right else {
+            panic!("expected right pushdown");
+        };
+        let Some(residual) = residual else {
+            panic!("expected residual");
+        };
+        assert_eq!(expr_predicate_side(&left, 2), PredicateSide::Left);
+        fn only_col_one(expr: &crate::query::Expr) -> bool {
+            match expr {
+                crate::query::Expr::Col(col) => *col == 1,
+                crate::query::Expr::Lit(_) => true,
+                crate::query::Expr::Eq(lhs, rhs)
+                | crate::query::Expr::Ne(lhs, rhs)
+                | crate::query::Expr::Lt(lhs, rhs)
+                | crate::query::Expr::Le(lhs, rhs)
+                | crate::query::Expr::Gt(lhs, rhs)
+                | crate::query::Expr::Ge(lhs, rhs)
+                | crate::query::Expr::Like(lhs, rhs)
+                | crate::query::Expr::And(lhs, rhs)
+                | crate::query::Expr::Or(lhs, rhs) => only_col_one(lhs) && only_col_one(rhs),
+                crate::query::Expr::Not(inner)
+                | crate::query::Expr::IsNull(inner)
+                | crate::query::Expr::IsNotNull(inner) => only_col_one(inner),
+            }
+        }
+        assert!(only_col_one(&right), "right pushdown must be remapped to side-local columns");
+        assert_eq!(expr_predicate_side(&residual, 2), PredicateSide::Mixed);
+    }
+
+    #[test]
+    fn left_join_keeps_right_only_terms_as_residual() {
+        let where_expr = crate::query::col(3)
+            .lt(crate::query::lit_i64(5))
+            .and(crate::query::col(0).gt(crate::query::lit_i64(10)));
+        let (left, right, residual) =
+            split_join_where_pushdown(Some(where_expr), crate::join::JoinType::Left, 2);
+
+        let Some(left) = left else {
+            panic!("expected left pushdown");
+        };
+        let Some(residual) = residual else {
+            panic!("expected residual");
+        };
+        assert_eq!(expr_predicate_side(&left, 2), PredicateSide::Left);
+        assert!(right.is_none());
+        assert_eq!(expr_predicate_side(&residual, 2), PredicateSide::Right);
     }
 }

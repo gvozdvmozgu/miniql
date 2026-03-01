@@ -6,6 +6,8 @@ use miniql::pager::{PageId, Pager};
 use miniql::query::Scan;
 use miniql::table::{self, ValueRef};
 
+mod alloc_profiler;
+
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
 }
@@ -67,15 +69,17 @@ fn bench_join_inlj_hot(c: &mut Criterion) {
     .expect("compile join");
 
     c.bench_function("join_inlj_hot", |b| {
-        b.iter(|| {
-            let mut rows = 0usize;
-            prepared
-                .for_each(&mut scratch, |_jr| {
-                    rows += 1;
-                    Ok(())
-                })
-                .expect("join");
-            black_box(rows);
+        alloc_profiler::with_alloc_log("join_inlj_hot", || {
+            b.iter(|| {
+                let mut rows = 0usize;
+                prepared
+                    .for_each(&mut scratch, |_jr| {
+                        rows += 1;
+                        Ok(())
+                    })
+                    .expect("join");
+                black_box(rows);
+            });
         });
     });
 }
@@ -97,18 +101,28 @@ fn bench_join_hash_hot(c: &mut Criterion) {
     .expect("compile join");
 
     c.bench_function("join_hash_hot", |b| {
-        b.iter(|| {
-            let mut rows = 0usize;
-            prepared
-                .for_each(&mut scratch, |_jr| {
-                    rows += 1;
-                    Ok(())
-                })
-                .expect("join");
-            black_box(rows);
+        alloc_profiler::with_alloc_log("join_hash_hot", || {
+            b.iter(|| {
+                let mut rows = 0usize;
+                prepared
+                    .for_each(&mut scratch, |_jr| {
+                        rows += 1;
+                        Ok(())
+                    })
+                    .expect("join");
+                black_box(rows);
+            });
         });
     });
 }
 
-criterion_group!(benches, bench_join_inlj_hot, bench_join_hash_hot);
+fn criterion_config() -> Criterion {
+    Criterion::default()
+}
+
+criterion_group! {
+    name = benches;
+    config = criterion_config();
+    targets = bench_join_inlj_hot, bench_join_hash_hot
+}
 criterion_main!(benches);

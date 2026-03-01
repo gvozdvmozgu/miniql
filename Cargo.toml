@@ -43,6 +43,7 @@ edition.workspace = true
 [dev-dependencies]
 codspeed-criterion-compat = "4"
 rusqlite = { version = "0.38", default-features = true, features = ["bundled"] }
+stats_alloc = "0.1"
 tempfile = "3"
 
 [dependencies]
