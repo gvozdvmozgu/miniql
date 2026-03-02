@@ -171,8 +171,16 @@ pub struct PreparedJoin<'db> {
 
 #[derive(Clone, Debug)]
 enum JoinPlan {
-    IndexNestedLoop { index_root: PageId, index_key_col: u16, index_cols: Option<Box<[u16]>> },
-    IndexMerge { index_root: PageId, index_key_col: u16, index_cols: Option<Box<[u16]>> },
+    IndexNestedLoop {
+        index_root: PageId,
+        index_key_col: u16,
+        covering_map: Option<Box<[(u16, usize)]>>,
+    },
+    IndexMerge {
+        index_root: PageId,
+        index_key_col: u16,
+        covering_map: Option<Box<[(u16, usize)]>>,
+    },
     HashJoin,
     NestedLoopScan,
     RowIdNestedLoop,
@@ -311,6 +319,17 @@ impl<'db> Join<'db> {
             &right_order_cols,
         )?;
 
+        let make_index_nested =
+            |index_root: PageId, index_key_col: u16, index_cols: Option<Box<[u16]>>| {
+                let covering_map = covering_map_for_index_boxed(&right_scan, index_cols.as_deref());
+                JoinPlan::IndexNestedLoop { index_root, index_key_col, covering_map }
+            };
+        let make_index_merge =
+            |index_root: PageId, index_key_col: u16, index_cols: Option<Box<[u16]>>| {
+                let covering_map = covering_map_for_index_boxed(&right_scan, index_cols.as_deref());
+                JoinPlan::IndexMerge { index_root, index_key_col, covering_map }
+            };
+
         let plan = match self.strategy {
             JoinStrategy::IndexNestedLoop { index_root, index_key_col } => {
                 if !matches!(right_key, JoinKey::Col(_)) {
@@ -321,11 +340,11 @@ impl<'db> Join<'db> {
                     right_scan.root(),
                     index_root,
                 )?;
-                JoinPlan::IndexNestedLoop {
+                make_index_nested(
                     index_root,
                     index_key_col,
-                    index_cols: index_cols.map(|cols| cols.into_boxed_slice()),
-                }
+                    index_cols.map(|cols| cols.into_boxed_slice()),
+                )
             }
             JoinStrategy::IndexMerge { index_root, index_key_col } => {
                 if !matches!(right_key, JoinKey::Col(_)) {
@@ -339,11 +358,11 @@ impl<'db> Join<'db> {
                     right_scan.root(),
                     index_root,
                 )?;
-                JoinPlan::IndexMerge {
+                make_index_merge(
                     index_root,
                     index_key_col,
-                    index_cols: index_cols.map(|cols| cols.into_boxed_slice()),
-                }
+                    index_cols.map(|cols| cols.into_boxed_slice()),
+                )
             }
             JoinStrategy::Hash | JoinStrategy::HashJoin => JoinPlan::HashJoin,
             JoinStrategy::NestedLoopScan => JoinPlan::NestedLoopScan,
@@ -355,27 +374,16 @@ impl<'db> Join<'db> {
                     if let Some(index) =
                         discover_index_for_join(right_scan.pager(), right_scan.root(), col)?
                     {
-                        let index_cols = index.cols.map(|cols| cols.into_boxed_slice());
-                        if index.unique_by_key {
-                            JoinPlan::IndexNestedLoop {
-                                index_root: index.root,
-                                index_key_col: index.key_col,
-                                index_cols,
-                            }
+                        let IndexInfo { root, key_col, cols, unique_by_key } = index;
+                        let index_cols = cols.map(|v| v.into_boxed_slice());
+                        if unique_by_key {
+                            make_index_nested(root, key_col, index_cols)
                         } else if prefer_hash {
                             JoinPlan::HashJoin
                         } else if left_keys_sorted {
-                            JoinPlan::IndexMerge {
-                                index_root: index.root,
-                                index_key_col: index.key_col,
-                                index_cols,
-                            }
+                            make_index_merge(root, key_col, index_cols)
                         } else {
-                            JoinPlan::IndexNestedLoop {
-                                index_root: index.root,
-                                index_key_col: index.key_col,
-                                index_cols,
-                            }
+                            make_index_nested(root, key_col, index_cols)
                         }
                     } else {
                         JoinPlan::HashJoin
@@ -431,15 +439,15 @@ impl<'db> PreparedJoin<'db> {
     /// Returns a string describing the chosen join strategy for diagnostics.
     pub fn explain(&self) -> &'static str {
         match &self.plan {
-            JoinPlan::IndexNestedLoop { index_cols, .. } => {
-                if covering_map_for_index(&self.right, index_cols.as_deref()).is_some() {
+            JoinPlan::IndexNestedLoop { covering_map, .. } => {
+                if covering_map.is_some() {
                     "index-nested-loop (covering)"
                 } else {
                     "index-nested-loop"
                 }
             }
-            JoinPlan::IndexMerge { index_cols, .. } => {
-                if covering_map_for_index(&self.right, index_cols.as_deref()).is_some() {
+            JoinPlan::IndexMerge { covering_map, .. } => {
+                if covering_map.is_some() {
                     "index-merge (covering)"
                 } else {
                     "index-merge"
@@ -491,7 +499,7 @@ impl<'db> PreparedJoin<'db> {
         decoded_right_cache.clear();
 
         match &self.plan {
-            JoinPlan::IndexNestedLoop { index_root, index_key_col, index_cols } => {
+            JoinPlan::IndexNestedLoop { index_root, index_key_col, covering_map, .. } => {
                 index_nested_loop(
                     &mut self.left,
                     &self.left_meta,
@@ -499,7 +507,7 @@ impl<'db> PreparedJoin<'db> {
                     &self.right_meta,
                     *index_root,
                     *index_key_col,
-                    index_cols.as_deref(),
+                    covering_map.as_deref(),
                     left_scan_scratch,
                     right_values,
                     right_bytes,
@@ -513,26 +521,28 @@ impl<'db> PreparedJoin<'db> {
                     cb,
                 )
             }
-            JoinPlan::IndexMerge { index_root, index_key_col, index_cols } => index_merge_join(
-                &mut self.left,
-                &self.left_meta,
-                &mut self.right,
-                &self.right_meta,
-                *index_root,
-                *index_key_col,
-                index_cols.as_deref(),
-                left_scan_scratch,
-                right_values,
-                right_bytes,
-                right_serials,
-                right_offsets,
-                index_scratch,
-                rowid_cache,
-                decoded_right_cache,
-                right_nulls,
-                right_null_len,
-                cb,
-            ),
+            JoinPlan::IndexMerge { index_root, index_key_col, covering_map, .. } => {
+                index_merge_join(
+                    &mut self.left,
+                    &self.left_meta,
+                    &mut self.right,
+                    &self.right_meta,
+                    *index_root,
+                    *index_key_col,
+                    covering_map.as_deref(),
+                    left_scan_scratch,
+                    right_values,
+                    right_bytes,
+                    right_serials,
+                    right_offsets,
+                    index_scratch,
+                    rowid_cache,
+                    decoded_right_cache,
+                    right_nulls,
+                    right_null_len,
+                    cb,
+                )
+            }
             JoinPlan::HashJoin => hash_join(
                 &mut self.left,
                 &self.left_meta,
@@ -648,39 +658,67 @@ struct RowLocation {
     cell_offset: u16,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RowLocationCacheEntry {
+    generation: u32,
+    rowid: i64,
+    loc: RowLocation,
+}
+
+impl Default for RowLocationCacheEntry {
+    fn default() -> Self {
+        Self { generation: 0, rowid: 0, loc: RowLocation { page_id: PageId::ROOT, cell_offset: 0 } }
+    }
+}
+
+#[inline(always)]
+fn cache_slot(mask: usize, rowid: i64) -> usize {
+    let key = rowid as u64;
+    (key.wrapping_mul(0x9e37_79b1_85eb_ca87) as usize) & mask
+}
+
 #[derive(Debug)]
 struct RowLocationCache {
-    entries: Vec<(i64, RowLocation)>,
-    next: usize,
-    capacity: usize,
+    entries: Vec<RowLocationCacheEntry>,
+    mask: usize,
+    generation: u32,
 }
 
 impl RowLocationCache {
     fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
-        Self { entries: Vec::with_capacity(capacity), next: 0, capacity }
+        let capacity = capacity.max(1).next_power_of_two();
+        Self {
+            entries: vec![RowLocationCacheEntry::default(); capacity],
+            mask: capacity - 1,
+            generation: 1,
+        }
     }
 
     fn clear(&mut self) {
-        self.entries.clear();
-        self.next = 0;
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            for entry in &mut self.entries {
+                entry.generation = 0;
+            }
+            self.generation = 1;
+        }
     }
 
+    #[inline(always)]
     fn get(&self, rowid: i64) -> Option<RowLocation> {
-        self.entries.iter().find(|(id, _)| *id == rowid).map(|(_, loc)| *loc)
+        let slot = cache_slot(self.mask, rowid);
+        let entry = &self.entries[slot];
+        if entry.generation == self.generation && entry.rowid == rowid {
+            Some(entry.loc)
+        } else {
+            None
+        }
     }
 
+    #[inline(always)]
     fn insert(&mut self, rowid: i64, loc: RowLocation) {
-        if let Some(entry) = self.entries.iter_mut().find(|(id, _)| *id == rowid) {
-            entry.1 = loc;
-            return;
-        }
-        if self.entries.len() < self.capacity {
-            self.entries.push((rowid, loc));
-        } else {
-            self.entries[self.next] = (rowid, loc);
-            self.next = (self.next + 1) % self.capacity;
-        }
+        let slot = cache_slot(self.mask, rowid);
+        self.entries[slot] = RowLocationCacheEntry { generation: self.generation, rowid, loc };
     }
 }
 
@@ -743,41 +781,79 @@ fn decoded_state_values(state: &DecodedRightState) -> Option<&[ValueSlot]> {
 
 #[derive(Debug)]
 struct DecodedRightCache {
-    entries: Vec<(i64, DecodedRightState)>,
-    next: usize,
-    capacity: usize,
+    entries: Vec<DecodedRightCacheEntry>,
+    mask: usize,
+    generation: u32,
+    used: bool,
+}
+
+#[derive(Debug)]
+struct DecodedRightCacheEntry {
+    generation: u32,
+    rowid: i64,
+    state: DecodedRightState,
+}
+
+impl Default for DecodedRightCacheEntry {
+    fn default() -> Self {
+        Self { generation: 0, rowid: 0, state: DecodedRightState::FilteredOut }
+    }
 }
 
 impl DecodedRightCache {
     fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
-        Self { entries: Vec::with_capacity(capacity), next: 0, capacity }
+        let capacity = capacity.max(1).next_power_of_two();
+        let mut entries = Vec::with_capacity(capacity);
+        entries.resize_with(capacity, DecodedRightCacheEntry::default);
+        Self { entries, mask: capacity - 1, generation: 1, used: false }
     }
 
     fn clear(&mut self) {
-        self.entries.clear();
-        self.next = 0;
-    }
-
-    fn get(&self, rowid: i64) -> Option<&DecodedRightState> {
-        self.entries.iter().find(|(id, _)| *id == rowid).map(|(_, state)| state)
-    }
-
-    fn contains(&self, rowid: i64) -> bool {
-        self.entries.iter().any(|(id, _)| *id == rowid)
-    }
-
-    fn insert(&mut self, rowid: i64, state: DecodedRightState) {
-        if let Some(entry) = self.entries.iter_mut().find(|(id, _)| *id == rowid) {
-            entry.1 = state;
-            return;
+        if self.used {
+            for entry in &mut self.entries {
+                if entry.generation == self.generation {
+                    entry.state = DecodedRightState::FilteredOut;
+                    entry.generation = 0;
+                }
+            }
+            self.used = false;
         }
-        if self.entries.len() < self.capacity {
-            self.entries.push((rowid, state));
-        } else {
-            self.entries[self.next] = (rowid, state);
-            self.next = (self.next + 1) % self.capacity;
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            for entry in &mut self.entries {
+                entry.generation = 0;
+                entry.state = DecodedRightState::FilteredOut;
+            }
+            self.generation = 1;
         }
+    }
+
+    #[inline(always)]
+    fn slot(&self, rowid: i64) -> usize {
+        cache_slot(self.mask, rowid)
+    }
+
+    #[inline(always)]
+    fn is_hit(&self, slot: usize, rowid: i64) -> bool {
+        let entry = &self.entries[slot];
+        entry.generation == self.generation && entry.rowid == rowid
+    }
+
+    #[inline(always)]
+    fn get_at(&self, slot: usize) -> &DecodedRightState {
+        &self.entries[slot].state
+    }
+
+    #[inline(always)]
+    fn insert_and_get_at(
+        &mut self,
+        slot: usize,
+        rowid: i64,
+        state: DecodedRightState,
+    ) -> &DecodedRightState {
+        self.used = true;
+        self.entries[slot] = DecodedRightCacheEntry { generation: self.generation, rowid, state };
+        &self.entries[slot].state
     }
 }
 
@@ -867,8 +943,13 @@ fn lookup_rowid_cell_cached<'row>(
     pager: &'row Pager,
     root: PageId,
     rowid: i64,
+    use_cache: bool,
     cache: &mut RowLocationCache,
 ) -> Result<Option<table::CellRef<'row>>> {
+    if !use_cache {
+        return table::lookup_rowid_cell(pager, root, rowid);
+    }
+
     if let Some(loc) = cache.get(rowid)
         && let Ok(cell) = table::read_table_cell_ref_from_bytes(pager, loc.page_id, loc.cell_offset)
         && cell.rowid() == rowid
@@ -877,10 +958,8 @@ fn lookup_rowid_cell_cached<'row>(
     }
 
     if let Some(cell) = table::lookup_rowid_cell(pager, root, rowid)? {
-        cache.insert(
-            rowid,
-            RowLocation { page_id: cell.page_id(), cell_offset: cell.cell_offset() },
-        );
+        let loc = RowLocation { page_id: cell.page_id(), cell_offset: cell.cell_offset() };
+        cache.insert(rowid, loc);
         return Ok(Some(cell));
     }
 
@@ -899,8 +978,9 @@ fn get_or_decode_table_row_cached<'a>(
     apply_filters: bool,
     decoded_cache: &'a mut DecodedRightCache,
 ) -> Result<Option<&'a [ValueSlot]>> {
-    if decoded_cache.contains(rowid) {
-        return Ok(decoded_cache.get(rowid).and_then(decoded_state_values));
+    let slot = decoded_cache.slot(rowid);
+    if decoded_cache.is_hit(slot, rowid) {
+        return Ok(decoded_state_values(decoded_cache.get_at(slot)));
     }
 
     let decoded = right_scan.eval_payload_with_filters(
@@ -911,15 +991,12 @@ fn get_or_decode_table_row_cached<'a>(
         right_offsets,
         apply_filters,
     )?;
-    match decoded {
-        Some(row) => {
-            let cached = CachedDecodedRow::from_row(row);
-            decoded_cache.insert(rowid, DecodedRightState::Present(cached));
-        }
-        None => decoded_cache.insert(rowid, DecodedRightState::FilteredOut),
-    }
-
-    Ok(decoded_cache.get(rowid).and_then(decoded_state_values))
+    let state = match decoded {
+        Some(row) => DecodedRightState::Present(CachedDecodedRow::from_row(row)),
+        None => DecodedRightState::FilteredOut,
+    };
+    let state = decoded_cache.insert_and_get_at(slot, rowid, state);
+    Ok(decoded_state_values(state))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -935,8 +1012,9 @@ fn get_or_decode_index_row_cached<'a>(
     apply_filters: bool,
     decoded_cache: &'a mut DecodedRightCache,
 ) -> Result<Option<&'a [ValueSlot]>> {
-    if decoded_cache.contains(rowid) {
-        return Ok(decoded_cache.get(rowid).and_then(decoded_state_values));
+    let slot = decoded_cache.slot(rowid);
+    if decoded_cache.is_hit(slot, rowid) {
+        return Ok(decoded_state_values(decoded_cache.get_at(slot)));
     }
 
     let decoded = right_scan.eval_index_payload_with_map(
@@ -948,15 +1026,12 @@ fn get_or_decode_index_row_cached<'a>(
         right_offsets,
         apply_filters,
     )?;
-    match decoded {
-        Some(row) => {
-            let cached = CachedDecodedRow::from_row(row);
-            decoded_cache.insert(rowid, DecodedRightState::Present(cached));
-        }
-        None => decoded_cache.insert(rowid, DecodedRightState::FilteredOut),
-    }
-
-    Ok(decoded_cache.get(rowid).and_then(decoded_state_values))
+    let state = match decoded {
+        Some(row) => DecodedRightState::Present(CachedDecodedRow::from_row(row)),
+        None => DecodedRightState::FilteredOut,
+    };
+    let state = decoded_cache.insert_and_get_at(slot, rowid, state);
+    Ok(decoded_state_values(state))
 }
 
 impl Default for JoinScratch {
@@ -1164,6 +1239,14 @@ fn covering_map_for_index(
     Some(map)
 }
 
+#[inline]
+fn covering_map_for_index_boxed(
+    right_scan: &PreparedScan<'_>,
+    index_cols: Option<&[u16]>,
+) -> Option<Box<[(u16, usize)]>> {
+    covering_map_for_index(right_scan, index_cols).map(Vec::into_boxed_slice)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn index_nested_loop<F>(
     left_scan: &mut PreparedScan<'_>,
@@ -1172,7 +1255,7 @@ fn index_nested_loop<F>(
     right_meta: &SideMeta,
     index_root: PageId,
     index_key_col: u16,
-    index_cols: Option<&[u16]>,
+    covering_map: Option<&[(u16, usize)]>,
     left_scratch: &mut ScanScratch,
     right_values: &mut Vec<ValueSlot>,
     right_bytes: &mut Vec<u8>,
@@ -1191,7 +1274,9 @@ where
     let right_root = right_scan.root();
     let pager = right_scan.pager();
     let mut cursor = IndexCursor::new(pager, index_root, index_key_col, index_scratch);
-    let covering_map = covering_map_for_index(right_scan, index_cols);
+    let use_right_row_cache = !matches!(left_meta.join_key, JoinKey::RowId);
+    let apply_right_filters = right_scan.has_filters();
+    let use_decoded_cache = use_right_row_cache && apply_right_filters;
 
     left_scan.for_each_eager(left_scratch, |left_rowid, left_row| {
         let left_out = left_meta.output_row(left_row.values_raw());
@@ -1216,19 +1301,38 @@ where
         while cursor.key_eq(left_key_value)? {
             if let Some(map) = covering_map.as_ref() {
                 let emitted = cursor.with_current_payload_and_rowid(|payload, right_rowid| {
-                    if let Some(right_values_cached) = get_or_decode_index_row_cached(
-                        right_rowid,
+                    if use_decoded_cache {
+                        if let Some(right_values_cached) = get_or_decode_index_row_cached(
+                            right_rowid,
+                            payload,
+                            map,
+                            right_scan,
+                            right_values,
+                            right_bytes,
+                            right_serials,
+                            right_offsets,
+                            apply_right_filters,
+                            decoded_right_cache,
+                        )? {
+                            let right_out = right_meta.output_row(right_values_cached);
+                            cb(JoinedRow {
+                                left_rowid,
+                                right_rowid,
+                                left: left_out,
+                                right: right_out,
+                            })?;
+                            return Ok(true);
+                        }
+                    } else if let Some(right_row) = right_scan.eval_index_payload_with_map(
                         payload,
                         map,
-                        right_scan,
                         right_values,
                         right_bytes,
                         right_serials,
                         right_offsets,
-                        true,
-                        decoded_right_cache,
+                        apply_right_filters,
                     )? {
-                        let right_out = right_meta.output_row(right_values_cached);
+                        let right_out = right_meta.output_row(right_row.values_raw());
                         cb(JoinedRow {
                             left_rowid,
                             right_rowid,
@@ -1244,23 +1348,51 @@ where
                 }
             } else {
                 let right_rowid = cursor.current_rowid()?;
-                if let Some(cell) =
-                    lookup_rowid_cell_cached(pager, right_root, right_rowid, rowid_cache)?
-                    && let Some(right_values_cached) = get_or_decode_table_row_cached(
-                        right_rowid,
+                if let Some(cell) = lookup_rowid_cell_cached(
+                    pager,
+                    right_root,
+                    right_rowid,
+                    use_right_row_cache,
+                    rowid_cache,
+                )? {
+                    if use_decoded_cache {
+                        if let Some(right_values_cached) = get_or_decode_table_row_cached(
+                            right_rowid,
+                            cell.payload(),
+                            right_scan,
+                            right_values,
+                            right_bytes,
+                            right_serials,
+                            right_offsets,
+                            apply_right_filters,
+                            decoded_right_cache,
+                        )? {
+                            let right_out = right_meta.output_row(right_values_cached);
+                            cb(JoinedRow {
+                                left_rowid,
+                                right_rowid,
+                                left: left_out,
+                                right: right_out,
+                            })?;
+                            matched = true;
+                        }
+                    } else if let Some(right_row) = right_scan.eval_payload_with_filters(
                         cell.payload(),
-                        right_scan,
                         right_values,
                         right_bytes,
                         right_serials,
                         right_offsets,
-                        true,
-                        decoded_right_cache,
-                    )?
-                {
-                    let right_out = right_meta.output_row(right_values_cached);
-                    cb(JoinedRow { left_rowid, right_rowid, left: left_out, right: right_out })?;
-                    matched = true;
+                        apply_right_filters,
+                    )? {
+                        let right_out = right_meta.output_row(right_row.values_raw());
+                        cb(JoinedRow {
+                            left_rowid,
+                            right_rowid,
+                            left: left_out,
+                            right: right_out,
+                        })?;
+                        matched = true;
+                    }
                 }
             }
 
@@ -1287,7 +1419,7 @@ fn index_merge_join<F>(
     right_meta: &SideMeta,
     index_root: PageId,
     index_key_col: u16,
-    index_cols: Option<&[u16]>,
+    covering_map: Option<&[(u16, usize)]>,
     left_scratch: &mut ScanScratch,
     right_values: &mut Vec<ValueSlot>,
     right_bytes: &mut Vec<u8>,
@@ -1306,7 +1438,9 @@ where
     let right_root = right_scan.root();
     let pager = right_scan.pager();
     let mut cursor = IndexCursor::new(pager, index_root, index_key_col, index_scratch);
-    let covering_map = covering_map_for_index(right_scan, index_cols);
+    let use_right_row_cache = !matches!(left_meta.join_key, JoinKey::RowId);
+    let apply_right_filters = right_scan.has_filters();
+    let use_decoded_cache = use_right_row_cache && apply_right_filters;
     let mut right_exhausted = false;
 
     left_scan.for_each_eager(left_scratch, |left_rowid, left_row| {
@@ -1332,19 +1466,38 @@ where
         loop {
             if let Some(map) = covering_map.as_ref() {
                 let emitted = cursor.with_current_payload_and_rowid(|payload, right_rowid| {
-                    if let Some(right_values_cached) = get_or_decode_index_row_cached(
-                        right_rowid,
+                    if use_decoded_cache {
+                        if let Some(right_values_cached) = get_or_decode_index_row_cached(
+                            right_rowid,
+                            payload,
+                            map,
+                            right_scan,
+                            right_values,
+                            right_bytes,
+                            right_serials,
+                            right_offsets,
+                            apply_right_filters,
+                            decoded_right_cache,
+                        )? {
+                            let right_out = right_meta.output_row(right_values_cached);
+                            cb(JoinedRow {
+                                left_rowid,
+                                right_rowid,
+                                left: left_out,
+                                right: right_out,
+                            })?;
+                            return Ok(true);
+                        }
+                    } else if let Some(right_row) = right_scan.eval_index_payload_with_map(
                         payload,
                         map,
-                        right_scan,
                         right_values,
                         right_bytes,
                         right_serials,
                         right_offsets,
-                        true,
-                        decoded_right_cache,
+                        apply_right_filters,
                     )? {
-                        let right_out = right_meta.output_row(right_values_cached);
+                        let right_out = right_meta.output_row(right_row.values_raw());
                         cb(JoinedRow {
                             left_rowid,
                             right_rowid,
@@ -1360,23 +1513,51 @@ where
                 }
             } else {
                 let right_rowid = cursor.current_rowid()?;
-                if let Some(cell) =
-                    lookup_rowid_cell_cached(pager, right_root, right_rowid, rowid_cache)?
-                    && let Some(right_values_cached) = get_or_decode_table_row_cached(
-                        right_rowid,
+                if let Some(cell) = lookup_rowid_cell_cached(
+                    pager,
+                    right_root,
+                    right_rowid,
+                    use_right_row_cache,
+                    rowid_cache,
+                )? {
+                    if use_decoded_cache {
+                        if let Some(right_values_cached) = get_or_decode_table_row_cached(
+                            right_rowid,
+                            cell.payload(),
+                            right_scan,
+                            right_values,
+                            right_bytes,
+                            right_serials,
+                            right_offsets,
+                            apply_right_filters,
+                            decoded_right_cache,
+                        )? {
+                            let right_out = right_meta.output_row(right_values_cached);
+                            cb(JoinedRow {
+                                left_rowid,
+                                right_rowid,
+                                left: left_out,
+                                right: right_out,
+                            })?;
+                            matched = true;
+                        }
+                    } else if let Some(right_row) = right_scan.eval_payload_with_filters(
                         cell.payload(),
-                        right_scan,
                         right_values,
                         right_bytes,
                         right_serials,
                         right_offsets,
-                        true,
-                        decoded_right_cache,
-                    )?
-                {
-                    let right_out = right_meta.output_row(right_values_cached);
-                    cb(JoinedRow { left_rowid, right_rowid, left: left_out, right: right_out })?;
-                    matched = true;
+                        apply_right_filters,
+                    )? {
+                        let right_out = right_meta.output_row(right_row.values_raw());
+                        cb(JoinedRow {
+                            left_rowid,
+                            right_rowid,
+                            left: left_out,
+                            right: right_out,
+                        })?;
+                        matched = true;
+                    }
                 }
             }
 
@@ -1651,6 +1832,7 @@ where
 
     let pager = right_scan.pager();
     let right_root = right_scan.root();
+    let use_right_row_cache = !matches!(left_meta.join_key, JoinKey::RowId);
     let (values, bytes, serials, offsets, stack) = right_scratch.split_mut();
     let mut seen = 0usize;
     let limit = right_scan.limit();
@@ -1771,18 +1953,36 @@ where
                 }
                 let cell =
                     table::read_table_cell_ref_from_bytes(pager, row.page_id, row.cell_offset)?;
-                if let Some(right_values_cached) = get_or_decode_table_row_cached(
-                    row.rowid,
+                if use_right_row_cache {
+                    if let Some(right_values_cached) = get_or_decode_table_row_cached(
+                        row.rowid,
+                        cell.payload(),
+                        right_scan,
+                        right_values,
+                        right_bytes,
+                        right_serials,
+                        right_offsets,
+                        false,
+                        decoded_right_cache,
+                    )? {
+                        let right_out = right_meta.output_row(right_values_cached);
+                        cb(JoinedRow {
+                            left_rowid,
+                            right_rowid: row.rowid,
+                            left: left_out,
+                            right: right_out,
+                        })?;
+                        matched = true;
+                    }
+                } else if let Some(right_row) = right_scan.eval_payload_with_filters(
                     cell.payload(),
-                    right_scan,
                     right_values,
                     right_bytes,
                     right_serials,
                     right_offsets,
                     false,
-                    decoded_right_cache,
                 )? {
-                    let right_out = right_meta.output_row(right_values_cached);
+                    let right_out = right_meta.output_row(right_row.values_raw());
                     cb(JoinedRow {
                         left_rowid,
                         right_rowid: row.rowid,

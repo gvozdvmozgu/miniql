@@ -6,6 +6,7 @@ use miniql::pager::{PageId, Pager};
 use miniql::query::{Scan, ScanScratch, col, lit_bytes, lit_i64};
 use miniql::table::{self, DecodeRecord, Null, RecordDecoder};
 
+#[path = "support/alloc_profiler.rs"]
 mod alloc_profiler;
 
 fn fixture_path(name: &str) -> PathBuf {

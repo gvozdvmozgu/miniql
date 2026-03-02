@@ -28,7 +28,7 @@ use crate::pager::PageId;
 use crate::query::{
     AggExpr, Expr, OrderBy, OrderDir, PreparedAggregate, PreparedScan, Row, ScanScratch, ValueLit,
 };
-use crate::schema::{parse_index_columns, parse_table_schema};
+use crate::schema::parse_table_schema;
 use crate::table::{self, BytesSpan, Corruption, QueryError, RawBytes, ValueRef, ValueSlot};
 
 const DEFAULT_SQL_DISTINCT_HASH_MEM_CAP_BYTES: usize = 64 * 1024 * 1024;
@@ -978,23 +978,38 @@ struct TopKRefItem<'a> {
 
 impl TopKRefItem<'_> {
     #[inline]
-    fn order_value_at(&self, idx: usize) -> ValueRef<'_> {
-        if let Some(pos) = self.order_proj_pos {
-            let p = *pos.get(idx).unwrap_or(&usize::MAX);
-            return self
-                .projected
-                .get(p)
+    fn compare_desired(&self, other: &Self) -> Ordering {
+        if let Some(order_proj_pos) = self.order_proj_pos {
+            for (idx, dir) in self.order_dirs.iter().enumerate() {
+                let left = order_proj_pos
+                    .get(idx)
+                    .and_then(|&p| self.projected.get(p))
+                    .map(OwnedSqlValue::as_value_ref)
+                    .unwrap_or(ValueRef::Null);
+                let right = order_proj_pos
+                    .get(idx)
+                    .and_then(|&p| other.projected.get(p))
+                    .map(OwnedSqlValue::as_value_ref)
+                    .unwrap_or(ValueRef::Null);
+                let mut cmp = compare_value_refs(left, right);
+                if matches!(dir, OrderDir::Desc) {
+                    cmp = cmp.reverse();
+                }
+                if cmp != Ordering::Equal {
+                    return cmp.then(self.seq.cmp(&other.seq));
+                }
+            }
+            return self.seq.cmp(&other.seq);
+        }
+
+        for (idx, dir) in self.order_dirs.iter().enumerate() {
+            let left =
+                self.order_keys.get(idx).map(OwnedSqlValue::as_value_ref).unwrap_or(ValueRef::Null);
+            let right = other
+                .order_keys
+                .get(idx)
                 .map(OwnedSqlValue::as_value_ref)
                 .unwrap_or(ValueRef::Null);
-        }
-        self.order_keys.get(idx).map(OwnedSqlValue::as_value_ref).unwrap_or(ValueRef::Null)
-    }
-
-    #[inline]
-    fn compare_desired(&self, other: &Self) -> Ordering {
-        for (idx, dir) in self.order_dirs.iter().enumerate() {
-            let left = self.order_value_at(idx);
-            let right = other.order_value_at(idx);
             let mut cmp = compare_value_refs(left, right);
             if matches!(dir, OrderDir::Desc) {
                 cmp = cmp.reverse();
@@ -1463,9 +1478,29 @@ fn compare_joined_order_to_item(
     seq: usize,
     item: &TopKRefItem<'_>,
 ) -> Ordering {
+    if let Some(order_proj_pos) = item.order_proj_pos {
+        for (idx, dir) in order_dirs.iter().enumerate() {
+            let left = joined_compact_get(joined, order_cols[idx]).unwrap_or(ValueRef::Null);
+            let right = order_proj_pos
+                .get(idx)
+                .and_then(|&p| item.projected.get(p))
+                .map(OwnedSqlValue::as_value_ref)
+                .unwrap_or(ValueRef::Null);
+            let mut cmp = compare_value_refs(left, right);
+            if matches!(dir, OrderDir::Desc) {
+                cmp = cmp.reverse();
+            }
+            if cmp != Ordering::Equal {
+                return cmp.then(seq.cmp(&item.seq));
+            }
+        }
+        return seq.cmp(&item.seq);
+    }
+
     for (idx, dir) in order_dirs.iter().enumerate() {
         let left = joined_compact_get(joined, order_cols[idx]).unwrap_or(ValueRef::Null);
-        let right = item.order_value_at(idx);
+        let right =
+            item.order_keys.get(idx).map(OwnedSqlValue::as_value_ref).unwrap_or(ValueRef::Null);
         let mut cmp = compare_value_refs(left, right);
         if matches!(dir, OrderDir::Desc) {
             cmp = cmp.reverse();
@@ -2449,30 +2484,13 @@ fn choose_join_strategy_from_right_index(
         return Ok(None);
     };
 
-    db.find_schema(|row| {
-        if !row.kind.eq_ignore_ascii_case("index")
-            || !row.tbl_name.eq_ignore_ascii_case(right_resolver.table_name.as_str())
-        {
-            return Ok(None);
-        }
-        let Some(sql) = row.sql.as_str() else {
-            return Ok(None);
-        };
-        let Some(index_cols) = parse_index_columns(sql) else {
-            return Ok(None);
-        };
-        if index_cols
-            .first()
-            .is_some_and(|index_col| index_col.eq_ignore_ascii_case(right_col_name.as_str()))
-        {
-            return Ok(Some(JoinStrategy::IndexNestedLoop {
-                index_root: row.root,
-                index_key_col: 0,
-            }));
-        }
+    let Some(index_root) =
+        db.first_index_on_column(right_resolver.table_name.as_str(), right_col_name.as_str())?
+    else {
+        return Ok(None);
+    };
 
-        Ok(None)
-    })
+    Ok(Some(JoinStrategy::IndexNestedLoop { index_root, index_key_col: 0 }))
 }
 
 fn parse_join_operator(join: &JoinOperator) -> table::Result<(JoinType, &SqlExpr)> {

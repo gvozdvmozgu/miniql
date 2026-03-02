@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::introspect::{SchemaRow, scan_sqlite_schema, scan_sqlite_schema_until};
 use crate::pager::{PageId, Pager};
 use crate::query::{Row, Scan, ScanScratch};
-use crate::schema::parse_table_schema;
+use crate::schema::{parse_index_columns, parse_table_schema};
 use crate::table;
 
 /// Read-only handle to a SQLite database file.
@@ -39,29 +39,45 @@ struct TableInfo {
 
 struct SchemaCache {
     tables: HashMap<String, TableInfo>,
+    first_index_by_table_col: HashMap<(String, String), PageId>,
 }
 
 impl SchemaCache {
     fn load(pager: &Pager) -> table::Result<Self> {
         let mut tables = HashMap::new();
+        let mut first_index_by_table_col = HashMap::new();
 
         scan_sqlite_schema(pager, |row| {
-            if !row.kind.eq_ignore_ascii_case("table") {
+            if row.kind.eq_ignore_ascii_case("table") {
+                let column_count = column_count_from_schema_sql(row.sql.as_str());
+                let info = TableInfo { name: row.name.to_owned(), root: row.root, column_count };
+                tables.insert(row.name.to_ascii_lowercase(), info);
                 return Ok(());
             }
 
-            let column_count = column_count_from_schema_sql(row.sql.as_str());
-            let info = TableInfo { name: row.name.to_owned(), root: row.root, column_count };
-
-            tables.insert(row.name.to_ascii_lowercase(), info);
+            if row.kind.eq_ignore_ascii_case("index")
+                && let Some(sql) = row.sql.as_str()
+                && let Some(cols) = parse_index_columns(sql)
+                && let Some(first_col) = cols.first()
+            {
+                first_index_by_table_col
+                    .entry((row.tbl_name.to_ascii_lowercase(), first_col.to_ascii_lowercase()))
+                    .or_insert(row.root);
+            }
             Ok(())
         })?;
 
-        Ok(Self { tables })
+        Ok(Self { tables, first_index_by_table_col })
     }
 
     fn table(&self, name: &str) -> Option<&TableInfo> {
         self.tables.get(&name.to_ascii_lowercase())
+    }
+
+    fn first_index_on_column(&self, table_name: &str, col_name: &str) -> Option<PageId> {
+        self.first_index_by_table_col
+            .get(&(table_name.to_ascii_lowercase(), col_name.to_ascii_lowercase()))
+            .copied()
     }
 }
 
@@ -131,6 +147,15 @@ impl Db {
         F: for<'row> FnMut(SchemaRow<'row>) -> table::Result<Option<T>>,
     {
         scan_sqlite_schema_until(self.pager(), f)
+    }
+
+    pub(crate) fn first_index_on_column(
+        &self,
+        table_name: &str,
+        col_name: &str,
+    ) -> table::Result<Option<PageId>> {
+        let cache = self.schema_cache()?;
+        Ok(cache.first_index_on_column(table_name, col_name))
     }
 
     /// Execute a SQL `SELECT` query against this database.
